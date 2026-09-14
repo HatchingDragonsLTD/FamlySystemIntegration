@@ -19,6 +19,10 @@ actions/<name>/runner.py               does the work, owns its response types
 actions/<name>/cli.py                  argparse wiring only
 actions/plan_write/builder.py          builds the plan write request body
 actions/plan_write/warnings.py         classifies + escalates plan warnings
+actions/plan_write/input_schema.py     the normalized input contract
+actions/plan_write/csv_loader.py       CSV -> normalized input
+actions/plan_write/hubspot_intake.py   webhook payload -> normalized input
+samples/plans.sample.csv               example CSV (the only committed one)
 integrations/                          reserved, empty (see its README)
 main.py                                CLI dispatcher
 ```
@@ -179,6 +183,88 @@ Swap the delivery with `set_notifier(fn)` when an `integrations/` bridge exists
 `KNOWN_WARNINGS` is seeded with the funding-mismatch case. Its `error` code is a
 placeholder until a real warning payload is captured; the title match carries it
 until then, and anything unmatched escalates rather than passing silently.
+
+### The normalized input contract
+
+Plans can be driven from a CSV file or from a HubSpot custom-code action. Both
+produce **the same normalized shape**, defined as dataclasses in
+`actions/plan_write/input_schema.py`. That shape is the contract; everything
+downstream of it is shared.
+
+```
+CSV file ---------                   >--- PlanInput ---> validate() ---> to_plan_body() ---> builder ---> preview
+HubSpot payload --/
+```
+
+**UUIDs only.** Every label-to-UUID resolution — billing profile names, session
+names, product names, funding types — happens **upstream**, in whatever builds
+the payload. This codebase performs no label lookup and should never learn how
+to: a label that reaches `validate()` is reported as a non-UUID and rejected.
+
+| Field | Notes |
+| --- | --- |
+| `childId` | UUID, required |
+| `from` | ISO date `YYYY-MM-DD`, required |
+| `ruleGroupId` | UUID or null |
+| `note` | free text, defaults to `""` |
+| `planParts[]` | at least one required |
+| `planParts[].billingProfileId` | UUID, required |
+| `planParts[].attendanceScheduleId` | UUID, required |
+| `planParts[].billing` | `{id, title, weeksOfCare, invoices}`; `id` must be a UUID |
+| `planParts[].termScheduleId` | UUID or null |
+| `planParts[].termTimeOnly` | boolean, defaults to `false` |
+| `planParts[].sessionBookings[]` | `{sessionId (UUID), day, fundable (bool)}` |
+| `planParts[].productBookings[]` | `{productId (UUID), day, amount (positive int)}` |
+| `publicFundingSettings` | `{method, hours, minutes, fundingTypeIds[], maxFundedMinutes}` or null |
+
+`day` must be one of `MONDAY`…`SUNDAY`. Keys may be camelCase or snake_case.
+
+**What `validate()` cannot do:** it checks that values are present and shaped
+like UUIDs — not that they exist in Famly, belong to this child, or mean what
+the producer intended. A well-formed UUID for the wrong session passes
+validation and still produces a wrong plan. Only a preview catches that, and
+only through its warnings.
+
+#### From CSV
+
+One row per booking line; rows sharing a `childId` become one plan with one
+plan part. A row carries **either** a `sessionId` or a `productId`. Plan-level
+values are read from that child's first row, so later rows need only their
+booking columns. See `samples/plans.sample.csv` for the column order.
+
+```bash
+python main.py plan --mode preview-csv --file plans.csv --version 3
+```
+
+Each plan is validated first. Invalid ones print their errors and are **never
+sent to Famly**; valid ones are previewed and their warnings printed. This mode
+cannot commit.
+
+Real CSVs and plan payloads are gitignored (`*.csv`, `*.plan.json`) because they
+carry child data — only the sample is committed.
+
+#### From HubSpot
+
+`actions/plan_write/hubspot_intake.py` accepts the same payload, nested under
+`properties` or `data` or neither:
+
+```python
+from actions.plan_write.hubspot_intake import handle_intake
+
+result = handle_intake(payload, version=3)   # dry_run=True by default
+if not result.ok:
+    ...  # result.errors -- nothing was sent to Famly
+```
+
+Validation runs **before** any network call, so a malformed payload costs
+nothing. `dry_run=False` raises `NotImplementedError`: committing from an
+automated intake path is deliberately not wired up, because a commit must go
+through `runner.commit` with an explicit confirm and a test-child allow-list
+that a webhook cannot satisfy on its own.
+
+There is no HTTP server here and none belongs in this package. A Flask/FastAPI
+shell can call `handle_intake` once the read-only path is proven; it belongs in
+`integrations/`, subject to the rule in that folder's README.
 
 ## Note on file URLs and expiry
 

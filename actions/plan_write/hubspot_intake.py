@@ -1,0 +1,112 @@
+"""Intake for the normalized payload a HubSpot custom-code action sends.
+
+The payload is the SAME normalized shape the CSV loader produces -- UUIDs
+already resolved upstream. Nothing here maps labels to UUIDs, and nothing here
+commits.
+
+There is no HTTP server in this module and none belongs here. A Flask/FastAPI
+shell can call `handle_intake` from `integrations/` once the read-only path is
+proven; this stays a plain function so it is testable and importable without a
+web framework.
+
+No argparse, no commit path.
+"""
+
+from dataclasses import dataclass, field
+from typing import Any
+
+from . import input_schema, runner
+
+# Wrappers a webhook may nest the payload under. Checked in order.
+PAYLOAD_WRAPPER_KEYS = ("properties", "data")
+
+
+@dataclass
+class IntakeResult:
+    """What an intake attempt produced.
+
+    `ok` False with `errors` populated means nothing was sent to Famly.
+    """
+
+    ok: bool = False
+    errors: list[str] = field(default_factory=list)
+    plan_input: input_schema.PlanInput | None = None
+    result: runner.ParsedPlanResult | None = None
+
+    @property
+    def warnings(self) -> list:
+        """Plan warnings from the preview, if one ran."""
+        return self.result.warnings if self.result else []
+
+
+def unwrap_payload(payload: Any) -> Any:
+    """Return the plan payload, unwrapping a `properties`/`data` nesting.
+
+    A webhook may deliver the normalized object directly or nested one level
+    down. Both are accepted; a wrapper is only unwrapped when it actually
+    contains a dict.
+    """
+    if not isinstance(payload, dict):
+        return payload
+
+    for key in PAYLOAD_WRAPPER_KEYS:
+        inner = payload.get(key)
+        if isinstance(inner, dict):
+            return inner
+
+    return payload
+
+
+def parse_hubspot_payload(payload: Any) -> input_schema.PlanInput:
+    """Parse a webhook payload into a PlanInput.
+
+    Defensive: never raises. An unusable payload yields an empty PlanInput,
+    which `input_schema.validate` then reports on.
+    """
+    return input_schema.from_dict(unwrap_payload(payload))
+
+
+def handle_intake(
+    payload: Any,
+    *,
+    version: int,
+    dry_run: bool = True,
+    client=None,
+) -> IntakeResult:
+    """Parse, validate, and (when valid) preview a plan from a webhook payload.
+
+    Validation happens BEFORE any network call: an invalid payload returns its
+    errors and Famly is never contacted.
+
+    Args:
+        payload: the normalized JSON, optionally nested under properties/data.
+        version: the plan version the request targets.
+        dry_run: must stay True. Preview only -- never writes.
+        client: optional RestClient, mainly for tests.
+
+    Returns:
+        IntakeResult. When `ok` is False, `errors` says why and nothing was sent.
+
+    Raises:
+        NotImplementedError: if `dry_run` is False. Committing from an automated
+            intake path is deliberately not wired up: a commit must go through
+            `runner.commit`, which requires an explicit confirm and a test-child
+            allow-list that a webhook cannot satisfy on its own.
+    """
+    if not dry_run:
+        raise NotImplementedError(
+            "handle_intake is preview-only. Committing from an automated intake "
+            "path is not wired up: use runner.commit() explicitly, with "
+            "confirm=True and an allowed_child_ids set."
+        )
+
+    plan_input = parse_hubspot_payload(payload)
+
+    errors = input_schema.validate(plan_input)
+    if errors:
+        return IntakeResult(ok=False, errors=errors, plan_input=plan_input)
+
+    plan_body = input_schema.to_plan_body(plan_input)
+    result = runner.preview(plan_body, version, client=client)
+
+    return IntakeResult(ok=True, errors=[], plan_input=plan_input, result=result)

@@ -7,7 +7,11 @@
 output/
 downloads/
 *.json.out
+
+# Plan payloads and CSV batches hold real child data -- keep them local.
+*.plan.json
 *.csv
+!samples/plans.sample.csv
 *.log
 
 # Python
