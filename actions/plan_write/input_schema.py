@@ -4,11 +4,14 @@ One shape, two producers: a CSV file (`csv_loader.py`) and a HubSpot custom-code
 action (`hubspot_intake.py`) both emit exactly this. Anything that can produce a
 `PlanInput` can drive a plan write.
 
-UUIDs ONLY. Every label-to-UUID resolution (billing profile names, session
-names, product names, funding types) happens upstream, in whatever built the
-payload. Nothing here looks a label up, and nothing here should ever learn how
-to -- a label arriving at this layer is a bug in the producer, and `validate`
-rejects it as a non-UUID.
+UUIDs ONLY, with one exception. Every label-to-UUID resolution (billing profile
+names, session names, product names, funding types) happens upstream, in
+whatever built the payload. Nothing here looks a label up, and nothing here
+should ever learn how to -- a label arriving at this layer is a bug in the
+producer, and `validate` rejects it as a non-UUID.
+
+The exception is `billing.id`, which is a billing-scheme enum string such as
+"ANNUALIZED_V2" and never a UUID. See KNOWN_BILLING_SCHEME_IDS.
 
 NOTE on naming: `builder.py` has its own `PlanPartInput`, `SessionBookingInput`,
 `ProductBookingInput`, `PublicFundingSettingsInput` and `BillingInput` with
@@ -37,6 +40,17 @@ VALID_DAYS = (
     "SATURDAY",
     "SUNDAY",
 )
+
+# Billing scheme identifiers seen on `billing.id`. Unlike every other *_id in
+# this contract, billing.id is an enum string, not a UUID.
+#
+# THIS LIST IS ALMOST CERTAINLY INCOMPLETE -- it holds only the schemes seen so
+# far. An id that is not listed is flagged rather than rejected: a scheme we
+# have not met yet is legitimate, but so is a typo, and being told about both
+# beats silently accepting either. Add real schemes here as they turn up.
+KNOWN_BILLING_SCHEME_IDS = {
+    "ANNUALIZED_V2",
+}
 
 # Canonical 8-4-4-4-12 hex form, matched case-insensitively.
 UUID_PATTERN = re.compile(
@@ -247,6 +261,29 @@ def _check_optional_uuid(value: Any, label: str, errors: list[str]) -> None:
         errors.append(f"{label}: {value!r} is not a UUID (use null to omit it)")
 
 
+def _check_billing_scheme_id(value: Any, label: str, errors: list[str]) -> None:
+    """Check `billing.id`, which is a billing-scheme enum, NOT a UUID.
+
+    Two tiers:
+      * hard failure -- missing, empty, or not a string at all;
+      * soft flag    -- a non-empty string that is not in
+        KNOWN_BILLING_SCHEME_IDS. That list is incomplete by nature, so an
+        unrecognised value is surfaced rather than rejected: it may be a scheme
+        we have not catalogued, or it may be a typo, and both are worth seeing.
+    """
+    if value is None or not isinstance(value, str) or not value.strip():
+        errors.append(f"{label}: required, but missing or empty")
+        return
+
+    if value.strip() not in KNOWN_BILLING_SCHEME_IDS:
+        errors.append(
+            f"{label}: NOTE -- {value!r} is not a known billing scheme "
+            f"({', '.join(sorted(KNOWN_BILLING_SCHEME_IDS))}). It may be valid "
+            f"and simply uncatalogued, or it may be a typo. Check it before "
+            f"committing."
+        )
+
+
 def _check_day(day: Any, prefix: str, errors: list[str]) -> None:
     if not isinstance(day, str) or day.strip().upper() not in VALID_DAYS:
         errors.append(f"{prefix}.day: {day!r} is not one of {', '.join(VALID_DAYS)}")
@@ -308,7 +345,8 @@ def validate(plan_input: PlanInput) -> list[str]:
         if part.billing is None:
             errors.append(f"{prefix}.billing: required, but missing")
         else:
-            _check_uuid(part.billing.id, f"{prefix}.billing.id", errors)
+            # NOT a UUID: billing.id carries a billing-scheme enum string.
+            _check_billing_scheme_id(part.billing.id, f"{prefix}.billing.id", errors)
 
         if not part.session_bookings and not part.product_bookings:
             errors.append(f"{prefix}: has neither session nor product bookings")

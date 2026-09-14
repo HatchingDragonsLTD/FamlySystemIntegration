@@ -7,8 +7,8 @@ Call `preview()` to have the server compute a plan without persisting it, and
 Preview and commit are the SAME request; only the `preview` query param differs.
 That makes an accidental write easy, so `commit()` is guarded (see below).
 
-The enriched response is parsed with the Plan model from the child-plans action
-rather than a parallel copy, so the plan shape lives in one place.
+The enriched response is parsed with the Plan model from the read-child-plans
+action rather than a parallel copy, so the plan shape lives in one place.
 
 IMPORTANT: the endpoint returns HTTP 200 even when the plan is invalid. The
 warnings in `behaviors[]` are the only signal, so every call here extracts them.
@@ -17,7 +17,7 @@ warnings in `behaviors[]` are the only signal, so every call here extracts them.
 from dataclasses import dataclass, field
 from typing import Any
 
-from actions.get_billing_plan.runner import Plan, parse_plan
+from actions.read_child_plans.runner import Plan, parse_plan
 from actions.plan_write import warnings as plan_warnings
 from core.rest_client import RestClient
 

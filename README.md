@@ -14,7 +14,8 @@ core/config.py                         settings from environment variables
 core/session.py                        attaches the access token to requests
 core/client.py                         generic GraphQL client (query-agnostic)
 core/rest_client.py                    generic REST client (endpoint-agnostic)
-actions/<name>/query.graphql           the query text (GraphQL actions)
+actions/<name>/query.graphql           the query text (GraphQL actions only)
+actions/read_child_plans/runner.py     reads a child's plans (REST)
 actions/<name>/runner.py               does the work, owns its response types
 actions/<name>/cli.py                  argparse wiring only
 actions/plan_write/builder.py          builds the plan write request body
@@ -114,10 +115,29 @@ plain qualification type. Only `Level` items carry a `level` field, and the
 parser reads it only on that branch. Unrecognised typenames are kept, not
 dropped, and every item retains its untouched response dict in `raw`.
 
+### Reading a child's plans
+
+```bash
+python main.py read-child-plans <childId> [--version 3] [--format summary|full]
+```
+
+`GET {rest_base}/v2/plans/?version=&childId=&flexiblePackages=true`. The summary
+gives what a create-vs-edit decision needs: `planId`, `version`, `from`/`to`,
+`monthlyEstimate`, `planPartIds` and a session count, alongside `hasPlans` and
+`currentPlanId`.
+
+`currentPlanId` is populated only when the child has **exactly one** plan. With
+zero or more than one it is null, so an ambiguous case has to be resolved
+deliberately rather than by taking the first row.
+
+The write path calls `runner.run()` directly for the same information.
+
 ### Adding another action
 
-Create `actions/<name>/query.graphql` and `actions/<name>/runner.py` with a
-`run(...)` function, then add one entry to the `ACTIONS` dict in `main.py`.
+Create `actions/<name>/runner.py` with a `run(...)` function and an
+`actions/<name>/cli.py` exposing NAME/HELP/add_args/handle, then add one import
+and one entry to `ACTIONS` in `main.py`. GraphQL actions also get a
+`query.graphql`; REST actions use `core/rest_client.py` instead.
 
 ## Writing plans (the `plan` action)
 
@@ -210,7 +230,7 @@ to: a label that reaches `validate()` is reported as a non-UUID and rejected.
 | `planParts[]` | at least one required |
 | `planParts[].billingProfileId` | UUID, required |
 | `planParts[].attendanceScheduleId` | UUID, required |
-| `planParts[].billing` | `{id, title, weeksOfCare, invoices}`; `id` must be a UUID |
+| `planParts[].billing` | `{id, title, weeksOfCare, invoices}`; `id` is a billing-scheme enum such as `ANNUALIZED_V2`, **not** a UUID |
 | `planParts[].termScheduleId` | UUID or null |
 | `planParts[].termTimeOnly` | boolean, defaults to `false` |
 | `planParts[].sessionBookings[]` | `{sessionId (UUID), day, fundable (bool)}` |
@@ -218,6 +238,12 @@ to: a label that reaches `validate()` is reported as a non-UUID and rejected.
 | `publicFundingSettings` | `{method, hours, minutes, fundingTypeIds[], maxFundedMinutes}` or null |
 
 `day` must be one of `MONDAY`…`SUNDAY`. Keys may be camelCase or snake_case.
+
+`billing.id` is the one id in the contract that is **not** a UUID — it names a
+billing scheme. `validate` hard-fails it only when missing or empty; a value
+outside `KNOWN_BILLING_SCHEME_IDS` is reported as a `NOTE` rather than rejected,
+since that list is incomplete and an unknown value may be a new scheme or a
+typo. Add schemes to that set as you confirm them.
 
 **What `validate()` cannot do:** it checks that values are present and shaped
 like UUIDs — not that they exist in Famly, belong to this child, or mean what

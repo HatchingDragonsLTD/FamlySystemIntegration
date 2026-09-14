@@ -1,41 +1,48 @@
-"""Child plans action.
+"""Read a child's plans from the REST plans endpoint.
 
-Fetches the full plan structure for a child and maps it into typed objects.
-Owns its GraphQL query file (query.graphql) and its own response types.
+    GET {rest_base}/v2/plans/?version=<int>&childId=<id>&flexiblePackages=true
+
 Importable directly by a future server or scheduler: call `run(child_id)` and
-you get parsed objects back -- no CLI involvement.
+you get parsed objects back -- no CLI involvement. The write path uses this to
+answer "does a plan already exist, and what are its id / version / planPartId?"
+before choosing whether to create, edit, or add a second plan.
 
 The response is deeply nested. The hierarchy modelled here:
 
-    Plan
-      billing (Billing)
-      publicFunding (PublicFunding)
-      publicFundingSettings (PublicFundingSettings)
-      behaviors      -> list[str] (capability flags, e.g. CanAddPlanParts)
-      planStates     -> list[PlanState]
-      sessionBookings-> list[SessionBooking]   (plan level)
-      planParts      -> list[PlanPart]
-        PlanPart
-          billing (Billing)
-          sessionBookings -> list[SessionBooking]  (part level)
-          SessionBooking
-            monthlyPrices -> list[MonthlyPrice]
+    ChildPlansResult
+      plans          -> list[Plan]
+      sessions       -> list[SessionRef]   (sessionId -> title lookup)
+      products       -> list[ProductRef]
+      discount_presets, behaviors
+      Plan
+        billing (Billing)
+        publicFunding (PublicFunding)
+        publicFundingSettings (PublicFundingSettings)
+        behaviors      -> list[str] (capability flags, e.g. CanAddPlanParts)
+        planStates     -> list[PlanState]
+        sessionBookings-> list[SessionBooking]   (plan level)
+        planParts      -> list[PlanPart]
+          PlanPart
+            billing (Billing)
+            sessionBookings -> list[SessionBooking]  (part level)
+            SessionBooking
+              monthlyPrices -> list[MonthlyPrice]
 
-Every field is parsed with .get() and Optional defaults, so a missing or
-renamed field yields None rather than a crash. The untouched node is kept in
-`raw` on the top-level Plan so anything not modelled is still reachable.
+Every field is parsed with .get() and Optional defaults, so a missing or renamed
+field yields None rather than a crash. The untouched node is kept in `raw` on
+the top-level Plan (and on the result) so anything not modelled is reachable.
 """
 
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
-from core.client import GraphQLClient
+from core.rest_client import RestClient
 
-QUERY_PATH = Path(__file__).with_name("query.graphql")
+# Path under the configured REST base URL (which already ends in /api).
+PLANS_PATH = "v2/plans/"
 
-# Must match the operationName in query.graphql. Update after capturing.
-OPERATION_NAME = "GetChildPlans"
+# The endpoint is versioned by query param, not by path.
+DEFAULT_VERSION = 3
 
 
 # --------------------------------------------------------------------------- #
@@ -141,6 +148,67 @@ class Plan:
     def is_open_ended(self) -> bool:
         """True when the plan has no end date."""
         return self.to is None
+
+    @property
+    def plan_part_ids(self) -> list[str]:
+        """The plan's part IDs -- an edit needs these to target a part."""
+        return [p.plan_part_id for p in self.plan_parts if p.plan_part_id]
+
+    @property
+    def session_booking_count(self) -> int:
+        """Session bookings across the plan, both plan-level and part-level."""
+        return len(self.session_bookings) + sum(
+            len(p.session_bookings) for p in self.plan_parts
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Lightweight reference types -- the lookup tables the response ships alongside
+# the plans. Only the fields useful for naming things are pulled out; the whole
+# node is kept in `raw`.
+# --------------------------------------------------------------------------- #
+@dataclass
+class SessionRef:
+    id: str | None = None
+    title: str | None = None
+    raw: dict = field(default_factory=dict)
+
+
+@dataclass
+class ProductRef:
+    id: str | None = None
+    title: str | None = None
+    raw: dict = field(default_factory=dict)
+
+
+@dataclass
+class ChildPlansResult:
+    child_id: str | None = None
+    plans: list[Plan] = field(default_factory=list)
+    sessions: list[SessionRef] = field(default_factory=list)
+    products: list[ProductRef] = field(default_factory=list)
+    discount_presets: dict = field(default_factory=dict)
+    behaviors: list[str] = field(default_factory=list)
+    raw: Any = None
+
+    @property
+    def has_plans(self) -> bool:
+        """True when the child has at least one plan."""
+        return bool(self.plans)
+
+    @property
+    def current_plan(self) -> Plan | None:
+        """The plan, when there is exactly one.
+
+        None when the child has no plans OR more than one -- in the ambiguous
+        case the caller must choose deliberately rather than be handed a guess.
+        """
+        return self.plans[0] if len(self.plans) == 1 else None
+
+    @property
+    def session_titles(self) -> dict[str, str | None]:
+        """sessionId -> title, for naming bookings in output."""
+        return {s.id: s.title for s in self.sessions if s.id}
 
 
 # --------------------------------------------------------------------------- #
@@ -251,7 +319,12 @@ def _parse_plan_part(node: Any) -> PlanPart:
     )
 
 
-def _parse_plan(node: Any) -> Plan:
+def parse_plan(node: Any) -> Plan:
+    """Parse a single plan node into a Plan.
+
+    Public because the plan-write action parses the same plan shape out of its
+    own responses -- the model lives here and only here.
+    """
     if not isinstance(node, dict):
         return Plan(raw={"value": node})
     parts = node.get("planParts")
@@ -281,64 +354,72 @@ def _parse_plan(node: Any) -> Plan:
         behaviors=_parse_behaviors(node.get("behaviors")),
         plan_states=_parse_plan_states(node.get("planStates")),
         session_bookings=_parse_session_bookings(node.get("sessionBookings")),
-        plan_parts=[_parse_plan_part(p) for p in parts] if isinstance(parts, list) else [],
+        plan_parts=[_parse_plan_part(p) for p in parts]
+        if isinstance(parts, list)
+        else [],
         raw=node,
     )
 
 
-# Public alias: the REST plan-write action reuses this parser so the enriched
-# plan shape is modelled in exactly one place.
-def parse_plan(node: Any) -> Plan:
-    """Parse a single plan node into a Plan."""
-    return _parse_plan(node)
+def _parse_sessions(node: Any) -> list[SessionRef]:
+    """Session reference list. `title` is what names a booking in output."""
+    if not isinstance(node, list):
+        return []
+    return [
+        SessionRef(id=s.get("id"), title=s.get("title"), raw=s)
+        for s in node
+        if isinstance(s, dict)
+    ]
 
 
-def parse_response(body: dict) -> list[Plan]:
-    """Map a raw GraphQL response body into Plan objects.
+def _parse_products(node: Any) -> list[ProductRef]:
+    if not isinstance(node, list):
+        return []
+    return [
+        ProductRef(id=p.get("id"), title=p.get("title"), raw=p)
+        for p in node
+        if isinstance(p, dict)
+    ]
 
-    The exact path to `plans` depends on the captured query. This assumes the
-    plans array sits somewhere under `data`; adjust _extract_plans once the real
-    query is in place.
-    """
+
+def parse_response(body: Any, child_id: str | None = None) -> ChildPlansResult:
+    """Map the raw REST response into a ChildPlansResult."""
     if not isinstance(body, dict):
-        return []
-    plans_node = _extract_plans(body.get("data") or {})
-    if not isinstance(plans_node, list):
-        return []
-    return [_parse_plan(p) for p in plans_node]
+        return ChildPlansResult(child_id=child_id, raw=body)
+
+    plans_node = body.get("plans")
+    discount_presets = body.get("discountPresets")
+
+    return ChildPlansResult(
+        child_id=child_id,
+        plans=[parse_plan(p) for p in plans_node] if isinstance(plans_node, list) else [],
+        sessions=_parse_sessions(body.get("sessions")),
+        products=_parse_products(body.get("products")),
+        discount_presets=discount_presets if isinstance(discount_presets, dict) else {},
+        behaviors=_parse_behaviors(body.get("behaviors")),
+        raw=body,
+    )
 
 
-def _extract_plans(data: dict) -> Any:
-    """Locate the plans array within `data`.
+def summarise(result: ChildPlansResult) -> list[dict]:
+    """A flat row per plan -- what a create-vs-edit decision needs.
 
-    The captured response is `{ "plans": [...], "sessions": [...], ... }`, but
-    it may be nested under a wrapper field (e.g. data.<something>.plans) once you
-    see the real query. Handle both: direct `data.plans`, else search one level
-    down for a dict containing a `plans` list.
+    `sessionCount` counts plan-level and part-level session bookings together.
     """
-    if isinstance(data.get("plans"), list):
-        return data["plans"]
-    for value in data.values():
-        if isinstance(value, dict) and isinstance(value.get("plans"), list):
-            return value["plans"]
-    return None
-
-
-def summarise(plans: list[Plan]) -> list[dict]:
-    """A flat, human-scannable row per plan -- the operationally useful bits."""
     rows = []
-    for p in plans:
+    for p in result.plans:
         rows.append(
             {
                 "planId": p.id,
+                "version": p.version,
                 "childId": p.child_id,
                 "from": p.from_,
                 "to": p.to,
                 "openEnded": p.is_open_ended,
                 "billingScheme": p.billing_scheme,
                 "monthlyEstimate": p.monthly_estimate,
-                "sessionDays": [b.day for b in p.session_bookings],
-                "planPartCount": len(p.plan_parts),
+                "planPartIds": p.plan_part_ids,
+                "sessionCount": p.session_booking_count,
             }
         )
     return rows
@@ -346,26 +427,30 @@ def summarise(plans: list[Plan]) -> list[dict]:
 
 def run(
     child_id: str,
-    client: GraphQLClient | None = None,
-) -> list[Plan]:
-    """Fetch and parse the full plan structure for one child.
+    version: int = DEFAULT_VERSION,
+    client: RestClient | None = None,
+) -> ChildPlansResult:
+    """Fetch and parse the plans for one child.
 
     Args:
         child_id: the Famly child ID.
+        version: the plans API version (query param, not a path segment).
         client: optional client, mainly for tests or reuse across calls.
 
     Returns:
-        Parsed Plan objects, in the order the API returned them.
-
-    NOTE: if the captured query needs more than childId (e.g. an
-    institutionSetId), add it to `variables` below and to the CLI in cli.py.
+        A ChildPlansResult. `has_plans` answers whether the child has any, and
+        `current_plan` gives the single plan when there is exactly one.
     """
-    client = client or GraphQLClient()
+    client = client or RestClient()
 
-    body = client.execute(
-        query_path=QUERY_PATH,
-        variables={"childId": child_id},
-        operation_name=OPERATION_NAME,
+    body = client.get(
+        PLANS_PATH,
+        params={
+            "version": version,
+            "childId": child_id,
+            # Sent as a string: this is a query param, not a JSON body.
+            "flexiblePackages": "true",
+        },
     )
 
-    return parse_response(body)
+    return parse_response(body, child_id=child_id)

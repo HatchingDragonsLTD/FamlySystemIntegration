@@ -14,8 +14,8 @@ import json
 import sys
 from dataclasses import asdict, is_dataclass
 
-from actions.get_billing_plan import cli as child_plans
 from actions.plan_write import cli as plan_write
+from actions.read_child_plans import cli as read_child_plans
 from actions.staff_credentials import cli as staff_credentials
 from actions.plan_write.runner import PlanCommitRefused
 from core.client import GraphQLError, GraphQLHTTPError
@@ -25,7 +25,7 @@ from core.rest_client import RestHTTPError
 # One line per action. main.py does not grow beyond this list.
 ACTIONS = [
     staff_credentials,
-    child_plans,
+    read_child_plans,
     plan_write,
 ]
 
@@ -42,7 +42,7 @@ def _print_result(result) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="main.py",
-        description="Query the Famly GraphQL API.",
+        description="Query and write the Famly API (GraphQL and REST).",
     )
     subparsers = parser.add_subparsers(dest="action", required=True)
 
