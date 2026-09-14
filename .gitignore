@@ -1,0 +1,31 @@
+# Secrets / local config
+.env
+.env.*
+!.env.example
+
+# Downloaded or generated output
+output/
+downloads/
+*.json.out
+*.csv
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Virtualenvs
+.venv/
+venv/
+env/
+
+# Tooling / editors
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.vscode/
+.idea/
+.DS_Store

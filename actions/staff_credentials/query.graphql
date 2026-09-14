@@ -1,0 +1,34 @@
+query GetStaffCredentialAssignments($employeeIds: [EmployeeId!]) {
+  staffQualifications {
+    assignments(employeeIds: $employeeIds) {
+      ...QualificationAssignment
+      __typename
+    }
+    __typename
+  }
+}
+
+fragment QualificationAssignment on QualificationAssignment {
+  id
+  qualificationDate
+  title
+  note
+  certificateNumber
+  expirationDate
+  qualification {
+    id
+    name
+    __typename
+  }
+  files {
+    id
+    name
+    url
+    __typename
+  }
+  ... on Level {
+    level
+    __typename
+  }
+  __typename
+}
