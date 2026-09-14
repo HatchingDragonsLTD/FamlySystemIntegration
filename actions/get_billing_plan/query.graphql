@@ -1,0 +1,22 @@
+# PLACEHOLDER -- paste the real query here (query text only, no sample response).
+#
+# To capture it:
+#   1. Open app.famly.co, go to a child's Plan / billing screen.
+#   2. Open browser dev tools -> Network tab, filter to "graphql".
+#   3. Reload the plan view so the request fires.
+#   4. Find the request whose payload has "operationName" for the plan query
+#      (the one whose response contains "plans", "sessions", "planParts").
+#   5. Copy the value of the "query" field out of the request payload and paste
+#      it below, unescaping the \n line breaks so it reads as normal GraphQL.
+#
+# Then update runner.py:
+#   - OPERATION_NAME  -> the operationName from the payload
+#   - VARIABLE_NAMES  -> confirm the variable(s); the runner assumes a single
+#                        childId of type Uuid/ChildId. If the query also needs an
+#                        institutionSetId (or similar), add it (see runner.py).
+#
+# Example of the shape expected (NOT the real query -- replace entirely):
+#
+# query GetChildPlans($childId: ChildId!) {
+#   ...
+# }

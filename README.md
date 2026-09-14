@@ -10,13 +10,17 @@ requests; configuration and the access token come from the environment.
 ## Layout
 
 ```
-core/config.py                        settings from environment variables
-core/session.py                       attaches the access token to requests
-core/client.py                        generic GraphQL client (query-agnostic)
-actions/staff_credentials/query.graphql   the query text
-actions/staff_credentials/runner.py       runs it, owns its response types
-integrations/                         reserved, empty (see its README)
-main.py                               CLI dispatcher
+core/config.py                         settings from environment variables
+core/session.py                        attaches the access token to requests
+core/client.py                         generic GraphQL client (query-agnostic)
+core/rest_client.py                    generic REST client (endpoint-agnostic)
+actions/<name>/query.graphql           the query text (GraphQL actions)
+actions/<name>/runner.py               does the work, owns its response types
+actions/<name>/cli.py                  argparse wiring only
+actions/plan_write/builder.py          builds the plan write request body
+actions/plan_write/warnings.py         classifies + escalates plan warnings
+integrations/                          reserved, empty (see its README)
+main.py                                CLI dispatcher
 ```
 
 The separation matters: `core/client.py` knows nothing about any specific query,
@@ -110,6 +114,71 @@ dropped, and every item retains its untouched response dict in `raw`.
 
 Create `actions/<name>/query.graphql` and `actions/<name>/runner.py` with a
 `run(...)` function, then add one entry to the `ACTIONS` dict in `main.py`.
+
+## Writing plans (the `plan` action)
+
+Plan create/update is **REST, not GraphQL**: `POST /api/v2/plans` with
+`?preview=<bool>&version=<int>`, authenticated with the same
+`x-famly-accesstoken` header via `TokenSession`.
+
+### Preview vs commit
+
+Preview and commit are the **same request**. The only difference is one query
+param:
+
+| | `preview=true` | `preview=false` |
+| --- | --- | --- |
+| Server calculates the plan | yes | yes |
+| Anything persisted | **no** | **yes** |
+
+That single flag is all that separates a dry run from a write, which is exactly
+why `commit()` is guarded.
+
+```bash
+# Dry run -- safe, never writes
+python main.py plan --from-json plan.json --version 3
+
+# Write -- both extra flags are required
+python main.py plan --from-json plan.json --version 3 --mode commit     --confirm --test-child <childId>
+```
+
+`--from-json` takes either the full `{"plan": {...}}` wrapper or a bare plan
+object. Build one in Python with `actions/plan_write/builder.py`
+(`build_plan_body`), which sends the sparse shape and generates `planPartId`
+UUIDs; the server backfills prices, session versions and booking IDs.
+
+### Guards on commit
+
+`runner.commit()` refuses, before sending anything, unless:
+
+1. `confirm=True` is passed explicitly, and
+2. the body's `childId` appears in `allowed_child_ids` (the CLI fills this from
+   `--test-child`, repeatable).
+
+It then runs a **preview first**, surfaces the warnings, and only then posts
+with `preview=false`. The guards live in the runner, not the CLI, so a server
+importing `commit()` directly gets identical protection. A refusal exits `3`.
+
+**The first real commit must target a disposable test child.** Nothing in the
+code knows which child IDs are real, so this is enforced by you naming the test
+child on every commit — there is no default allow-list and an empty one refuses.
+
+### Warnings are the only failure signal
+
+The endpoint returns **HTTP 200 even when the plan is invalid**. Validation
+problems come back inside `behaviors[]` as the `ShowPlanWarnings` entry, so a
+successful status code means nothing on its own.
+
+Both modes therefore always extract warnings, print them prominently to stderr,
+and return them on the result. `actions/plan_write/warnings.py` classifies each
+one against `KNOWN_WARNINGS`; anything unrecognised is escalated through
+`notify()`, which currently logs to stderr prefixed `UNHANDLED PLAN WARNING`.
+Swap the delivery with `set_notifier(fn)` when an `integrations/` bridge exists
+— callers do not change.
+
+`KNOWN_WARNINGS` is seeded with the funding-mismatch case. Its `error` code is a
+placeholder until a real warning payload is captured; the title match carries it
+until then, and anything unmatched escalates rather than passing silently.
 
 ## Note on file URLs and expiry
 

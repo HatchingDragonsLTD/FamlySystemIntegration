@@ -1,10 +1,12 @@
 """CLI dispatcher.
 
-Thin by design: it parses arguments and calls a runner. All real work lives in
-`actions/<name>/runner.py`, so a future server or scheduler can import those
-runners directly without going through this file.
+Thin by design and stays that way: it collects the action CLI modules listed in
+ACTIONS, wires up their subcommands, and calls the matching handler. All action
+logic lives in `actions/<name>/runner.py` (server-importable) and all action CLI
+wiring lives in `actions/<name>/cli.py`.
 
-Register a new action by adding one entry to ACTIONS below.
+Register a new action by adding one import and one entry to ACTIONS below. Each
+listed module must expose: NAME, HELP, add_args(parser), handle(args).
 """
 
 import argparse
@@ -12,64 +14,20 @@ import json
 import sys
 from dataclasses import asdict, is_dataclass
 
-from actions.staff_credentials import runner as staff_credentials_runner
+from actions.get_billing_plan import cli as child_plans
+from actions.plan_write import cli as plan_write
+from actions.staff_credentials import cli as staff_credentials
+from actions.plan_write.runner import PlanCommitRefused
 from core.client import GraphQLError, GraphQLHTTPError
 from core.config import ConfigError
+from core.rest_client import RestHTTPError
 
-# Sort keys offered for staff-credentials, mapped to the attribute to sort on.
-STAFF_CREDENTIALS_SORT_KEYS = {
-    "title": "title",
-    "date": "qualification_date",
-    "expiry": "expiration_date",
-    "qualification": "qualification_name",
-}
-
-
-def _add_staff_credentials_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument(
-        "employee_ids",
-        nargs="+",
-        metavar="employeeId",
-        help="One or more Famly employee IDs",
-    )
-    parser.add_argument(
-        "--format",
-        choices=("summary", "full"),
-        default="summary",
-        help=(
-            "summary: title, qualificationDate, note, certificateNumber, "
-            "qualification (default). full: every parsed field, including "
-            "expirationDate, level and file URLs."
-        ),
-    )
-    parser.add_argument(
-        "--sort",
-        choices=sorted(STAFF_CREDENTIALS_SORT_KEYS),
-        help="Sort the output. Omit to keep the order the API returned.",
-    )
-
-
-def _run_staff_credentials(args: argparse.Namespace):
-    assignments = staff_credentials_runner.run(args.employee_ids)
-
-    if args.sort:
-        attr = STAFF_CREDENTIALS_SORT_KEYS[args.sort]
-        # Missing values sort last rather than blowing up on None comparison.
-        assignments.sort(key=lambda a: (getattr(a, attr) is None, getattr(a, attr) or ""))
-
-    if args.format == "summary":
-        return staff_credentials_runner.summarise(assignments)
-    return assignments
-
-
-# name -> (help text, argument setup, handler)
-ACTIONS = {
-    "staff-credentials": (
-        "Fetch staff qualification assignments for one or more employees",
-        _add_staff_credentials_args,
-        _run_staff_credentials,
-    ),
-}
+# One line per action. main.py does not grow beyond this list.
+ACTIONS = [
+    staff_credentials,
+    child_plans,
+    plan_write,
+]
 
 
 def _print_result(result) -> None:
@@ -88,16 +46,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="action", required=True)
 
-    for name, (help_text, add_args, _handler) in ACTIONS.items():
-        sub = subparsers.add_parser(name, help=help_text)
-        add_args(sub)
+    for module in ACTIONS:
+        sub = subparsers.add_parser(module.NAME, help=module.HELP)
+        module.add_args(sub)
 
     return parser
 
 
+def _handler_for(name: str):
+    for module in ACTIONS:
+        if module.NAME == name:
+            return module.handle
+    raise KeyError(name)  # argparse's required subparser makes this unreachable
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    _help, _add_args, handler = ACTIONS[args.action]
+    handler = _handler_for(args.action)
 
     try:
         result = handler(args)
@@ -110,6 +75,12 @@ def main(argv: list[str] | None = None) -> int:
     except GraphQLError as exc:
         print(f"GraphQL error: {exc}", file=sys.stderr)
         return 1
+    except RestHTTPError as exc:
+        print(f"HTTP error: {exc}", file=sys.stderr)
+        return 1
+    except PlanCommitRefused as exc:
+        print(f"Refused: {exc}", file=sys.stderr)
+        return 3
 
     _print_result(result)
     return 0
