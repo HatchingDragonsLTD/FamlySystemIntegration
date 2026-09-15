@@ -1,9 +1,24 @@
 """HTTP entry point for the HubSpot -> Famly intake.
 
-A deliberately tiny Flask app: one POST route that authenticates the caller
-with a shared secret, hands the JSON body to the preview-only intake, and
-returns the computed result plus any plan warnings. It never commits -- the
-intake is dry-run only by construction (handle_intake raises if asked to write).
+A deliberately tiny Flask app acting as a ROUTER: one POST route that
+authenticates the caller with a shared secret, reads the `action` field from
+the JSON body, dispatches to that action's handler via `web_registry`, and
+wraps whatever comes back in a standard envelope.
+
+It never commits -- the only registered action is preview-only by construction.
+
+This file holds NO per-action logic and must not import any `actions.*` module
+directly: the registry owns that. Adding an action means adding one entry to
+`web_registry.ACTIONS` (see the note there); nothing here changes.
+
+Request body:
+
+    {"action": "plan_preview", ...action fields...}
+
+Response envelope, applied to every action:
+
+    {"ok": bool, "action": "<name>", "data": {...},
+     "warnings": [...], "errors": [...]}
 
 Run behind Caddy (which terminates TLS). Served by gunicorn under systemd in
 production; `python server.py` runs Flask's dev server for local testing only.
@@ -12,18 +27,17 @@ Config comes from the environment (loaded from .env alongside the rest of the
 app):
     INTAKE_SHARED_SECRET   required. Callers must send it as the
                            X-Intake-Secret header. Requests without it are 401.
-    INTAKE_PLAN_VERSION    optional int, default 3. The plan `version` passed
-                           through to preview.
+    INTAKE_PLAN_VERSION    optional int, default 3. Read by the plan_preview
+                           action itself, not here.
     FAMLY_ACCESS_TOKEN / FAMLY_* are read by the existing core.config layer.
 """
 
 import os
-import dataclasses
 
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 
-from actions.plan_write import hubspot_intake
+import web_registry
 from core.rest_client import RestHTTPError
 
 load_dotenv()
@@ -31,7 +45,6 @@ load_dotenv()
 app = Flask(__name__)
 
 SHARED_SECRET = os.environ.get("INTAKE_SHARED_SECRET", "").strip()
-PLAN_VERSION = int(os.environ.get("INTAKE_PLAN_VERSION", "3"))
 
 
 def _authorized(req) -> bool:
@@ -47,6 +60,79 @@ def _authorized(req) -> bool:
     return provided == SHARED_SECRET
 
 
+def _envelope(
+    action: str | None,
+    *,
+    ok: bool,
+    data: dict | None = None,
+    warnings: list | None = None,
+    errors: list | None = None,
+) -> dict:
+    """The one response shape every action returns through."""
+    return {
+        "ok": ok,
+        "action": action,
+        "data": data or {},
+        "warnings": warnings or [],
+        "errors": errors or [],
+    }
+
+
+def _dispatch(action: str, handler, payload: dict) -> tuple[dict, int]:
+    """Call an action handler and classify anything it raises.
+
+    Classification lives here so every action inherits it identically:
+
+      * Famly 4xx -> 422. A bad payload (e.g. "please select a billing
+        profile") will NEVER succeed on retry, so HubSpot must not retry it.
+        Returning 5xx here makes HubSpot retry the same doomed request forever.
+      * Famly 5xx -> 502. A real transient upstream fault, worth a retry.
+      * anything else -> 500.
+    """
+    try:
+        data, status = handler(payload)
+    except RestHTTPError as exc:
+        if 400 <= exc.status_code < 500:
+            return (
+                _envelope(
+                    action,
+                    ok=False,
+                    errors=["famly rejected the plan", str(exc)],
+                ),
+                422,
+            )
+        return (
+            _envelope(
+                action,
+                ok=False,
+                errors=["famly upstream error", str(exc)],
+            ),
+            502,
+        )
+    except Exception as exc:  # noqa: BLE001 - unexpected server fault -> 500
+        return (
+            _envelope(action, ok=False, errors=["intake failed", str(exc)]),
+            500,
+        )
+
+    # Handlers return warnings/errors alongside their data; the envelope owns
+    # those two, so lift them out of the action payload.
+    data = dict(data)
+    warnings = data.pop("warnings", [])
+    errors = data.pop("errors", [])
+
+    return (
+        _envelope(
+            action,
+            ok=status == 200,
+            data=data,
+            warnings=warnings,
+            errors=errors,
+        ),
+        status,
+    )
+
+
 @app.get("/health")
 def health():
     """Unauthenticated liveness check (no secrets, no Famly calls)."""
@@ -59,46 +145,38 @@ def intake():
         return jsonify({"error": "unauthorized"}), 401
 
     payload = request.get_json(silent=True)
-    if payload is None:
-        return jsonify({"error": "body must be JSON"}), 400
+    if not isinstance(payload, dict):
+        return jsonify({"error": "body must be a JSON object"}), 400
 
-    try:
-        result = hubspot_intake.handle_intake(
-            payload,
-            version=PLAN_VERSION,
-            dry_run=True,  # never commit from the webhook path
-        )
-    except RestHTTPError as exc:
-        # Famly rejected the request. A 4xx from Famly is a bad-payload problem
-        # (e.g. "please select a billing profile") -- it will NEVER succeed on
-        # retry, so we must return a 4xx to HubSpot too. Returning 5xx here makes
-        # HubSpot retry the same doomed request forever. Only Famly 5xx (a real
-        # transient upstream fault) is worth a retry, so we pass 502 for those.
-        if 400 <= exc.status_code < 500:
-            return (
-                jsonify({"error": "famly rejected the plan", "detail": str(exc)}),
-                422,
-            )
+    action = payload.get("action")
+    valid = ", ".join(web_registry.action_names())
+
+    if not action:
         return (
-            jsonify({"error": "famly upstream error", "detail": str(exc)}),
-            502,
+            jsonify(
+                _envelope(
+                    None,
+                    ok=False,
+                    errors=[f"missing 'action' field. Valid actions: {valid}"],
+                )
+            ),
+            400,
         )
-    except Exception as exc:  # noqa: BLE001 - unexpected server fault -> 500
-        return jsonify({"error": "intake failed", "detail": str(exc)}), 500
 
-    warnings = [
-        dataclasses.asdict(w) if dataclasses.is_dataclass(w) else str(w)
-        for w in result.warnings
-    ]
+    handler = web_registry.get_handler(action)
+    if handler is None:
+        return (
+            jsonify(
+                _envelope(
+                    action,
+                    ok=False,
+                    errors=[f"unknown action {action!r}. Valid actions: {valid}"],
+                )
+            ),
+            400,
+        )
 
-    body = {
-        "ok": result.ok,
-        "errors": result.errors,
-        "warnings": warnings,
-        "previewed": result.result is not None,
-    }
-    # Validation failures are a client problem (bad payload) -> 422.
-    status = 200 if result.ok else 422
+    body, status = _dispatch(action, handler, payload)
     return jsonify(body), status
 
 

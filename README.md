@@ -292,6 +292,75 @@ There is no HTTP server here and none belongs in this package. A Flask/FastAPI
 shell can call `handle_intake` once the read-only path is proven; it belongs in
 `integrations/`, subject to the rule in that folder's README.
 
+## The intake server
+
+`server.py` is a thin Flask **router**. It authenticates, reads an `action`
+field from the JSON body, dispatches to that action's handler via
+`web_registry.py`, and wraps the result in one standard envelope. It holds no
+per-action logic and imports no `actions.*` module — the registry does that.
+
+### ⚠️ HubSpot webhook change required
+
+The webhook previously sent plan fields at the top level with no `action`
+field. **It must now send `"action": "plan_preview"` in the body.** Without it
+the request is rejected with 400 and a message listing the valid actions —
+update the HubSpot webhook before relying on this.
+
+```json
+{
+  "action": "plan_preview",
+  "childId": "...",
+  "from": "2026-09-01",
+  "monday_session": "..."
+}
+```
+
+Everything else about the payload is unchanged: plan fields at the top level,
+or nested under `properties`/`data`.
+
+### Routes
+
+| Route | Auth | Purpose |
+| --- | --- | --- |
+| `GET /health` | none | liveness check; no secrets, no Famly calls |
+| `POST /intake` | `X-Intake-Secret` header | dispatches by `action` |
+
+### Response envelope
+
+Every action returns through the same shape:
+
+```json
+{"ok": true, "action": "plan_preview", "data": {}, "warnings": [], "errors": []}
+```
+
+For `plan_preview`, `data` holds `plan` (the flattened summary), `plan_full`
+(Famly's computed response, untouched) and `previewed`. `warnings` and `errors`
+come from the intake result. `ok` is true only on a successful preview.
+
+### Status codes
+
+| Situation | Status | Retry? |
+| --- | --- | --- |
+| Successful preview | 200 | — |
+| Missing or unknown `action` | 400 | no |
+| Missing/invalid shared secret | 401 | no |
+| Validation rejected the payload | 422 | **no** |
+| Famly returned 4xx | 422 | **no** |
+| Famly returned 5xx | 502 | yes |
+| Anything else | 500 | yes |
+
+The 4xx→422 mapping is deliberate: a Famly 4xx means the payload is wrong and
+will never succeed, so HubSpot must not retry it. Only a Famly 5xx is a real
+transient fault. This classification lives in the router, so every action
+inherits it.
+
+### Adding a web action
+
+Create `actions/<name>/web.py` exposing `ACTION_NAME` and
+`handle(payload) -> (data, status)`, then add one entry to
+`web_registry.ACTIONS`. `server.py` does not change. Handlers are plain
+functions — unit-testable without Flask or a running server.
+
 ## Note on file URLs and expiry
 
 Each assignment's `files[].url` is a **pre-signed S3 URL that expires roughly
@@ -304,5 +373,6 @@ This tool does not download files today; it is read-only and prints parsed data.
 
 ## Scope
 
-Read-only by intent. No mutations, no integrations, no webhook server. See
+Read-only by intent. The intake server previews plans and never commits: the
+only registered web action is dry-run by construction. See
 `integrations/README.md` before adding anything that writes to another system.
