@@ -15,7 +15,7 @@ No argparse, no commit path.
 from dataclasses import dataclass, field
 from typing import Any
 
-from . import input_schema, runner
+from . import hubspot_flatten, input_schema, runner
 
 # Wrappers a webhook may nest the payload under. Checked in order.
 PAYLOAD_WRAPPER_KEYS = ("properties", "data")
@@ -60,10 +60,14 @@ def unwrap_payload(payload: Any) -> Any:
 def parse_hubspot_payload(payload: Any) -> input_schema.PlanInput:
     """Parse a webhook payload into a PlanInput.
 
-    Defensive: never raises. An unusable payload yields an empty PlanInput,
-    which `input_schema.validate` then reports on.
+    The HubSpot native webhook sends a flat field set (one sessionId per day,
+    scalar billing/funding fields), so we reshape it into the nested plan
+    structure before parsing. Defensive: never raises. An unusable payload
+    yields an empty PlanInput, which `input_schema.validate` then reports on.
     """
-    return input_schema.from_dict(unwrap_payload(payload))
+    unwrapped = unwrap_payload(payload)
+    nested = hubspot_flatten.flatten_to_nested(unwrapped)
+    return input_schema.from_dict(nested)
 
 
 def handle_intake(

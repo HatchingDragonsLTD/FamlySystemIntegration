@@ -323,7 +323,11 @@ def validate(plan_input: PlanInput) -> list[str]:
                 f"from: {plan_input.from_date!r} is not an ISO date (YYYY-MM-DD)"
             )
 
-    _check_optional_uuid(plan_input.rule_group_id, "ruleGroupId", errors)
+    # ruleGroupId is a Famly ULID (e.g. 01M0SM9F...), not a UUID. Optional:
+    # absent is fine; present must be a non-empty string.
+    if plan_input.rule_group_id is not None:
+        if not isinstance(plan_input.rule_group_id, str) or not plan_input.rule_group_id.strip():
+            errors.append("ruleGroupId: present but empty (use null to omit it)")
 
     if not plan_input.plan_parts:
         errors.append("planParts: at least one plan part is required")
@@ -331,7 +335,11 @@ def validate(plan_input: PlanInput) -> list[str]:
     for index, part in enumerate(plan_input.plan_parts):
         prefix = f"planParts[{index}]"
 
-        _check_uuid(part.billing_profile_id, f"{prefix}.billingProfileId", errors)
+        # billingProfileId is resolved server-side (from the child's existing
+        # plan / billing-profile lookup), so it is not required at intake time.
+        # When present it must be a UUID; when absent it is filled in later.
+        if part.billing_profile_id is not None:
+            _check_uuid(part.billing_profile_id, f"{prefix}.billingProfileId", errors)
         _check_uuid(
             part.attendance_schedule_id, f"{prefix}.attendanceScheduleId", errors
         )
