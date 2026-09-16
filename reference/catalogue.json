@@ -1,0 +1,34 @@
+{
+  "_comment": [
+    "Local names for Famly session and product UUIDs, used to label the Slack",
+    "plan-preview summary. Famly's plans response identifies sessions and",
+    "products by UUID only and carries no titles, so they are mapped here.",
+    "",
+    "Fill in the name against each UUID. An entry left empty (or an id absent",
+    "from this file) falls back to showing the raw UUID, so a half-filled file",
+    "is safe -- it never blocks a preview or a Slack post.",
+    "",
+    "Sessions come in two sets of three: funded and unfunded.",
+    "Replace the PASTE-... placeholder keys with the real UUIDs.",
+    "",
+    "The file is re-read on every preview, so edits take effect without a",
+    "server restart. Point FAMLY_CATALOGUE_FILE elsewhere to override the path."
+  ],
+
+  "sessions": {
+    "222faa9f-b12e-498c-aac4-28fc442e4989": "Funded Full Day",
+    "75040dda-848c-468e-9efe-74b203ca2ea1": "Funded Morning",
+    "c6fe35a4-3fea-4c30-9313-f10fc969fb5b": "Funded Afternoon",
+
+    "4d8b109a-62e1-40eb-afab-242fc39cb71c": "Full Day",
+    "a649ec9b-242d-479c-a572-3c4d83c715a8": "Morning",
+    "8f150941-08cd-4642-a50c-014c5429e94e": "Afternoon"
+  },
+
+  "products": {
+    "69ff7b03-2743-4fdb-98fb-dda081e42784": "Funded Meals & Snacks",
+    "efc8f065-7342-4e4f-8ab0-c9d81ec587d1": "Funded Educational Activites & Extras",
+    "8a95de4f-f080-4063-8d49-3b03fe95644c":"Meals & Snacks",
+    "7de23b4b-699a-4847-9ca6-6928d70886fb":"Educational Activites & Extras"
+  }
+}

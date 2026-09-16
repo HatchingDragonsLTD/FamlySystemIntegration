@@ -13,13 +13,15 @@ import hashlib
 import hmac
 import json
 import logging
+import pathlib
+import tempfile
 import time
 import unittest
 from unittest import mock
 from urllib.parse import urlencode
 
 from actions.read_child_plans.runner import parse_plan, parse_response
-from integrations import slack
+from integrations import catalogue, slack
 
 # The integration logs loudly on failure by design; keep the test output clean.
 logging.disable(logging.CRITICAL)
@@ -284,6 +286,81 @@ class BuildSummaryTests(unittest.TestCase):
     def test_missing_reference_and_plan_never_raise(self):
         self.assertIn("Monday — s-full", slack.build_summary(self.plan, []))
         self.assertIn("no plan returned", slack.build_summary(None, []))
+
+
+class CatalogueTests(unittest.TestCase):
+    """The local UUID -> name map that labels the Slack summary."""
+
+    def _write(self, tmpdir, payload):
+        path = pathlib.Path(tmpdir) / "catalogue.json"
+        path.write_text(payload, encoding="utf-8")
+        return path
+
+    def test_loads_session_and_product_names(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(
+                tmp,
+                json.dumps(
+                    {
+                        "sessions": {"s-1": "Full Day (Funded)"},
+                        "products": {"p-1": "Hot Lunch"},
+                    }
+                ),
+            )
+            with mock.patch.dict("os.environ", {"FAMLY_CATALOGUE_FILE": str(path)}):
+                sessions, products = catalogue.load_titles()
+
+        self.assertEqual(sessions, {"s-1": "Full Day (Funded)"})
+        self.assertEqual(products, {"p-1": "Hot Lunch"})
+
+    def test_unfilled_placeholders_are_dropped(self):
+        # An empty name must behave like an absent id, so the summary falls
+        # back to the UUID rather than printing a blank.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(
+                tmp,
+                json.dumps({"sessions": {"s-1": "", "s-2": "   ", "s-3": "Morning"}}),
+            )
+            with mock.patch.dict("os.environ", {"FAMLY_CATALOGUE_FILE": str(path)}):
+                sessions, products = catalogue.load_titles()
+
+        self.assertEqual(sessions, {"s-3": "Morning"})
+        self.assertEqual(products, {})
+
+    def test_missing_or_malformed_file_never_raises(self):
+        with mock.patch.dict(
+            "os.environ", {"FAMLY_CATALOGUE_FILE": "/nope/not-here.json"}
+        ):
+            self.assertEqual(catalogue.load_titles(), ({}, {}))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(tmp, "{not json")
+            with mock.patch.dict("os.environ", {"FAMLY_CATALOGUE_FILE": str(path)}):
+                self.assertEqual(catalogue.load_titles(), ({}, {}))
+
+    def test_shipped_catalogue_file_is_valid_json(self):
+        # The committed template must always parse, however it is filled in.
+        raw = json.loads(
+            catalogue.DEFAULT_CATALOGUE_PATH.read_text(encoding="utf-8")
+        )
+        self.assertIsInstance(raw.get("sessions"), dict)
+        self.assertIsInstance(raw.get("products"), dict)
+
+    def test_names_from_the_file_reach_the_summary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(
+                tmp, json.dumps({"sessions": {"s-full": "Full Day (Funded)"}})
+            )
+            with mock.patch.dict("os.environ", {"FAMLY_CATALOGUE_FILE": str(path)}):
+                sessions, products = catalogue.load_titles()
+
+        plan, _ = _sample_plan_and_reference()
+        text = slack.build_summary(
+            plan, [], session_titles=sessions, product_titles=products
+        )
+        self.assertIn("• Monday — Full Day (Funded) — 203.13", text)
+        # The product has no entry, so it stays a UUID.
+        self.assertIn("• Monday — 1× p-lunch — 3.50", text)
 
 
 class VerifySlackRequestTests(unittest.TestCase):

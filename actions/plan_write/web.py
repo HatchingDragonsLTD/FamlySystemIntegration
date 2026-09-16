@@ -25,8 +25,7 @@ import os
 import uuid
 from typing import Any
 
-from actions.read_child_plans import runner as read_child_plans
-from integrations import slack
+from integrations import catalogue, slack
 
 from . import hubspot_intake
 
@@ -89,34 +88,15 @@ def _log_plan_full(preview_id: str, plan_full: Any) -> None:
     logger.info("PLAN PREVIEW preview_id=%s plan_full=%s", preview_id, rendered)
 
 
-def _catalogue_titles(plan: Any) -> tuple[dict, dict]:
-    """Fetch the child's session/product catalogue for naming bookings.
+def _catalogue_titles() -> tuple[dict, dict]:
+    """Names for the session and product UUIDs the plan books.
 
-    The preview response identifies sessions and products by UUID only, so the
-    names come from `read_child_plans.run`, which returns the catalogue
-    alongside the child's plans. ONE call serves both maps.
-
-    Never raises: a catalogue that cannot be fetched means the Slack summary
-    falls back to showing UUIDs. A cosmetic lookup must not cost the approver
-    the message, nor break a preview that has already succeeded.
+    Read from the local catalogue file: Famly's plans response carries the ids
+    only, with no titles, so there is nothing to look them up against over the
+    API. See `integrations/catalogue.py` -- it never raises, and an id it does
+    not cover falls back to the UUID.
     """
-    child_id = getattr(plan, "child_id", None)
-    if not child_id:
-        logger.warning("No childId on the previewed plan; cannot resolve names")
-        return {}, {}
-
-    try:
-        catalogue = read_child_plans.run(child_id, version=PLAN_VERSION)
-    except Exception as exc:  # noqa: BLE001 - naming must never break a preview
-        logger.warning(
-            "Could not fetch the reference catalogue for child %s: %s; "
-            "the Slack summary will show raw IDs",
-            child_id,
-            exc,
-        )
-        return {}, {}
-
-    return catalogue.session_titles, catalogue.product_titles
+    return catalogue.load_titles()
 
 
 def handle(payload: dict) -> tuple[dict, int]:
@@ -173,9 +153,9 @@ def handle(payload: dict) -> tuple[dict, int]:
     # The full plan is logged, not returned.
     _log_plan_full(preview_id, preview.raw)
 
-    # Names come from the child's live catalogue, which the preview response
-    # does not carry. One fetch, reused for both maps.
-    session_titles, product_titles = _catalogue_titles(preview.plan)
+    # Names come from the local catalogue file; the preview response has ids
+    # only. No Famly call, so a preview costs exactly one request as before.
+    session_titles, product_titles = _catalogue_titles()
 
     data["slack_posted"] = slack.post_preview(
         slack.build_summary(
