@@ -12,9 +12,9 @@ Messages are posted proactively (chat.postMessage), so they are updated by
 POSTing to the interaction's `response_url` -- an inline `replace_original`
 response does not reliably update a message Slack did not render itself.
 
-The inbound half is SECURITY-CRITICAL and fully verified even though nothing
-acts on it yet: the signature check is proven before a commit path is ever
-wired to it.
+The inbound half is SECURITY-CRITICAL: an Approve click now COMMITS a plan to
+Famly, so the signature check is the gate on a real write. It was implemented
+and proven before the commit path was attached to it.
 
 SLACK APP CONFIGURATION: the interactivity request URL must be set to
 
@@ -476,7 +476,7 @@ def update_message(response_url: str, text: str) -> bool:
 
     try:
         body = response.json()
-    except ValueError:
+    except Exception:  # noqa: BLE001 - this function promises never to raise
         body = None
 
     if isinstance(body, dict) and body.get("ok") is False:

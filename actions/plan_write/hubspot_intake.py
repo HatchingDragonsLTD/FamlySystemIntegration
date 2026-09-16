@@ -31,6 +31,9 @@ class IntakeResult:
     ok: bool = False
     errors: list[str] = field(default_factory=list)
     plan_input: input_schema.PlanInput | None = None
+    # The exact {"plan": {...}} body sent to Famly. Kept so an approval can
+    # commit precisely what was previewed, rather than rebuilding it.
+    plan_body: dict | None = None
     result: runner.ParsedPlanResult | None = None
 
     @property
@@ -113,4 +116,10 @@ def handle_intake(
     plan_body = input_schema.to_plan_body(plan_input)
     result = runner.preview(plan_body, version, client=client)
 
-    return IntakeResult(ok=True, errors=[], plan_input=plan_input, result=result)
+    return IntakeResult(
+        ok=True,
+        errors=[],
+        plan_input=plan_input,
+        plan_body=plan_body,
+        result=result,
+    )

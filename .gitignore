@@ -8,6 +8,12 @@ output/
 downloads/
 *.json.out
 
+# The preview store holds child plan data -- never commit it.
+var/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+
 # Plan payloads and CSV batches hold real child data -- keep them local.
 *.plan.json
 *.csv

@@ -5,7 +5,11 @@ authenticates the caller with a shared secret, reads the `action` field from
 the JSON body, dispatches to that action's handler via `web_registry`, and
 wraps whatever comes back in a standard envelope.
 
-It never commits -- the only registered action is preview-only by construction.
+The /intake path never commits: the only registered action is preview-only by
+construction. The Slack Approve button IS a write path -- it commits a
+previously previewed plan, behind the guards in
+actions/plan_write/approval.py (COMMIT_ENABLED, an allow-list of child IDs, a
+TTL, and an atomic claim that makes a double-click safe).
 
 This file holds NO per-action logic and must not import any `actions.*` module
 directly: the registry owns that. Adding an action means adding one entry to
@@ -32,12 +36,14 @@ app):
     SLACK_SIGNING_SECRET   required for /slack/interactivity. Without it that
                            route rejects everything (fails closed).
     SLACK_BOT_TOKEN / SLACK_CHANNEL_ID are read by integrations/slack.py.
+    COMMIT_ENABLED / COMMIT_ALLOWED_CHILD_IDS gate the commit path; see
+                           core/config.py and actions/plan_write/approval.py.
     FAMLY_ACCESS_TOKEN / FAMLY_* are read by the existing core.config layer.
 
 Routes:
     GET  /health              unauthenticated liveness check
     POST /intake              shared-secret auth, dispatches by `action`
-    POST /slack/interactivity Slack-signature auth, records button clicks
+    POST /slack/interactivity Slack-signature auth; Approve commits a plan
 """
 
 import logging
@@ -202,9 +208,9 @@ def slack_interactivity():
     SLACK APP CONFIGURATION: set the interactivity request URL to
     https://<domain>/slack/interactivity in the Slack app settings.
 
-    Inert by design. The click is verified, parsed and logged; nothing is
-    committed. Verification is implemented fully now so the security is proven
-    before any write is attached to it.
+    Approve COMMITS the previewed plan, subject to the guards in
+    actions/plan_write/approval.py. Reject records the decision and writes
+    nothing. Both require a valid Slack signature.
     """
     # The signature is computed over the RAW body. Read it before touching
     # request.form -- re-serialising parsed form data would change the bytes and
@@ -235,14 +241,10 @@ def slack_interactivity():
         user,
     )
 
-    if action_id == slack.ACTION_APPROVE:
-        # TODO: commit path plugs in here. Look the plan up by preview_id and
-        # call actions.plan_write.runner.commit() with confirm=True and an
-        # allowed_child_ids set. Nothing writes until that is deliberately
-        # added -- an approval today is recorded and nothing more.
-        text = "✅ Approved — (commit not yet implemented)"
-    else:
-        text = "❌ Rejected"
+    # The commit path. Approve writes to Famly; the decision and every guard
+    # live in the action (via the registry), so this file keeps no per-action
+    # logic. It never raises -- a failure comes back as text for the approver.
+    text = web_registry.handle_slack_click(action_id, preview_id, user)
 
     # The message was posted proactively with chat.postMessage, so an inline
     # `replace_original` response does not reliably update it. POST to the

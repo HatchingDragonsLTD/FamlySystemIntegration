@@ -27,7 +27,7 @@ from typing import Any
 
 from integrations import catalogue, slack
 
-from . import hubspot_intake
+from . import hubspot_intake, preview_store
 
 logger = logging.getLogger(__name__)
 
@@ -152,6 +152,25 @@ def handle(payload: dict) -> tuple[dict, int]:
 
     # The full plan is logged, not returned.
     _log_plan_full(preview_id, preview.raw)
+
+    # Store the EXACT body that was previewed, so an Approve click commits
+    # precisely what the approver saw rather than a rebuild of it. A store
+    # failure must not break a preview that already succeeded -- it only means
+    # the approval cannot be honoured, which the handler reports.
+    try:
+        preview_store.save(
+            preview_id,
+            result.plan_body or {},
+            getattr(preview.plan, "child_id", None),
+            PLAN_VERSION,
+        )
+    except Exception as exc:  # noqa: BLE001 - storing must not break the preview
+        logger.warning(
+            "Could not store preview_id=%s (%s); an approval will report it as "
+            "not found",
+            preview_id,
+            exc,
+        )
 
     # Names come from the local catalogue file; the preview response has ids
     # only. No Famly call, so a preview costs exactly one request as before.

@@ -16,6 +16,7 @@ status; the router wraps it in the standard envelope and classifies any
 exception it raises.
 """
 
+from actions.plan_write import approval as plan_write_approval
 from actions.plan_write import web as plan_write_web
 
 # One line per action. ACTION_NAME -> handler.
@@ -23,10 +24,20 @@ ACTIONS = {
     plan_write_web.ACTION_NAME: plan_write_web.handle,
 }
 
+# Slack button clicks. The router verifies the signature and identifies the
+# action; the decision -- and the only write path to Famly -- lives in the
+# action, so server.py stays free of per-action logic.
+SLACK_CLICK_HANDLER = plan_write_approval.handle_click
+
 
 def get_handler(action: str):
     """The handler for `action`, or None when it is not registered."""
     return ACTIONS.get(action)
+
+
+def handle_slack_click(action_id: str, preview_id, user) -> str:
+    """Act on a verified Slack button click; returns the message text."""
+    return SLACK_CLICK_HANDLER(action_id, preview_id, user)
 
 
 def action_names() -> list[str]:

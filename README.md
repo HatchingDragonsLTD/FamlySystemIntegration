@@ -376,9 +376,9 @@ HubSpot -> POST /intake -> preview -> Slack message (Approve / Reject)
                                     logged only - nothing commits
 ```
 
-**The buttons are inert.** A click is verified, parsed and logged; approving
-records the decision and replaces the Slack message with "Approved - (commit
-not yet implemented)".
+**Approve commits the plan** -- see
+[Committing an approved plan](#committing-an-approved-plan). Reject records the
+decision and writes nothing.
 
 The message is updated by POSTing to the interaction's `response_url`, not by
 the inline response: the preview was posted proactively with `chat.postMessage`,
@@ -423,6 +423,52 @@ missing headers all return 401.
 | Interactivity request URL | `https://<domain>/slack/interactivity` |
 | Bot scope | `chat:write` |
 | Env | `SLACK_BOT_TOKEN`, `SLACK_CHANNEL_ID`, `SLACK_SIGNING_SECRET` |
+
+### Committing an approved plan
+
+Clicking **Approve** in Slack writes the plan to Famly. It is the only write
+path in the project, and it commits the EXACT body that was previewed, read
+back from a store -- never a rebuild, so what is written is what the approver
+saw.
+
+Five guards, in order. Any one of them stops the write:
+
+| Guard | Where | Refusal |
+| --- | --- | --- |
+| `COMMIT_ENABLED` must be true | `core/config.py` | "Commit is disabled" |
+| Preview must exist and be within its TTL (24h) | `preview_store.get` | "expired or not found" |
+| Not already committed / rejected / in progress | atomic claim | "already committed" |
+| Child must be in `COMMIT_ALLOWED_CHILD_IDS` | config + `runner.commit` | "child not in the allowed list" |
+| `confirm=True` and a non-empty allow-list | `runner.commit` | refusal surfaced to Slack |
+
+**The first real commit must target a disposable test child.** Set
+`COMMIT_ALLOWED_CHILD_IDS` to that child's ID and nothing else, then turn
+`COMMIT_ENABLED=true`. Widen the list only once the path is proven.
+
+```bash
+COMMIT_ENABLED=true
+COMMIT_ALLOWED_CHILD_IDS=<test-child-uuid>
+```
+
+Scope: **create only**. Overwriting an existing plan and adding a second plan
+are separate operations and are deliberately not built.
+
+#### Double-click safety
+
+Two Approve clicks would otherwise both read "pending" and write two real
+plans. The store moves `pending -> committing` in a single conditional UPDATE,
+so exactly one click can win; the second is told it was already committed. A
+failed commit releases the claim, so a corrected retry is possible.
+
+#### The preview store
+
+`actions/plan_write/preview_store.py`, SQLite via stdlib `sqlite3` (no
+dependency, and safe across gunicorn workers). It holds child plan data, so it
+lives in `var/` and is gitignored. `PREVIEW_STORE_PATH` moves it;
+`PREVIEW_TTL_HOURS` changes the 24h expiry.
+
+An approval clicked days later is refused rather than committed against stale
+pricing.
 
 ### Adding a web action
 
