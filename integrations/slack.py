@@ -3,9 +3,14 @@
 Two directions:
 
   * OUTBOUND -- `post_preview` sends a previewed plan to a Slack channel with
-    Approve / Reject buttons.
+    Approve / Reject buttons, and `update_message` replaces that message once a
+    button is clicked.
   * INBOUND  -- `verify_slack_request` and `parse_interaction` handle the
     button click Slack posts back.
+
+Messages are posted proactively (chat.postMessage), so they are updated by
+POSTing to the interaction's `response_url` -- an inline `replace_original`
+response does not reliably update a message Slack did not render itself.
 
 The inbound half is SECURITY-CRITICAL and fully verified even though nothing
 acts on it yet: the signature check is proven before a commit path is ever
@@ -253,6 +258,69 @@ def post_preview(summary_text: str, preview_id: str) -> bool:
         return False
 
     logger.info("Posted plan preview to Slack: preview_id=%s", preview_id)
+    return True
+
+
+# --------------------------------------------------------------------------- #
+# Outbound: update a message in response to a click
+# --------------------------------------------------------------------------- #
+def update_message(response_url: str, text: str) -> bool:
+    """Replace the message a button was clicked on, via its `response_url`.
+
+    An inline `replace_original` response only reliably updates messages Slack
+    itself rendered from a slash command. Previews are posted proactively with
+    chat.postMessage, so the message is updated by POSTing back to the
+    interaction's short-lived `response_url` instead.
+
+    Args:
+        response_url: from the interaction payload (see `parse_interaction`).
+        text: the replacement message text.
+
+    Returns:
+        True when Slack accepted the update, False otherwise.
+
+    Never raises -- same failure isolation as `post_preview`. A failed update
+    leaves the original message in place; it does not affect the caller.
+    """
+    if not response_url:
+        logger.warning("No response_url given; cannot update the Slack message")
+        return False
+
+    try:
+        response = requests.post(
+            response_url,
+            headers={"Content-Type": "application/json; charset=utf-8"},
+            json={"replace_original": True, "text": text},
+            timeout=POST_TIMEOUT,
+        )
+    except Exception as exc:  # noqa: BLE001 - Slack must never break the caller
+        logger.warning("Slack message update failed: %s", exc)
+        return False
+
+    # A response_url POST answers with a plain "ok" body rather than the JSON
+    # envelope chat.postMessage returns, so the status code is what counts --
+    # but check for an {"ok": false} body too, in case one is sent.
+    if response.status_code != 200:
+        logger.warning(
+            "Slack rejected the message update: HTTP %s %s",
+            response.status_code,
+            response.text[:200],
+        )
+        return False
+
+    try:
+        body = response.json()
+    except ValueError:
+        body = None
+
+    if isinstance(body, dict) and body.get("ok") is False:
+        logger.warning(
+            "Slack rejected the message update: %s",
+            body.get("error") or response.text[:200],
+        )
+        return False
+
+    logger.info("Updated the Slack message via response_url")
     return True
 
 

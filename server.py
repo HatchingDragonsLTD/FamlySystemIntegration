@@ -244,8 +244,23 @@ def slack_interactivity():
     else:
         text = "❌ Rejected"
 
-    # replace_original swaps the message in place, so the buttons cannot be
-    # clicked twice.
+    # The message was posted proactively with chat.postMessage, so an inline
+    # `replace_original` response does not reliably update it. POST to the
+    # interaction's response_url instead, and ack with an empty 200 -- Slack
+    # only needs a prompt acknowledgement here.
+    response_url = interaction.get("response_url")
+
+    if response_url:
+        slack.update_message(response_url, text)
+        return "", 200
+
+    # No response_url (shouldn't happen): fall back to the inline response so
+    # the update is at least attempted.
+    logger.warning(
+        "Slack interaction had no response_url; falling back to the inline "
+        "response for preview_id=%s",
+        preview_id,
+    )
     return jsonify({"replace_original": True, "text": text}), 200
 
 

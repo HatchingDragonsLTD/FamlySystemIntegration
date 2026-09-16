@@ -156,10 +156,18 @@ class Plan:
 
     @property
     def session_booking_count(self) -> int:
-        """Session bookings across the plan, both plan-level and part-level."""
-        return len(self.session_bookings) + sum(
-            len(p.session_bookings) for p in self.plan_parts
-        )
+        """How many sessions the plan books.
+
+        Famly MIRRORS the same bookings at both levels: `plan.sessionBookings`
+        and each `planPart.sessionBookings` describe the same sessions, so
+        adding them together counts every session twice.
+
+        The plan parts are the authoritative source, since that is where a
+        booking actually lives. The plan-level list is the fallback for a plan
+        that has no parts at all.
+        """
+        part_total = sum(len(p.session_bookings) for p in self.plan_parts)
+        return part_total if self.plan_parts else len(self.session_bookings)
 
 
 # --------------------------------------------------------------------------- #
@@ -404,7 +412,8 @@ def parse_response(body: Any, child_id: str | None = None) -> ChildPlansResult:
 def summarise(result: ChildPlansResult) -> list[dict]:
     """A flat row per plan -- what a create-vs-edit decision needs.
 
-    `sessionCount` counts plan-level and part-level session bookings together.
+    `sessionCount` counts the plan-part bookings (the two levels mirror each
+    other, so they must not be added together).
     """
     rows = []
     for p in result.plans:

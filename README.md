@@ -26,7 +26,8 @@ actions/plan_write/hubspot_intake.py   webhook payload -> normalized input
 actions/plan_write/hubspot_flatten.py  flat HubSpot fields -> nested plan shape
 actions/plan_write/web.py              plan_preview web handler
 samples/plans.sample.csv               example CSV (the only committed one)
-integrations/slack.py                  Slack post + inbound signature check
+integrations/slack.py                  Slack post/update + signature check
+tests/test_slack.py                    unit tests (stdlib unittest)
 web_registry.py                        action name -> web handler
 server.py                              thin HTTP router (no per-action logic)
 main.py                                CLI dispatcher
@@ -376,7 +377,14 @@ HubSpot -> POST /intake -> preview -> Slack message (Approve / Reject)
 ```
 
 **The buttons are inert.** A click is verified, parsed and logged; approving
-records the decision and replies "Approved - (commit not yet implemented)".
+records the decision and replaces the Slack message with "Approved - (commit
+not yet implemented)".
+
+The message is updated by POSTing to the interaction's `response_url`, not by
+the inline response: the preview was posted proactively with `chat.postMessage`,
+and an inline `replace_original` does not reliably update a message Slack did
+not render itself. The endpoint acks with an empty 200. If an interaction ever
+arrives without a `response_url`, it falls back to the inline response.
 The commit path is a deliberate later step, marked with a `TODO` in
 `server.py`. `handle_intake` remains dry-run only and raises if asked to write.
 
@@ -422,6 +430,17 @@ Create `actions/<name>/web.py` exposing `ACTION_NAME` and
 `handle(payload) -> (data, status)`, then add one entry to
 `web_registry.ACTIONS`. `server.py` does not change. Handlers are plain
 functions — unit-testable without Flask or a running server.
+
+## Tests
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+Stdlib `unittest`, no extra dependency and no running server: `requests.post`
+is swapped for a recorder, so the outbound JSON is asserted directly. Covers
+`update_message`'s payload shape and failure isolation, the Slack signature
+check (valid, tampered, replayed, unconfigured), and interaction parsing.
 
 ## Note on file URLs and expiry
 
