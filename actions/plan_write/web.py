@@ -89,6 +89,36 @@ def _log_plan_full(preview_id: str, plan_full: Any) -> None:
     logger.info("PLAN PREVIEW preview_id=%s plan_full=%s", preview_id, rendered)
 
 
+def _catalogue_titles(plan: Any) -> tuple[dict, dict]:
+    """Fetch the child's session/product catalogue for naming bookings.
+
+    The preview response identifies sessions and products by UUID only, so the
+    names come from `read_child_plans.run`, which returns the catalogue
+    alongside the child's plans. ONE call serves both maps.
+
+    Never raises: a catalogue that cannot be fetched means the Slack summary
+    falls back to showing UUIDs. A cosmetic lookup must not cost the approver
+    the message, nor break a preview that has already succeeded.
+    """
+    child_id = getattr(plan, "child_id", None)
+    if not child_id:
+        logger.warning("No childId on the previewed plan; cannot resolve names")
+        return {}, {}
+
+    try:
+        catalogue = read_child_plans.run(child_id, version=PLAN_VERSION)
+    except Exception as exc:  # noqa: BLE001 - naming must never break a preview
+        logger.warning(
+            "Could not fetch the reference catalogue for child %s: %s; "
+            "the Slack summary will show raw IDs",
+            child_id,
+            exc,
+        )
+        return {}, {}
+
+    return catalogue.session_titles, catalogue.product_titles
+
+
 def handle(payload: dict) -> tuple[dict, int]:
     """Run a dry-run plan preview for a webhook payload.
 
@@ -143,17 +173,17 @@ def handle(payload: dict) -> tuple[dict, int]:
     # The full plan is logged, not returned.
     _log_plan_full(preview_id, preview.raw)
 
-    # The Slack summary needs more than the flat dict holds -- per-day session
-    # titles, products, weekly totals -- so it gets the parsed plan object plus
-    # the reference data that names sessions and products.
-    #
-    # The reference lists come from the preview response itself, so this costs
-    # no extra Famly call. If the response does not carry them, the lookups are
-    # simply empty and the summary falls back to raw IDs.
-    reference = read_child_plans.parse_response(preview.raw)
+    # Names come from the child's live catalogue, which the preview response
+    # does not carry. One fetch, reused for both maps.
+    session_titles, product_titles = _catalogue_titles(preview.plan)
 
     data["slack_posted"] = slack.post_preview(
-        slack.build_summary(preview.plan, warnings, reference=reference),
+        slack.build_summary(
+            preview.plan,
+            warnings,
+            session_titles=session_titles,
+            product_titles=product_titles,
+        ),
         preview_id,
     )
 

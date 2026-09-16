@@ -246,6 +246,11 @@ class ChildPlansResult:
         """sessionId -> title, for naming bookings in output."""
         return {s.id: s.title for s in self.sessions if s.id}
 
+    @property
+    def product_titles(self) -> dict[str, str | None]:
+        """productId -> title, the product-side mirror of `session_titles`."""
+        return {p.id: p.title for p in self.products if p.id}
+
 
 # --------------------------------------------------------------------------- #
 # Parsers -- each guards its input type and uses .get() throughout

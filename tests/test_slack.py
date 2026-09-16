@@ -90,19 +90,33 @@ class UpdateMessageTests(unittest.TestCase):
             self.assertFalse(slack.update_message(RESPONSE_URL, "text"))
 
 
+PRICING_GROUP = "pg-active"
+OTHER_PRICING_GROUP = "pg-old"
+
+
 def _sample_plan_and_reference():
     """A plan with mirrored bookings, products, funding and a weekly total."""
+    def booking(session_id, day, prices):
+        return {
+            "sessionId": session_id,
+            "day": day,
+            "monthlyPrices": [
+                {"pricingGroupId": group, "price": price} for group, price in prices
+            ],
+        }
+
     bookings = [
-        {"sessionId": "s-full", "day": "WEDNESDAY"},
-        {"sessionId": "s-full", "day": "MONDAY"},
-        {"sessionId": "s-am", "day": "FRIDAY"},
-        {"sessionId": "s-full", "day": "TUESDAY"},
+        booking("s-full", "WEDNESDAY", [(PRICING_GROUP, 203.13)]),
+        booking("s-full", "MONDAY", [(PRICING_GROUP, 203.13), (OTHER_PRICING_GROUP, 180.0)]),
+        booking("s-am", "FRIDAY", [(PRICING_GROUP, 101.5)]),
+        booking("s-full", "TUESDAY", [(PRICING_GROUP, 203.13)]),
     ]
     plan_node = {
         "id": "plan-1",
         "childId": "child-1",
         "from": "2026-09-01",
         "to": None,
+        "pricingGroupId": PRICING_GROUP,
         "monthlyEstimate": 812.5,
         "publicFunding": {"amount": 210.0, "hours": 15, "minutes": 30},
         "planParts": [
@@ -110,7 +124,7 @@ def _sample_plan_and_reference():
                 "planPartId": "pp-1",
                 "sessionBookings": bookings,
                 "productBookings": [
-                    {"productId": "p-lunch", "day": "MONDAY", "amount": 1},
+                    {"productId": "p-lunch", "day": "MONDAY", "amount": 1, "bookedPrice": 3.5},
                     {"productId": "p-nap", "day": "WEDNESDAY", "amount": 3},
                 ],
             }
@@ -145,7 +159,12 @@ class BuildSummaryTests(unittest.TestCase):
 
     def setUp(self):
         self.plan, self.reference = _sample_plan_and_reference()
-        self.text = slack.build_summary(self.plan, [], reference=self.reference)
+        self.text = slack.build_summary(
+            self.plan,
+            [],
+            session_titles=self.reference.session_titles,
+            product_titles=self.reference.product_titles,
+        )
 
     def test_lists_each_session_once_in_week_order(self):
         session_lines = [
@@ -158,8 +177,8 @@ class BuildSummaryTests(unittest.TestCase):
         self.assertIn("*Sessions* (4)", self.text)
 
     def test_uses_session_titles_from_the_reference(self):
-        self.assertIn("• Monday — Full Day", self.text)
-        self.assertIn("• Friday — Morning Session", self.text)
+        self.assertIn("• Monday — Full Day — 203.13", self.text)
+        self.assertIn("• Friday — Morning Session — 101.50", self.text)
 
     def test_falls_back_to_session_id_when_the_title_is_unknown(self):
         plan = parse_plan(
@@ -169,13 +188,13 @@ class BuildSummaryTests(unittest.TestCase):
                 ]
             }
         )
-        text = slack.build_summary(plan, [], reference=self.reference)
+        text = slack.build_summary(plan, [], session_titles=self.reference.session_titles)
         self.assertIn("• Monday — s-x", text)
 
     def test_lists_products_with_amount_and_title(self):
         self.assertIn("*Products* (2)", self.text)
-        self.assertIn("• Monday — 1× Hot Lunch", self.text)
-        self.assertIn("• Wednesday — 3× Nappies", self.text)
+        self.assertIn("• Monday — 1× Hot Lunch — 3.50", self.text)
+        self.assertIn("• Wednesday — 3× Nappies", self.text)  # no bookedPrice -> no price
 
     def test_products_section_is_omitted_when_there_are_none(self):
         plan = parse_plan(
@@ -185,7 +204,7 @@ class BuildSummaryTests(unittest.TestCase):
                 ]
             }
         )
-        text = slack.build_summary(plan, [], reference=self.reference)
+        text = slack.build_summary(plan, [], session_titles=self.reference.session_titles)
         self.assertNotIn("*Products*", text)
 
     def test_shows_weekly_and_monthly_totals(self):
@@ -218,10 +237,49 @@ class BuildSummaryTests(unittest.TestCase):
             {"warning": {"title": "Funding mismatch", "severity": "warning"}, "known": {"key": "funding_mismatch"}},
             {"warning": {"title": "Unseen problem", "severity": "error"}, "known": None},
         ]
-        text = slack.build_summary(self.plan, warnings, reference=self.reference)
+        text = slack.build_summary(self.plan, warnings, session_titles=self.reference.session_titles)
         self.assertIn("*2 warning(s)*", text)
         self.assertIn("[funding_mismatch]", text)
         self.assertIn("[UNTRACKED]", text)
+
+    def test_price_comes_from_the_active_pricing_group_only(self):
+        # MONDAY has both the active group's 203.13 and another group's 180.00.
+        self.assertIn("• Monday — Full Day — 203.13", self.text)
+        self.assertNotIn("180.00", self.text)
+
+    def test_price_is_omitted_when_the_active_group_has_none(self):
+        plan = parse_plan(
+            {
+                "pricingGroupId": PRICING_GROUP,
+                "planParts": [
+                    {
+                        "planPartId": "pp",
+                        "sessionBookings": [
+                            {
+                                "sessionId": "s-full",
+                                "day": "MONDAY",
+                                # Only a price for a DIFFERENT pricing group.
+                                "monthlyPrices": [
+                                    {"pricingGroupId": OTHER_PRICING_GROUP, "price": 180.0}
+                                ],
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+        text = slack.build_summary(
+            plan, [], session_titles=self.reference.session_titles
+        )
+        # Better no price than the wrong one.
+        self.assertIn("• Monday — Full Day", text)
+        self.assertNotIn("180.00", text)
+
+    def test_falls_back_to_ids_without_a_catalogue(self):
+        text = slack.build_summary(self.plan, [])
+        self.assertIn("• Monday — s-full — 203.13", text)
+        self.assertIn("• Monday — 1× p-lunch — 3.50", text)
+        self.assertNotIn("Full Day", text)
 
     def test_missing_reference_and_plan_never_raise(self):
         self.assertIn("Monday — s-full", slack.build_summary(self.plan, []))

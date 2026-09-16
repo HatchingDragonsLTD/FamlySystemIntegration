@@ -130,27 +130,62 @@ def _product_bookings(plan: Any) -> list:
     return list(getattr(plan, "product_bookings", None) or [])
 
 
-def _title_lookup(reference: Any, attribute: str) -> dict:
-    """Build an id -> title map from a reference list, tolerating None."""
-    items = getattr(reference, attribute, None) or []
-    lookup = {}
-    for item in items:
-        item_id = getattr(item, "id", None)
-        if item_id:
-            lookup[item_id] = getattr(item, "title", None)
-    return lookup
+def _active_pricing_group(plan: Any) -> str | None:
+    """The pricing group whose prices apply to this plan.
+
+    Taken from the plan itself, falling back to the first plan state (the
+    current period) when the plan node does not carry it.
+    """
+    group = getattr(plan, "pricing_group_id", None)
+    if group:
+        return group
+
+    states = getattr(plan, "plan_states", None) or []
+    for state in states:
+        raw = getattr(state, "raw", None)
+        if isinstance(raw, dict) and raw.get("pricingGroupId"):
+            return raw["pricingGroupId"]
+    return None
 
 
-def build_summary(plan: Any, warnings: list, reference: Any = None) -> str:
+def _session_price(booking: Any, pricing_group_id: str | None) -> Any | None:
+    """The booking's price for the active pricing group.
+
+    `monthlyPrices` carries one entry per pricing group, so a price is only
+    correct when its `pricingGroupId` matches the plan's active group. Returns
+    None when it cannot be matched -- an omitted price beats a wrong one, since
+    the approver is deciding on money.
+    """
+    if not pricing_group_id:
+        return None
+
+    for price in getattr(booking, "monthly_prices", None) or []:
+        if getattr(price, "pricing_group_id", None) == pricing_group_id:
+            return getattr(price, "price", None)
+    return None
+
+
+def build_summary(
+    plan: Any,
+    warnings: list,
+    session_titles: dict | None = None,
+    product_titles: dict | None = None,
+) -> str:
     """Format a previewed plan as plain, scannable Slack text for an approver.
 
     Args:
         plan: the parsed preview plan (read_child_plans.runner.Plan).
         warnings: the serialised warnings from the same result.
-        reference: optional ChildPlansResult-shaped object carrying `sessions`
-            and `products`, used to turn IDs into names. Without it (or for an
-            id it does not cover) the ID is shown instead -- a readable label is
-            a nicety, and must never cost the approver the message itself.
+        session_titles: sessionId -> title from the child's live catalogue
+            (`ChildPlansResult.session_titles`).
+        product_titles: productId -> title, likewise.
+
+    Either map may be None or empty: an unresolved id is shown as the id
+    itself. A readable label is a nicety and must never cost the approver the
+    message.
+
+    Prices come from the COMPUTED PLAN, not the catalogue, so they are what
+    this plan actually charges.
 
     Returns:
         The message text. Defensive throughout: this runs on the success path,
@@ -159,8 +194,9 @@ def build_summary(plan: Any, warnings: list, reference: Any = None) -> str:
     if plan is None:
         return "*Plan preview awaiting approval*\n• (no plan returned)"
 
-    session_titles = _title_lookup(reference, "sessions")
-    product_titles = _title_lookup(reference, "products")
+    session_titles = session_titles or {}
+    product_titles = product_titles or {}
+    pricing_group_id = _active_pricing_group(plan)
 
     child_id = getattr(plan, "child_id", None) or "unknown"
     date_from = getattr(plan, "from_", None) or "unknown"
@@ -182,7 +218,13 @@ def build_summary(plan: Any, warnings: list, reference: Any = None) -> str:
         for booking in bookings:
             session_id = getattr(booking, "session_id", None)
             title = session_titles.get(session_id) or session_id or "unknown session"
-            lines.append(f"• {_day_label(getattr(booking, 'day', None))} — {title}")
+            line = f"• {_day_label(getattr(booking, 'day', None))} — {title}"
+
+            price = _session_price(booking, pricing_group_id)
+            if price is not None:
+                line += f" — {_money(price)}"
+
+            lines.append(line)
     else:
         lines.append("*Sessions*\n• None booked.")
 
@@ -201,9 +243,13 @@ def build_summary(plan: Any, warnings: list, reference: Any = None) -> str:
             title = product_titles.get(product_id) or product_id or "unknown product"
             amount = product.get("amount")
             amount = "?" if amount is None else amount
-            lines.append(
-                f"• {_day_label(product.get('day'))} — {amount}× {title}"
-            )
+            line = f"• {_day_label(product.get('day'))} — {amount}× {title}"
+
+            booked_price = product.get("bookedPrice")
+            if booked_price is not None:
+                line += f" — {_money(booked_price)}"
+
+            lines.append(line)
 
     # --- Totals ------------------------------------------------------------ #
     lines.append("")
