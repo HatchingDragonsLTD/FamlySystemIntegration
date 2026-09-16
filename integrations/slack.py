@@ -72,53 +72,173 @@ def _money(value: Any) -> str:
     return str(value)
 
 
-def build_summary(plan_summary: dict, warnings: list) -> str:
-    """Format the key figures as plain, scannable Slack text.
+# Week order for listing bookings. Anything unrecognised sorts last.
+WEEK_ORDER = (
+    "MONDAY",
+    "TUESDAY",
+    "WEDNESDAY",
+    "THURSDAY",
+    "FRIDAY",
+    "SATURDAY",
+    "SUNDAY",
+)
+
+
+def _day_sort_key(day: Any) -> tuple:
+    """Monday first; unknown or missing days last, alphabetically."""
+    name = str(day).strip().upper() if day else ""
+    if name in WEEK_ORDER:
+        return (0, WEEK_ORDER.index(name), "")
+    return (1, 0, name)
+
+
+def _day_label(day: Any) -> str:
+    """`MONDAY` -> `Monday`."""
+    if not day:
+        return "Unknown day"
+    return str(day).strip().title()
+
+
+def _session_bookings(plan: Any) -> list:
+    """The plan's session bookings, listed once each.
+
+    Famly MIRRORS bookings at plan level and plan-part level, so taking both
+    would list every session twice. The parts are authoritative; the plan-level
+    list is the fallback for a plan with no parts. Matches
+    `Plan.session_booking_count`.
+    """
+    parts = getattr(plan, "plan_parts", None) or []
+    if parts:
+        bookings = []
+        for part in parts:
+            bookings.extend(getattr(part, "session_bookings", None) or [])
+        return bookings
+    return list(getattr(plan, "session_bookings", None) or [])
+
+
+def _product_bookings(plan: Any) -> list:
+    """The plan's product bookings, de-duplicated the same way as sessions.
+
+    These stay raw dicts in the Plan model, so they are read with .get().
+    """
+    parts = getattr(plan, "plan_parts", None) or []
+    if parts:
+        bookings = []
+        for part in parts:
+            bookings.extend(getattr(part, "product_bookings", None) or [])
+        return bookings
+    return list(getattr(plan, "product_bookings", None) or [])
+
+
+def _title_lookup(reference: Any, attribute: str) -> dict:
+    """Build an id -> title map from a reference list, tolerating None."""
+    items = getattr(reference, attribute, None) or []
+    lookup = {}
+    for item in items:
+        item_id = getattr(item, "id", None)
+        if item_id:
+            lookup[item_id] = getattr(item, "title", None)
+    return lookup
+
+
+def build_summary(plan: Any, warnings: list, reference: Any = None) -> str:
+    """Format a previewed plan as plain, scannable Slack text for an approver.
 
     Args:
-        plan_summary: the flat summary dict from the plan_preview action.
+        plan: the parsed preview plan (read_child_plans.runner.Plan).
         warnings: the serialised warnings from the same result.
+        reference: optional ChildPlansResult-shaped object carrying `sessions`
+            and `products`, used to turn IDs into names. Without it (or for an
+            id it does not cover) the ID is shown instead -- a readable label is
+            a nicety, and must never cost the approver the message itself.
 
     Returns:
-        Message text. Defensive: a missing field reads as "unknown" rather
-        than raising, since this runs on the success path and must not break it.
+        The message text. Defensive throughout: this runs on the success path,
+        so a missing field reads as "unknown" rather than raising.
     """
-    summary = plan_summary if isinstance(plan_summary, dict) else {}
+    if plan is None:
+        return "*Plan preview awaiting approval*\n• (no plan returned)"
 
-    child_id = summary.get("childId") or "unknown"
-    date_from = summary.get("from") or "unknown"
-    date_to = summary.get("to") or "open-ended"
-    estimate = _money(summary.get("monthlyEstimate"))
-    sessions = summary.get("sessionCount")
-    sessions = "unknown" if sessions is None else str(sessions)
+    session_titles = _title_lookup(reference, "sessions")
+    product_titles = _title_lookup(reference, "products")
 
-    funding_amount = summary.get("publicFundingAmount")
-    funding_hours = summary.get("publicFundingHours")
-    funding_minutes = summary.get("publicFundingMinutes")
+    child_id = getattr(plan, "child_id", None) or "unknown"
+    date_from = getattr(plan, "from_", None) or "unknown"
+    date_to = getattr(plan, "to", None) or "open-ended"
 
     lines = [
         "*Plan preview awaiting approval*",
         f"• Child: `{child_id}`",
         f"• Dates: {date_from} → {date_to}",
-        f"• Monthly estimate: {estimate}",
-        f"• Sessions booked: {sessions}",
     ]
 
-    if funding_amount is not None or funding_hours is not None:
-        hours_part = "unknown" if funding_hours is None else f"{funding_hours}h"
-        if funding_minutes:
-            hours_part += f" {funding_minutes}m"
-        lines.append(
-            f"• Public funding: {_money(funding_amount)} ({hours_part})"
-        )
+    # --- Sessions ---------------------------------------------------------- #
+    bookings = sorted(
+        _session_bookings(plan), key=lambda b: _day_sort_key(getattr(b, "day", None))
+    )
+    lines.append("")
+    if bookings:
+        lines.append(f"*Sessions* ({len(bookings)})")
+        for booking in bookings:
+            session_id = getattr(booking, "session_id", None)
+            title = session_titles.get(session_id) or session_id or "unknown session"
+            lines.append(f"• {_day_label(getattr(booking, 'day', None))} — {title}")
+    else:
+        lines.append("*Sessions*\n• None booked.")
 
+    # --- Products (omitted entirely when there are none) ------------------- #
+    products = sorted(
+        _product_bookings(plan),
+        key=lambda b: _day_sort_key(b.get("day") if isinstance(b, dict) else None),
+    )
+    if products:
+        lines.append("")
+        lines.append(f"*Products* ({len(products)})")
+        for product in products:
+            if not isinstance(product, dict):
+                continue
+            product_id = product.get("productId")
+            title = product_titles.get(product_id) or product_id or "unknown product"
+            amount = product.get("amount")
+            amount = "?" if amount is None else amount
+            lines.append(
+                f"• {_day_label(product.get('day'))} — {amount}× {title}"
+            )
+
+    # --- Totals ------------------------------------------------------------ #
+    lines.append("")
+    states = getattr(plan, "plan_states", None) or []
+    weekly = states[0].weekly_total if states else None
+
+    lines.append(f"• Weekly total: {_money(weekly)}")
+    lines.append(f"• Monthly estimate: {_money(getattr(plan, 'monthly_estimate', None))}")
+
+    if len(states) > 1:
+        # Don't enumerate every period -- just flag that the figure above is
+        # the current one and the rate moves later.
+        lines.append(f"• _(rate changes during plan — {len(states)} periods)_")
+
+    # --- Public funding, only when funded ---------------------------------- #
+    funding = getattr(plan, "public_funding", None)
+    amount = getattr(funding, "amount", None)
+    hours = getattr(funding, "hours", None)
+    minutes = getattr(funding, "minutes", None)
+
+    if amount or hours or minutes:
+        hours_part = "unknown" if hours is None else f"{hours}h"
+        if minutes:
+            hours_part += f" {minutes}m"
+        lines.append(f"• Public funding: {_money(amount)} ({hours_part})")
+
+    # --- Warnings (unchanged: the approver must see these) ----------------- #
     count = len(warnings) if isinstance(warnings, list) else 0
+    lines.append("")
     if count:
-        lines.append(f"• :warning: *{count} warning(s)* — review before approving:")
+        lines.append(f":warning: *{count} warning(s)* — review before approving:")
         for warning in warnings[:5]:
-            lines.append(f"    – {_warning_line(warning)}")
+            lines.append(f"• {_warning_line(warning)}")
         if count > 5:
-            lines.append(f"    – …and {count - 5} more")
+            lines.append(f"• …and {count - 5} more")
     else:
         lines.append("• No warnings returned.")
 

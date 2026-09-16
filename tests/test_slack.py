@@ -18,6 +18,7 @@ import unittest
 from unittest import mock
 from urllib.parse import urlencode
 
+from actions.read_child_plans.runner import parse_plan, parse_response
 from integrations import slack
 
 # The integration logs loudly on failure by design; keep the test output clean.
@@ -87,6 +88,144 @@ class UpdateMessageTests(unittest.TestCase):
 
         with mock.patch.object(slack.requests, "post", boom):
             self.assertFalse(slack.update_message(RESPONSE_URL, "text"))
+
+
+def _sample_plan_and_reference():
+    """A plan with mirrored bookings, products, funding and a weekly total."""
+    bookings = [
+        {"sessionId": "s-full", "day": "WEDNESDAY"},
+        {"sessionId": "s-full", "day": "MONDAY"},
+        {"sessionId": "s-am", "day": "FRIDAY"},
+        {"sessionId": "s-full", "day": "TUESDAY"},
+    ]
+    plan_node = {
+        "id": "plan-1",
+        "childId": "child-1",
+        "from": "2026-09-01",
+        "to": None,
+        "monthlyEstimate": 812.5,
+        "publicFunding": {"amount": 210.0, "hours": 15, "minutes": 30},
+        "planParts": [
+            {
+                "planPartId": "pp-1",
+                "sessionBookings": bookings,
+                "productBookings": [
+                    {"productId": "p-lunch", "day": "MONDAY", "amount": 1},
+                    {"productId": "p-nap", "day": "WEDNESDAY", "amount": 3},
+                ],
+            }
+        ],
+        # Famly mirrors these at plan level; they must not be listed twice.
+        "sessionBookings": list(bookings),
+        "productBookings": [{"productId": "p-lunch", "day": "MONDAY", "amount": 1}],
+        "planStates": [
+            {
+                "from": "2026-09-01",
+                "to": None,
+                "planPartStates": [{"planPartId": "pp-1", "weeklyTotal": 187.5}],
+            }
+        ],
+    }
+    reference_body = {
+        "plans": [],
+        "sessions": [
+            {"id": "s-full", "title": "Full Day"},
+            {"id": "s-am", "title": "Morning Session"},
+        ],
+        "products": [
+            {"id": "p-lunch", "title": "Hot Lunch"},
+            {"id": "p-nap", "title": "Nappies"},
+        ],
+    }
+    return parse_plan(plan_node), parse_response(reference_body)
+
+
+class BuildSummaryTests(unittest.TestCase):
+    """The summary is what an approver reads before clicking Approve."""
+
+    def setUp(self):
+        self.plan, self.reference = _sample_plan_and_reference()
+        self.text = slack.build_summary(self.plan, [], reference=self.reference)
+
+    def test_lists_each_session_once_in_week_order(self):
+        session_lines = [
+            line for line in self.text.splitlines() if line.startswith("• ") and "—" in line
+        ]
+        days = [line.split(" — ")[0].removeprefix("• ") for line in session_lines]
+
+        # Four bookings, mirrored at both levels -- must appear four times, not eight.
+        self.assertEqual(days[:4], ["Monday", "Tuesday", "Wednesday", "Friday"])
+        self.assertIn("*Sessions* (4)", self.text)
+
+    def test_uses_session_titles_from_the_reference(self):
+        self.assertIn("• Monday — Full Day", self.text)
+        self.assertIn("• Friday — Morning Session", self.text)
+
+    def test_falls_back_to_session_id_when_the_title_is_unknown(self):
+        plan = parse_plan(
+            {
+                "planParts": [
+                    {"planPartId": "pp", "sessionBookings": [{"sessionId": "s-x", "day": "MONDAY"}]}
+                ]
+            }
+        )
+        text = slack.build_summary(plan, [], reference=self.reference)
+        self.assertIn("• Monday — s-x", text)
+
+    def test_lists_products_with_amount_and_title(self):
+        self.assertIn("*Products* (2)", self.text)
+        self.assertIn("• Monday — 1× Hot Lunch", self.text)
+        self.assertIn("• Wednesday — 3× Nappies", self.text)
+
+    def test_products_section_is_omitted_when_there_are_none(self):
+        plan = parse_plan(
+            {
+                "planParts": [
+                    {"planPartId": "pp", "sessionBookings": [{"sessionId": "s-full", "day": "MONDAY"}]}
+                ]
+            }
+        )
+        text = slack.build_summary(plan, [], reference=self.reference)
+        self.assertNotIn("*Products*", text)
+
+    def test_shows_weekly_and_monthly_totals(self):
+        self.assertIn("• Weekly total: 187.50", self.text)
+        self.assertIn("• Monthly estimate: 812.50", self.text)
+
+    def test_notes_a_mid_plan_rate_change_without_enumerating_periods(self):
+        plan = parse_plan(
+            {
+                "planStates": [
+                    {"planPartStates": [{"weeklyTotal": 187.5}]},
+                    {"planPartStates": [{"weeklyTotal": 200.0}]},
+                ]
+            }
+        )
+        text = slack.build_summary(plan, [])
+        self.assertIn("rate changes during plan", text)
+        # The first (current) state's figure is the one shown.
+        self.assertIn("• Weekly total: 187.50", text)
+        self.assertNotIn("200.00", text)
+
+    def test_public_funding_shown_only_when_funded(self):
+        self.assertIn("• Public funding: 210.00 (15h 30m)", self.text)
+
+        unfunded = parse_plan({"publicFunding": None, "planParts": []})
+        self.assertNotIn("Public funding", slack.build_summary(unfunded, []))
+
+    def test_warnings_are_surfaced(self):
+        warnings = [
+            {"warning": {"title": "Funding mismatch", "severity": "warning"}, "known": {"key": "funding_mismatch"}},
+            {"warning": {"title": "Unseen problem", "severity": "error"}, "known": None},
+        ]
+        text = slack.build_summary(self.plan, warnings, reference=self.reference)
+        self.assertIn("*2 warning(s)*", text)
+        self.assertIn("[funding_mismatch]", text)
+        self.assertIn("[UNTRACKED]", text)
+
+    def test_missing_reference_and_plan_never_raise(self):
+        self.assertIn("Monday — s-full", slack.build_summary(self.plan, []))
+        self.assertIn("no plan returned", slack.build_summary(None, []))
 
 
 class VerifySlackRequestTests(unittest.TestCase):

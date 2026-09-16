@@ -75,9 +75,37 @@ class SessionBooking:
 
 
 @dataclass
+class PlanPartState:
+    """One plan part's figures for a given plan state."""
+
+    plan_part_id: str | None = None
+    weekly_total: Any | None = None
+    raw: dict = field(default_factory=dict)
+
+
+@dataclass
 class PlanState:
+    """A period of the plan. More than one means the rate changes mid-plan."""
+
     from_: str | None = None
     to: str | None = None
+    plan_part_states: list[PlanPartState] = field(default_factory=list)
+    raw: dict = field(default_factory=dict)
+
+    @property
+    def weekly_total(self) -> float | None:
+        """The plan's weekly total for this state: its parts added together.
+
+        None when no part reports a numeric total, so a caller can tell
+        "nothing reported" apart from a genuine zero.
+        """
+        totals = [
+            p.weekly_total
+            for p in self.plan_part_states
+            if isinstance(p.weekly_total, (int, float))
+            and not isinstance(p.weekly_total, bool)
+        ]
+        return float(sum(totals)) if totals else None
 
 
 @dataclass
@@ -272,11 +300,30 @@ def _parse_behaviors(node: Any) -> list[str]:
     return [b.get("id") for b in node if isinstance(b, dict) and b.get("id")]
 
 
+def _parse_plan_part_states(node: Any) -> list[PlanPartState]:
+    if not isinstance(node, list):
+        return []
+    return [
+        PlanPartState(
+            plan_part_id=p.get("planPartId"),
+            weekly_total=p.get("weeklyTotal"),
+            raw=p,
+        )
+        for p in node
+        if isinstance(p, dict)
+    ]
+
+
 def _parse_plan_states(node: Any) -> list[PlanState]:
     if not isinstance(node, list):
         return []
     return [
-        PlanState(from_=s.get("from"), to=s.get("to"))
+        PlanState(
+            from_=s.get("from"),
+            to=s.get("to"),
+            plan_part_states=_parse_plan_part_states(s.get("planPartStates")),
+            raw=s,
+        )
         for s in node
         if isinstance(s, dict)
     ]

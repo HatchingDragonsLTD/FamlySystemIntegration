@@ -25,6 +25,7 @@ import os
 import uuid
 from typing import Any
 
+from actions.read_child_plans import runner as read_child_plans
 from integrations import slack
 
 from . import hubspot_intake
@@ -142,8 +143,17 @@ def handle(payload: dict) -> tuple[dict, int]:
     # The full plan is logged, not returned.
     _log_plan_full(preview_id, preview.raw)
 
+    # The Slack summary needs more than the flat dict holds -- per-day session
+    # titles, products, weekly totals -- so it gets the parsed plan object plus
+    # the reference data that names sessions and products.
+    #
+    # The reference lists come from the preview response itself, so this costs
+    # no extra Famly call. If the response does not carry them, the lookups are
+    # simply empty and the summary falls back to raw IDs.
+    reference = read_child_plans.parse_response(preview.raw)
+
     data["slack_posted"] = slack.post_preview(
-        slack.build_summary(plan_summary or {}, warnings),
+        slack.build_summary(preview.plan, warnings, reference=reference),
         preview_id,
     )
 
