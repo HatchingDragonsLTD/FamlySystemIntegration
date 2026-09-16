@@ -29,9 +29,18 @@ app):
                            X-Intake-Secret header. Requests without it are 401.
     INTAKE_PLAN_VERSION    optional int, default 3. Read by the plan_preview
                            action itself, not here.
+    SLACK_SIGNING_SECRET   required for /slack/interactivity. Without it that
+                           route rejects everything (fails closed).
+    SLACK_BOT_TOKEN / SLACK_CHANNEL_ID are read by integrations/slack.py.
     FAMLY_ACCESS_TOKEN / FAMLY_* are read by the existing core.config layer.
+
+Routes:
+    GET  /health              unauthenticated liveness check
+    POST /intake              shared-secret auth, dispatches by `action`
+    POST /slack/interactivity Slack-signature auth, records button clicks
 """
 
+import logging
 import os
 
 from flask import Flask, request, jsonify
@@ -39,10 +48,13 @@ from dotenv import load_dotenv
 
 import web_registry
 from core.rest_client import RestHTTPError
+from integrations import slack
 
 load_dotenv()
 
 app = Flask(__name__)
+
+logger = logging.getLogger(__name__)
 
 SHARED_SECRET = os.environ.get("INTAKE_SHARED_SECRET", "").strip()
 
@@ -178,6 +190,63 @@ def intake():
 
     body, status = _dispatch(action, handler, payload)
     return jsonify(body), status
+
+
+@app.post("/slack/interactivity")
+def slack_interactivity():
+    """Receive a Slack button click.
+
+    Separate from /intake and deliberately NOT behind X-Intake-Secret: Slack
+    authenticates by signing the request, not by a shared header.
+
+    SLACK APP CONFIGURATION: set the interactivity request URL to
+    https://<domain>/slack/interactivity in the Slack app settings.
+
+    Inert by design. The click is verified, parsed and logged; nothing is
+    committed. Verification is implemented fully now so the security is proven
+    before any write is attached to it.
+    """
+    # The signature is computed over the RAW body. Read it before touching
+    # request.form -- re-serialising parsed form data would change the bytes and
+    # the signature would never match.
+    raw_body = request.get_data()
+
+    if not slack.verify_slack_request(request.headers, raw_body):
+        logger.warning("Rejected an unverified Slack interactivity request")
+        return jsonify({"error": "invalid slack signature"}), 401
+
+    interaction = slack.parse_interaction(raw_body)
+    action_id = interaction.get("action_id")
+    preview_id = interaction.get("preview_id")
+    user = interaction.get("user")
+
+    if action_id not in (slack.ACTION_APPROVE, slack.ACTION_REJECT):
+        logger.warning(
+            "SLACK INTERACTION ignored: unrecognised action=%s preview_id=%s",
+            action_id,
+            preview_id,
+        )
+        return jsonify({"text": "Unrecognised action."}), 200
+
+    logger.info(
+        "SLACK APPROVAL: preview_id=%s action=%s user=%s",
+        preview_id,
+        action_id,
+        user,
+    )
+
+    if action_id == slack.ACTION_APPROVE:
+        # TODO: commit path plugs in here. Look the plan up by preview_id and
+        # call actions.plan_write.runner.commit() with confirm=True and an
+        # allowed_child_ids set. Nothing writes until that is deliberately
+        # added -- an approval today is recorded and nothing more.
+        text = "✅ Approved — (commit not yet implemented)"
+    else:
+        text = "❌ Rejected"
+
+    # replace_original swaps the message in place, so the buttons cannot be
+    # clicked twice.
+    return jsonify({"replace_original": True, "text": text}), 200
 
 
 if __name__ == "__main__":

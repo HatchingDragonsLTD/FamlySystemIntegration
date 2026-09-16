@@ -23,8 +23,12 @@ actions/plan_write/warnings.py         classifies + escalates plan warnings
 actions/plan_write/input_schema.py     the normalized input contract
 actions/plan_write/csv_loader.py       CSV -> normalized input
 actions/plan_write/hubspot_intake.py   webhook payload -> normalized input
+actions/plan_write/hubspot_flatten.py  flat HubSpot fields -> nested plan shape
+actions/plan_write/web.py              plan_preview web handler
 samples/plans.sample.csv               example CSV (the only committed one)
-integrations/                          reserved, empty (see its README)
+integrations/slack.py                  Slack post + inbound signature check
+web_registry.py                        action name -> web handler
+server.py                              thin HTTP router (no per-action logic)
 main.py                                CLI dispatcher
 ```
 
@@ -324,6 +328,7 @@ or nested under `properties`/`data`.
 | --- | --- | --- |
 | `GET /health` | none | liveness check; no secrets, no Famly calls |
 | `POST /intake` | `X-Intake-Secret` header | dispatches by `action` |
+| `POST /slack/interactivity` | Slack signature | records button clicks (inert) |
 
 ### Response envelope
 
@@ -333,9 +338,11 @@ Every action returns through the same shape:
 {"ok": true, "action": "plan_preview", "data": {}, "warnings": [], "errors": []}
 ```
 
-For `plan_preview`, `data` holds `plan` (the flattened summary), `plan_full`
-(Famly's computed response, untouched) and `previewed`. `warnings` and `errors`
-come from the intake result. `ok` is true only on a successful preview.
+For `plan_preview`, `data` holds `plan` (the flattened summary), `previewed`,
+`preview_id` and `slack_posted`. The full computed plan is logged rather than
+returned -- see [Slack approval flow](#slack-approval-flow). `warnings` and
+`errors` come from the intake result. `ok` is true only on a successful
+preview.
 
 ### Status codes
 
@@ -353,6 +360,61 @@ The 4xx→422 mapping is deliberate: a Famly 4xx means the payload is wrong and
 will never succeed, so HubSpot must not retry it. Only a Famly 5xx is a real
 transient fault. This classification lives in the router, so every action
 inherits it.
+
+### Slack approval flow
+
+After a successful preview, the `plan_preview` action posts a readable summary
+to Slack with **Approve** and **Reject** buttons, and returns a `preview_id`
+and a `slack_posted` flag alongside the plan summary.
+
+```
+HubSpot -> POST /intake -> preview -> Slack message (Approve / Reject)
+                                          |
+                        POST /slack/interactivity  (signature-verified)
+                                          |
+                                    logged only - nothing commits
+```
+
+**The buttons are inert.** A click is verified, parsed and logged; approving
+records the decision and replies "Approved - (commit not yet implemented)".
+The commit path is a deliberate later step, marked with a `TODO` in
+`server.py`. `handle_intake` remains dry-run only and raises if asked to write.
+
+#### What is returned, and what is not
+
+`plan_full` is **no longer returned** to HubSpot. It is logged server-side at
+INFO, keyed by `preview_id`:
+
+```
+PLAN PREVIEW preview_id=<uuid> plan_full={...}
+```
+
+That log line is currently the only record of a previewed plan -- there is no
+store yet, so a future commit path will need one (or will have to re-preview
+from the original payload). The flat `plan` summary is still returned.
+
+A Slack outage cannot break a preview: `post_preview` catches everything,
+returns False, and the response is still 200 with `slack_posted: false`.
+
+#### Inbound security
+
+`POST /slack/interactivity` does **not** use `X-Intake-Secret` -- Slack
+authenticates by signing the request. `verify_slack_request` checks the
+HMAC-SHA256 signature over the **raw** body (re-serialised form data would not
+match) and rejects anything older than five minutes, for replay protection. It
+fails closed: with no `SLACK_SIGNING_SECRET` set, every request is rejected.
+
+Verification is fully implemented now, before any write is attached to it, so
+the security is proven first. Forged signatures, tampered bodies, replays and
+missing headers all return 401.
+
+#### Slack app setup
+
+| Setting | Value |
+| --- | --- |
+| Interactivity request URL | `https://<domain>/slack/interactivity` |
+| Bot scope | `chat:write` |
+| Env | `SLACK_BOT_TOKEN`, `SLACK_CHANNEL_ID`, `SLACK_SIGNING_SECRET` |
 
 ### Adding a web action
 
