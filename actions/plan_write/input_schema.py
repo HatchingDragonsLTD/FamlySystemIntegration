@@ -30,6 +30,10 @@ from typing import Any
 
 from . import builder
 
+# Where a producer (e.g. hubspot_flatten) leaves problems only it could detect.
+# Never part of the plan body -- to_plan_body does not read it.
+PRODUCER_PROBLEMS_KEY = "_problems"
+
 # Days as the API names them.
 VALID_DAYS = (
     "MONDAY",
@@ -109,6 +113,12 @@ class PlanPartInput:
     product_bookings: list[ProductBookingInput] = field(default_factory=list)
     term_schedule_id: str | None = None
     term_time_only: bool = False
+    # Custom discounts, PASSED THROUGH as built by the producer (see
+    # hubspot_flatten.build_discounts). Deliberately untyped: the shape is
+    # Famly's, and modelling it here would mean two places to keep in step.
+    # The producer validates them; validate() below only checks the shape is
+    # a list of objects.
+    discounts: list = field(default_factory=list)
 
 
 @dataclass
@@ -119,6 +129,11 @@ class PlanInput:
     note: str = ""
     plan_parts: list[PlanPartInput] = field(default_factory=list)
     public_funding_settings: PublicFundingSettingsInput | None = None
+    # Advisory problems the producer found while reshaping the payload --
+    # things only it could see, such as a discount slot with a name but no
+    # amount. NOT validation errors: the offending item is excluded and the
+    # plan still previews. Surfaced as warnings, not as a refusal.
+    problems: list[str] = field(default_factory=list)
 
 
 # --------------------------------------------------------------------------- #
@@ -192,6 +207,7 @@ def _parse_plan_part(node: Any) -> PlanPartInput:
         return PlanPartInput()
 
     term_time_only = _first(node, "termTimeOnly", "term_time_only")
+    discounts = node.get("discounts")
 
     return PlanPartInput(
         billing_profile_id=_first(node, "billingProfileId", "billing_profile_id"),
@@ -209,6 +225,7 @@ def _parse_plan_part(node: Any) -> PlanPartInput:
         # Kept as-is when it is already a bool so validate() can report a
         # non-boolean rather than silently coercing one.
         term_time_only=term_time_only if term_time_only is not None else False,
+        discounts=discounts if isinstance(discounts, list) else [],
     )
 
 
@@ -225,6 +242,7 @@ def from_dict(data: Any) -> PlanInput:
     parts = _first(data, "planParts", "plan_parts")
     funding = _first(data, "publicFundingSettings", "public_funding_settings")
     note = data.get("note")
+    problems = data.get(PRODUCER_PROBLEMS_KEY)
 
     return PlanInput(
         child_id=_first(data, "childId", "child_id"),
@@ -235,6 +253,9 @@ def from_dict(data: Any) -> PlanInput:
         if isinstance(parts, list)
         else [],
         public_funding_settings=_parse_public_funding_settings(funding),
+        problems=[p for p in problems if isinstance(p, str)]
+        if isinstance(problems, list)
+        else [],
     )
 
 
@@ -311,6 +332,11 @@ def validate(plan_input: PlanInput) -> list[str]:
     """
     errors: list[str] = []
 
+    # NOTE: `plan_input.problems` is deliberately NOT added here. Those are
+    # advisory -- a malformed discount slot is excluded and flagged, and the
+    # rest of the plan still previews. They travel the warnings channel
+    # instead (see hubspot_intake), alongside Famly's own warnings, so the
+    # approver sees the computed plan AND the flag rather than a blank refusal.
     _check_uuid(plan_input.child_id, "childId", errors)
 
     if not plan_input.from_date:
@@ -355,6 +381,13 @@ def validate(plan_input: PlanInput) -> list[str]:
         else:
             # NOT a UUID: billing.id carries a billing-scheme enum string.
             _check_billing_scheme_id(part.billing.id, f"{prefix}.billing.id", errors)
+
+        for d_index, discount in enumerate(part.discounts):
+            # Pass-through, so only the container shape is checked here.
+            if not isinstance(discount, dict):
+                errors.append(
+                    f"{prefix}.discounts[{d_index}]: {discount!r} is not an object"
+                )
 
         if not part.session_bookings and not part.product_bookings:
             errors.append(f"{prefix}: has neither session nor product bookings")
@@ -435,6 +468,8 @@ def to_plan_body(plan_input: PlanInput) -> dict:
                     )
                     for b in part.product_bookings
                 ],
+                # Straight through: the producer built these in Famly's shape.
+                discounts=list(part.discounts),
             )
         )
 

@@ -130,6 +130,35 @@ def _product_bookings(plan: Any) -> list:
     return list(getattr(plan, "product_bookings", None) or [])
 
 
+def _discounts(plan: Any) -> list:
+    """The plan's discounts, de-duplicated the same way as sessions.
+
+    Raw dicts in the Plan model, so they are read with .get().
+    """
+    parts = getattr(plan, "plan_parts", None) or []
+    if parts:
+        found = []
+        for part in parts:
+            found.extend(getattr(part, "discounts", None) or [])
+        return found
+    return list(getattr(plan, "discounts", None) or [])
+
+
+def _percent(value: Any) -> str:
+    """A discount fraction as a percentage: 0.05 -> "5%".
+
+    Trailing zeros are trimmed so 0.05 reads "5%" rather than "5.0%", while
+    0.075 still reads "7.5%".
+    """
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return "unknown"
+
+    percent = value * 100
+    if float(percent).is_integer():
+        return f"{int(percent)}%"
+    return f"{percent:g}%"
+
+
 def _active_pricing_group(plan: Any) -> str | None:
     """The pricing group whose prices apply to this plan.
 
@@ -250,6 +279,18 @@ def build_summary(
                 line += f" — {_money(booked_price)}"
 
             lines.append(line)
+
+    # --- Discounts (omitted entirely when there are none) ------------------ #
+    discounts = sorted(
+        (d for d in _discounts(plan) if isinstance(d, dict)),
+        key=lambda d: d.get("ordering") if isinstance(d.get("ordering"), int) else 99,
+    )
+    if discounts:
+        lines.append("")
+        lines.append(f"*Discounts* ({len(discounts)})")
+        for discount in discounts:
+            title = discount.get("title") or "untitled discount"
+            lines.append(f"• {title} — {_percent(discount.get('amount'))}")
 
     # --- Totals ------------------------------------------------------------ #
     lines.append("")

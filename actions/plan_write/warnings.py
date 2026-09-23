@@ -70,7 +70,22 @@ class KnownWarning:
 # tighten `title_contains`. Anything not matched is escalated, so an incomplete
 # entry fails loudly rather than silently.
 # --------------------------------------------------------------------------- #
+# Error codes stamped on warnings this codebase raises itself, rather than ones
+# Famly returned. They travel the same channel so the approver sees one list.
+# Each local kind gets its own code, so a future one is not misfiled as this one.
+ERROR_DISCOUNT_EXCLUDED = "DiscountExcluded"
+
 KNOWN_WARNINGS: tuple[KnownWarning, ...] = (
+    KnownWarning(
+        key="discount_excluded",
+        description=(
+            "A discount slot in the HubSpot payload was malformed -- a missing "
+            "name/amount pair, an unparseable amount, or an amount outside the "
+            "0-1 fraction range. The discount was excluded from the plan; "
+            "everything else was previewed as normal."
+        ),
+        error_codes=(ERROR_DISCOUNT_EXCLUDED,),
+    ),
     KnownWarning(
         key="funding_mismatch",
         description=(
@@ -147,6 +162,36 @@ def extract_warnings(body: Any) -> list[PlanWarning]:
             warnings.extend(_parse_warning(item) for item in items)
 
     return warnings
+
+
+def local_warning(
+    title: str,
+    message: str | None = None,
+    *,
+    error: str = ERROR_DISCOUNT_EXCLUDED,
+    severity: str = "warning",
+    metadata: Any | None = None,
+) -> ClassifiedWarning:
+    """Build a warning for a problem THIS codebase found, not Famly.
+
+    Routed through `classify` like any other, so it lands in the same warnings
+    list, renders the same way in Slack, and -- when `error` is a code the
+    registry knows -- is not escalated as untracked.
+
+    Used for input problems that must not block a preview: the plan is still
+    computed and shown, with the problem flagged beside it. That mirrors how
+    Famly's own warnings behave, where an HTTP 200 can still carry a complaint.
+    """
+    return classify(
+        PlanWarning(
+            title=title,
+            message=message,
+            severity=severity,
+            error=error,
+            metadata=metadata,
+            raw={"source": "local"},
+        )
+    )
 
 
 def notify(warning: PlanWarning) -> None:

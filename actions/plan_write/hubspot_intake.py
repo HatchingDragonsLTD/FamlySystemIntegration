@@ -15,7 +15,7 @@ No argparse, no commit path.
 from dataclasses import dataclass, field
 from typing import Any
 
-from . import hubspot_flatten, input_schema, runner
+from . import hubspot_flatten, input_schema, runner, warnings as plan_warnings
 
 # Wrappers a webhook may nest the payload under. Checked in order.
 PAYLOAD_WRAPPER_KEYS = ("properties", "data")
@@ -115,6 +115,16 @@ def handle_intake(
 
     plan_body = input_schema.to_plan_body(plan_input)
     result = runner.preview(plan_body, version, client=client)
+
+    # Advisory input problems (e.g. a malformed discount slot, already excluded
+    # from the body) ride the SAME warnings channel as Famly's own, so the
+    # approver sees one list: the computed plan plus everything flagged about
+    # it. They never block the preview -- exactly how a Famly warning behaves,
+    # where an HTTP 200 can still carry a complaint.
+    if plan_input.problems and result is not None:
+        result.warnings = list(result.warnings) + [
+            plan_warnings.local_warning(problem) for problem in plan_input.problems
+        ]
 
     return IntakeResult(
         ok=True,
