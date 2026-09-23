@@ -182,6 +182,9 @@ def handle(payload: dict) -> tuple[dict, int]:
             # commit path.
             site_code=site.get("site_code"),
             institution_id=site.get("institution_id"),
+            # Recorded so an adjustment can name the same pricing group the
+            # plan was priced against.
+            pricing_group_id=getattr(preview.plan, "active_pricing_group_id", None),
         )
     except Exception as exc:  # noqa: BLE001 - storing must not break the preview
         logger.warning(

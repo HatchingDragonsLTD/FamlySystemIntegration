@@ -28,6 +28,7 @@ ACTIONS = {
 # action; the decision -- and the only write path to Famly -- lives in the
 # action, so server.py stays free of per-action logic.
 SLACK_CLICK_HANDLER = plan_write_approval.handle_click
+SLACK_SUBMISSION_HANDLER = plan_write_approval.handle_adjust_submission
 
 
 def get_handler(action: str):
@@ -35,9 +36,22 @@ def get_handler(action: str):
     return ACTIONS.get(action)
 
 
-def handle_slack_click(action_id: str, preview_id, user) -> str:
-    """Act on a verified Slack button click; returns the message text."""
-    return SLACK_CLICK_HANDLER(action_id, preview_id, user)
+def handle_slack_click(action_id: str, preview_id, user, trigger_id=None):
+    """Act on a verified Slack button click.
+
+    Returns the message text to show, or None when there is nothing to say
+    (opening a modal leaves the original message alone).
+    """
+    return SLACK_CLICK_HANDLER(action_id, preview_id, user, trigger_id)
+
+
+def handle_slack_submission(preview_id, adjustment, user) -> dict | None:
+    """Act on a verified Slack modal submission.
+
+    Returns a Slack `response_action` body to show an inline validation error,
+    or None to close the modal.
+    """
+    return SLACK_SUBMISSION_HANDLER(preview_id, adjustment, user)
 
 
 def action_names() -> list[str]:

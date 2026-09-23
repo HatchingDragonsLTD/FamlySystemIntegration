@@ -183,6 +183,23 @@ class Plan:
         return [p.plan_part_id for p in self.plan_parts if p.plan_part_id]
 
     @property
+    def active_pricing_group_id(self) -> str | None:
+        """The pricing group whose prices apply to this plan.
+
+        From the plan itself, falling back to the first plan state (the current
+        period) when the plan node does not carry it. Prices are per pricing
+        group, so anything reading or writing a price must name this one.
+        """
+        if self.pricing_group_id:
+            return self.pricing_group_id
+
+        for state in self.plan_states:
+            raw = getattr(state, "raw", None)
+            if isinstance(raw, dict) and raw.get("pricingGroupId"):
+                return raw["pricingGroupId"]
+        return None
+
+    @property
     def session_booking_count(self) -> int:
         """How many sessions the plan books.
 
