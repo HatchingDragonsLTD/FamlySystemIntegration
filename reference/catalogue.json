@@ -25,12 +25,16 @@
 
   "sites": {
     "HDCITY": {
-      "label": "",
-      "institutionId": ""
+      "label": "City of London",
+      "institutionId": "e91da3a4-1538-41ca-b23f-ca395916ace2"
     },
     "HDCW": {
-      "label": "",
-      "institutionId": ""
+      "label": "Canada Water",
+      "institutionId": "b7e907d1-ed14-49d2-a506-73252a74d769"
+    },
+    "HDWEST": {
+      "label": "Westminster",
+      "institutionId": "91337453-8a6c-435e-ae84-f2a00575212a"
     }
   },
 
