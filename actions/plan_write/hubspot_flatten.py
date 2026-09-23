@@ -10,7 +10,8 @@ cannot hold arrays), and the native webhook forwards them as a flat JSON body:
     monday_session ... friday_session,   (sessionId per day, "" = not booked)
     funded, fundingMethod, fundingHours, maxFundedMinutes,
     discount_1_name/discount_1_amount ... discount_3_name/discount_3_amount,
-    site_code                            (e.g. "HDCITY" -- metadata only)
+    site_code                            (e.g. "HDCITY" -- metadata only),
+    product_1_id, product_2_id, addon_quantity   (non-funded deals only)
 
 This module reshapes that into the single-plan-part nested structure. It does
 NOT validate -- it only restructures; `input_schema.validate` still runs after.
@@ -61,6 +62,11 @@ _MAX_DISCOUNT_AMOUNT = 1.0
 # Key the problems are carried under, for input_schema to pick up. Stripped
 # before the plan body is built -- it never reaches Famly.
 PROBLEMS_KEY = "_problems"
+
+# Hard validation failures the producer found -- routed to input_schema.validate
+# alongside a missing childId, so they BLOCK the preview. Distinct from
+# PROBLEMS_KEY, which is advisory and only warns.
+ERRORS_KEY = "_errors"
 
 # Sibling metadata: site context, deliberately OUTSIDE the plan dict so it can
 # never be posted to Famly's plan endpoint. to_plan_body does not read it.
@@ -176,6 +182,79 @@ def build_discounts(data: Any) -> tuple[list, list[str]]:
     return discounts, problems
 
 
+def build_product_bookings(data: Any, booked_days: list[str]) -> tuple[list, list[str]]:
+    """Build product bookings for the first `addon_quantity` booked days.
+
+    Non-funded deals send two product UUIDs and a quantity; a funded deal sends
+    none of them, and gets no product bookings. Both products are booked on
+    each selected day, one unit each.
+
+    Days are taken in week order (the order `_DAYS` already produced the
+    session bookings in), so "the first 3 of Mon/Wed/Thu/Fri" is Mon, Wed, Thu.
+
+    UNLIKE the discount slots, a malformed product setup is a HARD error, not a
+    warning. There is no safe partial behaviour: capping the quantity, or
+    guessing which of the two products to drop, would silently bill the family
+    for something nobody chose. Blocking the preview is the correct outcome.
+
+    Args:
+        data: the flat HubSpot payload.
+        booked_days: the plan's booked days, already in week order.
+
+    Returns:
+        (product_bookings, errors). A non-empty `errors` means the preview must
+        not proceed; `product_bookings` is then empty.
+    """
+    if not isinstance(data, dict):
+        return [], []
+
+    product_1 = _s(data.get("product_1_id"))
+    product_2 = _s(data.get("product_2_id"))
+    raw_quantity = _s(data.get("addon_quantity"))
+
+    supplied = [bool(product_1), bool(product_2), bool(raw_quantity)]
+
+    # The funded path: nothing sent, nothing booked, nothing wrong.
+    if not any(supplied):
+        return [], []
+
+    # Half-specified. Naming what is missing beats a generic complaint.
+    if not all(supplied):
+        missing = []
+        if not product_1:
+            missing.append("product_1_id")
+        if not product_2:
+            missing.append("product_2_id")
+        if not raw_quantity:
+            missing.append("addon_quantity")
+        return [], [
+            f"product booking is half-specified: missing {', '.join(missing)}. "
+            f"Send product_1_id, product_2_id and addon_quantity together, or "
+            f"none of them."
+        ]
+
+    try:
+        quantity = int(float(raw_quantity))
+    except (TypeError, ValueError):
+        return [], [f"addon_quantity: {raw_quantity!r} is not an integer"]
+
+    if quantity < 0:
+        return [], [f"addon_quantity ({quantity}) cannot be negative"]
+
+    if quantity > len(booked_days):
+        return [], [
+            f"addon_quantity ({quantity}) exceeds the number of booked days "
+            f"({len(booked_days)})"
+        ]
+
+    bookings = []
+    for day in booked_days[:quantity]:
+        for product_id in (product_1, product_2):
+            bookings.append({"productId": product_id, "day": day, "amount": 1})
+
+    return bookings, []
+
+
 def build_site_metadata(data: Any) -> dict:
     """Resolve `site_code` into sibling metadata for the plan.
 
@@ -263,6 +342,11 @@ def flatten_to_nested(data: Any) -> dict:
     # reports them at PREVIEW time rather than after a commit.
     discounts, discount_problems = build_discounts(data)
 
+    # Product bookings land on the first `addon_quantity` booked days, in week
+    # order. A malformed setup is a hard error and blocks the preview.
+    booked_days = [booking["day"] for booking in session_bookings]
+    product_bookings, product_errors = build_product_bookings(data, booked_days)
+
     plan_part = {
         "billingProfileId": _s(data.get("billingProfileId")) or None,
         "attendanceScheduleId": _s(data.get("attendanceScheduleId")) or None,
@@ -273,7 +357,7 @@ def flatten_to_nested(data: Any) -> dict:
             "invoices": data.get("billingInvoices"),
         },
         "sessionBookings": session_bookings,
-        "productBookings": [],
+        "productBookings": product_bookings,
         "discounts": discounts,
         "termScheduleId": None,
         "termTimeOnly": _as_bool(data.get("termTimeOnly")),
@@ -290,6 +374,9 @@ def flatten_to_nested(data: Any) -> dict:
 
     if discount_problems:
         nested[PROBLEMS_KEY] = discount_problems
+
+    if product_errors:
+        nested[ERRORS_KEY] = product_errors
 
     # Site context rides alongside the plan, never inside it.
     nested[METADATA_KEY] = build_site_metadata(data)
