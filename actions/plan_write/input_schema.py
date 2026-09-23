@@ -38,6 +38,11 @@ PRODUCER_PROBLEMS_KEY = "_problems"
 # to_plan_body never reads it, so it cannot reach Famly.
 PRODUCER_METADATA_KEY = "_metadata"
 
+# Hard failures the producer found (e.g. addon_quantity exceeding the booked
+# days). Unlike PRODUCER_PROBLEMS_KEY these BLOCK the preview -- validate()
+# reports them alongside its own errors.
+PRODUCER_ERRORS_KEY = "_errors"
+
 # Days as the API names them.
 VALID_DAYS = (
     "MONDAY",
@@ -138,6 +143,10 @@ class PlanInput:
     # amount. NOT validation errors: the offending item is excluded and the
     # plan still previews. Surfaced as warnings, not as a refusal.
     problems: list[str] = field(default_factory=list)
+    # Hard failures from the producer. These DO block the preview: they mean
+    # the input contradicts itself (e.g. more add-on days requested than days
+    # booked), where no partial interpretation would be safe.
+    input_errors: list[str] = field(default_factory=list)
     # Sibling metadata from the producer (site code, institution id, label).
     # Informational: it is stored and shown, never sent to Famly and never used
     # to choose any UUID in the plan body.
@@ -252,6 +261,7 @@ def from_dict(data: Any) -> PlanInput:
     note = data.get("note")
     problems = data.get(PRODUCER_PROBLEMS_KEY)
     metadata = data.get(PRODUCER_METADATA_KEY)
+    input_errors = data.get(PRODUCER_ERRORS_KEY)
 
     return PlanInput(
         child_id=_first(data, "childId", "child_id"),
@@ -264,6 +274,9 @@ def from_dict(data: Any) -> PlanInput:
         public_funding_settings=_parse_public_funding_settings(funding),
         problems=[p for p in problems if isinstance(p, str)]
         if isinstance(problems, list)
+        else [],
+        input_errors=[e for e in input_errors if isinstance(e, str)]
+        if isinstance(input_errors, list)
         else [],
         metadata=metadata if isinstance(metadata, dict) else {},
     )
@@ -341,6 +354,10 @@ def validate(plan_input: PlanInput) -> list[str]:
     returns are the only signal.
     """
     errors: list[str] = []
+
+    # Hard failures the producer found -- reported first, because they describe
+    # the input the user actually typed. These BLOCK the preview.
+    errors.extend(plan_input.input_errors)
 
     # NOTE: `plan_input.problems` is deliberately NOT added here. Those are
     # advisory -- a malformed discount slot is excluded and flagged, and the
