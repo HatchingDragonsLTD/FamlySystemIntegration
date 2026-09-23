@@ -56,6 +56,13 @@ CREATE TABLE IF NOT EXISTS previews (
 )
 """
 
+# Columns added after the table first shipped. A deployed store already has
+# rows, so they are added in place rather than by recreating the table.
+_ADDED_COLUMNS = {
+    "site_code": "TEXT",
+    "institution_id": "TEXT",
+}
+
 
 @dataclass
 class StoredPreview:
@@ -67,6 +74,10 @@ class StoredPreview:
     version: int | None = None
     created_at: str | None = None
     status: str = STATUS_PENDING
+    # Site context, informational. Recorded so a stored preview carries which
+    # site it belongs to; nothing in the commit path reads it.
+    site_code: str | None = None
+    institution_id: str | None = None
 
     @property
     def is_expired(self) -> bool:
@@ -125,12 +136,39 @@ def _connect() -> sqlite3.Connection:
     # Concurrent workers: WAL lets a reader run while another writes.
     connection.execute("PRAGMA journal_mode=WAL")
     connection.execute(_SCHEMA)
+    _migrate(connection)
     connection.commit()
     return connection
 
 
+def _migrate(connection: sqlite3.Connection) -> None:
+    """Add any column missing from an existing store.
+
+    CREATE TABLE IF NOT EXISTS leaves an older table untouched, so a store
+    written before a column existed would break on read. Adding in place keeps
+    the pending previews already in it.
+    """
+    existing = {
+        row["name"] for row in connection.execute("PRAGMA table_info(previews)")
+    }
+    for column, column_type in _ADDED_COLUMNS.items():
+        if column not in existing:
+            connection.execute(
+                f"ALTER TABLE previews ADD COLUMN {column} {column_type}"
+            )
+            logger.info("Preview store: added column %s", column)
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _column(row: sqlite3.Row, name: str):
+    """Read a column that an older store may not have."""
+    try:
+        return row[name]
+    except (IndexError, KeyError):
+        return None
 
 
 def _row_to_preview(row: sqlite3.Row) -> StoredPreview:
@@ -146,6 +184,8 @@ def _row_to_preview(row: sqlite3.Row) -> StoredPreview:
         version=row["version"],
         created_at=row["created_at"],
         status=row["status"],
+        site_code=_column(row, "site_code"),
+        institution_id=_column(row, "institution_id"),
     )
 
 
@@ -161,17 +201,28 @@ def _has_expired(created_at: str | None) -> bool:
     return datetime.now(timezone.utc) - created > timedelta(hours=ttl_hours())
 
 
-def save(preview_id: str, plan_body: dict, child_id: str | None, version: int | None) -> None:
+def save(
+    preview_id: str,
+    plan_body: dict,
+    child_id: str | None,
+    version: int | None,
+    site_code: str | None = None,
+    institution_id: str | None = None,
+) -> None:
     """Record a previewed plan as pending approval.
 
     Overwrites any existing row for the same preview_id (ids are uuid4, so this
     is a re-save rather than a collision).
+
+    `site_code`/`institution_id` are metadata: stored so a preview carries its
+    site context, read by nothing in the commit path.
     """
     with _open() as connection:
         connection.execute(
             "INSERT OR REPLACE INTO previews "
-            "(preview_id, plan_body, child_id, version, created_at, status) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
+            "(preview_id, plan_body, child_id, version, created_at, status, "
+            "site_code, institution_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 preview_id,
                 json.dumps(plan_body),
@@ -179,6 +230,8 @@ def save(preview_id: str, plan_body: dict, child_id: str | None, version: int | 
                 version,
                 _now(),
                 STATUS_PENDING,
+                site_code,
+                institution_id,
             ),
         )
 

@@ -34,6 +34,10 @@ from . import builder
 # Never part of the plan body -- to_plan_body does not read it.
 PRODUCER_PROBLEMS_KEY = "_problems"
 
+# Sibling metadata (site context). Carried for the store and the Slack summary;
+# to_plan_body never reads it, so it cannot reach Famly.
+PRODUCER_METADATA_KEY = "_metadata"
+
 # Days as the API names them.
 VALID_DAYS = (
     "MONDAY",
@@ -134,6 +138,10 @@ class PlanInput:
     # amount. NOT validation errors: the offending item is excluded and the
     # plan still previews. Surfaced as warnings, not as a refusal.
     problems: list[str] = field(default_factory=list)
+    # Sibling metadata from the producer (site code, institution id, label).
+    # Informational: it is stored and shown, never sent to Famly and never used
+    # to choose any UUID in the plan body.
+    metadata: dict = field(default_factory=dict)
 
 
 # --------------------------------------------------------------------------- #
@@ -243,6 +251,7 @@ def from_dict(data: Any) -> PlanInput:
     funding = _first(data, "publicFundingSettings", "public_funding_settings")
     note = data.get("note")
     problems = data.get(PRODUCER_PROBLEMS_KEY)
+    metadata = data.get(PRODUCER_METADATA_KEY)
 
     return PlanInput(
         child_id=_first(data, "childId", "child_id"),
@@ -256,6 +265,7 @@ def from_dict(data: Any) -> PlanInput:
         problems=[p for p in problems if isinstance(p, str)]
         if isinstance(problems, list)
         else [],
+        metadata=metadata if isinstance(metadata, dict) else {},
     )
 
 

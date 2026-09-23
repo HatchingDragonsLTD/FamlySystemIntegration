@@ -88,6 +88,18 @@ def _log_plan_full(preview_id: str, plan_full: Any) -> None:
     logger.info("PLAN PREVIEW preview_id=%s plan_full=%s", preview_id, rendered)
 
 
+def _site_payload(result: Any) -> dict | None:
+    """Site context for the response. Informational; never sent to Famly."""
+    metadata = (result.plan_input.metadata or {}) if result.plan_input else {}
+    if not metadata:
+        return None
+    return {
+        "siteCode": metadata.get("site_code"),
+        "label": metadata.get("label"),
+        "institutionId": metadata.get("institution_id"),
+    }
+
+
 def _catalogue_titles() -> tuple[dict, dict]:
     """Names for the session and product UUIDs the plan books.
 
@@ -135,6 +147,7 @@ def handle(payload: dict) -> tuple[dict, int]:
 
     data = {
         "plan": plan_summary,
+        "site": _site_payload(result),
         "previewed": preview is not None,
         "preview_id": None,
         "slack_posted": False,
@@ -157,12 +170,18 @@ def handle(payload: dict) -> tuple[dict, int]:
     # precisely what the approver saw rather than a rebuild of it. A store
     # failure must not break a preview that already succeeded -- it only means
     # the approval cannot be honoured, which the handler reports.
+    site = (result.plan_input.metadata or {}) if result.plan_input else {}
+
     try:
         preview_store.save(
             preview_id,
             result.plan_body or {},
             getattr(preview.plan, "child_id", None),
             PLAN_VERSION,
+            # Metadata only: recorded with the preview, read by nothing in the
+            # commit path.
+            site_code=site.get("site_code"),
+            institution_id=site.get("institution_id"),
         )
     except Exception as exc:  # noqa: BLE001 - storing must not break the preview
         logger.warning(
@@ -182,6 +201,7 @@ def handle(payload: dict) -> tuple[dict, int]:
             warnings,
             session_titles=session_titles,
             product_titles=product_titles,
+            site=site,
         ),
         preview_id,
     )

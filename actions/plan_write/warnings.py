@@ -74,6 +74,7 @@ class KnownWarning:
 # Famly returned. They travel the same channel so the approver sees one list.
 # Each local kind gets its own code, so a future one is not misfiled as this one.
 ERROR_DISCOUNT_EXCLUDED = "DiscountExcluded"
+ERROR_SITE_UNRESOLVED = "SiteUnresolved"
 
 KNOWN_WARNINGS: tuple[KnownWarning, ...] = (
     KnownWarning(
@@ -85,6 +86,15 @@ KNOWN_WARNINGS: tuple[KnownWarning, ...] = (
             "everything else was previewed as normal."
         ),
         error_codes=(ERROR_DISCOUNT_EXCLUDED,),
+    ),
+    KnownWarning(
+        key="site_unresolved",
+        description=(
+            "The payload's site_code was missing or not in the catalogue, so "
+            "the plan has no site context. Informational only -- the plan "
+            "itself is unaffected, since site context decides nothing about it."
+        ),
+        error_codes=(ERROR_SITE_UNRESOLVED,),
     ),
     KnownWarning(
         key="funding_mismatch",

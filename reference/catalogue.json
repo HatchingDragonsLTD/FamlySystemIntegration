@@ -12,8 +12,27 @@
     "Replace the PASTE-... placeholder keys with the real UUIDs.",
     "",
     "The file is re-read on every preview, so edits take effect without a",
-    "server restart. Point FAMLY_CATALOGUE_FILE elsewhere to override the path."
+    "server restart. Point FAMLY_CATALOGUE_FILE elsewhere to override the path.",
+    "",
+    "SITES: each key is the site_code HubSpot sends (matched case-insensitively).",
+    "Fill in `label` (shown to the approver in Slack) and `institutionId`",
+    "(Famly's institution UUID for that site). BOTH MAY BE LEFT EMPTY: the code",
+    "still resolves, the label falls back to the code, and institution_id stays",
+    "null. institutionId is METADATA ONLY today -- nothing sends it to Famly.",
+    "Session and product names stay in the flat maps below: UUIDs are globally",
+    "unique, so they need no per-site grouping to be named correctly."
   ],
+
+  "sites": {
+    "HDCITY": {
+      "label": "",
+      "institutionId": ""
+    },
+    "HDCW": {
+      "label": "",
+      "institutionId": ""
+    }
+  },
 
   "sessions": {
     "222faa9f-b12e-498c-aac4-28fc442e4989": "Funded Full Day",

@@ -9,7 +9,8 @@ cannot hold arrays), and the native webhook forwards them as a flat JSON body:
     termTimeOnly,
     monday_session ... friday_session,   (sessionId per day, "" = not booked)
     funded, fundingMethod, fundingHours, maxFundedMinutes,
-    discount_1_name/discount_1_amount ... discount_3_name/discount_3_amount
+    discount_1_name/discount_1_amount ... discount_3_name/discount_3_amount,
+    site_code                            (e.g. "HDCITY" -- metadata only)
 
 This module reshapes that into the single-plan-part nested structure. It does
 NOT validate -- it only restructures; `input_schema.validate` still runs after.
@@ -23,6 +24,8 @@ billingProfileId is intentionally absent (the server resolves it separately).
 
 from datetime import datetime, timezone
 from typing import Any
+
+from integrations import catalogue
 
 # HubSpot field prefix -> Famly day enum. Order fixed for stable output.
 _DAYS = [
@@ -58,6 +61,10 @@ _MAX_DISCOUNT_AMOUNT = 1.0
 # Key the problems are carried under, for input_schema to pick up. Stripped
 # before the plan body is built -- it never reaches Famly.
 PROBLEMS_KEY = "_problems"
+
+# Sibling metadata: site context, deliberately OUTSIDE the plan dict so it can
+# never be posted to Famly's plan endpoint. to_plan_body does not read it.
+METADATA_KEY = "_metadata"
 
 
 def _s(value: Any) -> str:
@@ -169,6 +176,51 @@ def build_discounts(data: Any) -> tuple[list, list[str]]:
     return discounts, problems
 
 
+def build_site_metadata(data: Any) -> dict:
+    """Resolve `site_code` into sibling metadata for the plan.
+
+    METADATA ONLY. The result is carried beside the plan, never inside it:
+    `institution_id` is not sent to Famly, and nothing here influences which
+    session, billing profile or attendance schedule the plan uses -- those stay
+    entirely determined by the UUIDs HubSpot already sends.
+
+    Never blocks a preview. A missing or unrecognised code yields a `warning`
+    for the approver and leaves `institution_id` as None.
+
+    Returns:
+        {"site_code", "label", "institution_id", "warning"}; `warning` is None
+        when the code resolved.
+    """
+    raw_code = _s(data.get("site_code")) if isinstance(data, dict) else ""
+
+    if raw_code == "":
+        return {
+            "site_code": None,
+            "label": None,
+            "institution_id": None,
+            "warning": "No site_code supplied - proceeding without site context",
+        }
+
+    site = catalogue.resolve_site(raw_code)
+    if site is None:
+        return {
+            "site_code": raw_code,
+            "label": None,
+            "institution_id": None,
+            "warning": (
+                f"Unrecognised site_code: {raw_code} - proceeding without site "
+                f"context"
+            ),
+        }
+
+    return {
+        "site_code": site["site_code"],
+        "label": site["label"],
+        "institution_id": site["institution_id"],
+        "warning": None,
+    }
+
+
 def is_flat_payload(data: Any) -> bool:
     """True when the payload looks like the flat HubSpot shape.
 
@@ -238,6 +290,9 @@ def flatten_to_nested(data: Any) -> dict:
 
     if discount_problems:
         nested[PROBLEMS_KEY] = discount_problems
+
+    # Site context rides alongside the plan, never inside it.
+    nested[METADATA_KEY] = build_site_metadata(data)
 
     if funded:
         nested["publicFundingSettings"] = {

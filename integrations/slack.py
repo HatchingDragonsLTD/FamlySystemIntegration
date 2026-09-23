@@ -199,6 +199,7 @@ def build_summary(
     warnings: list,
     session_titles: dict | None = None,
     product_titles: dict | None = None,
+    site: dict | None = None,
 ) -> str:
     """Format a previewed plan as plain, scannable Slack text for an approver.
 
@@ -208,6 +209,9 @@ def build_summary(
         session_titles: sessionId -> title from the child's live catalogue
             (`ChildPlansResult.session_titles`).
         product_titles: productId -> title, likewise.
+        site: resolved site metadata ({"label", ...}) for the Site line. Shows
+            "unknown" when absent or unresolved -- it is informational, and
+            decides nothing about the plan.
 
     Either map may be None or empty: an unresolved id is shown as the id
     itself. A readable label is a nicety and must never cost the approver the
@@ -231,8 +235,11 @@ def build_summary(
     date_from = getattr(plan, "from_", None) or "unknown"
     date_to = getattr(plan, "to", None) or "open-ended"
 
+    site_label = (site or {}).get("label") if isinstance(site, dict) else None
+
     lines = [
         "*Plan preview awaiting approval*",
+        f"• Site: {site_label or 'unknown'}",
         f"• Child: `{child_id}`",
         f"• Dates: {date_from} → {date_to}",
     ]

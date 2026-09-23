@@ -121,10 +121,24 @@ def handle_intake(
     # approver sees one list: the computed plan plus everything flagged about
     # it. They never block the preview -- exactly how a Famly warning behaves,
     # where an HTTP 200 can still carry a complaint.
-    if plan_input.problems and result is not None:
-        result.warnings = list(result.warnings) + [
+    if result is not None:
+        extra = [
             plan_warnings.local_warning(problem) for problem in plan_input.problems
         ]
+
+        # Unresolved site context is advisory too: it changes nothing about the
+        # plan, but the approver should know which site this is (or that we
+        # could not tell).
+        site_warning = (plan_input.metadata or {}).get("warning")
+        if site_warning:
+            extra.append(
+                plan_warnings.local_warning(
+                    site_warning, error=plan_warnings.ERROR_SITE_UNRESOLVED
+                )
+            )
+
+        if extra:
+            result.warnings = list(result.warnings) + extra
 
     return IntakeResult(
         ok=True,
