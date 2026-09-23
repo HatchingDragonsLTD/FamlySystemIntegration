@@ -210,7 +210,10 @@ def slack_interactivity():
 
     Approve COMMITS the previewed plan, subject to the guards in
     actions/plan_write/approval.py. Reject records the decision and writes
-    nothing. Both require a valid Slack signature.
+    nothing. Adjust & Approve opens a modal; its submission re-prices the plan
+    and offers the result under a NEW preview_id, whose Confirm Commit button
+    is an ordinary Approve. Every one of them requires a valid Slack signature,
+    including the modal submission.
     """
     # The signature is computed over the RAW body. Read it before touching
     # request.form -- re-serialising parsed form data would change the bytes and
@@ -226,7 +229,21 @@ def slack_interactivity():
     preview_id = interaction.get("preview_id")
     user = interaction.get("user")
 
-    if action_id not in (slack.ACTION_APPROVE, slack.ACTION_REJECT):
+    # A modal submission answers IN the HTTP response: an inline validation
+    # error can be delivered no other way, so this returns the body directly
+    # rather than going through response_url.
+    if interaction.get("type") == slack.TYPE_VIEW_SUBMISSION:
+        body = web_registry.handle_slack_submission(
+            preview_id, interaction.get("adjustment"), user
+        )
+        # A body means "show this error and keep the modal open"; None closes it.
+        return (jsonify(body), 200) if body else ("", 200)
+
+    if action_id not in (
+        slack.ACTION_APPROVE,
+        slack.ACTION_REJECT,
+        slack.ACTION_ADJUST,
+    ):
         logger.warning(
             "SLACK INTERACTION ignored: unrecognised action=%s preview_id=%s",
             action_id,
@@ -244,7 +261,14 @@ def slack_interactivity():
     # The commit path. Approve writes to Famly; the decision and every guard
     # live in the action (via the registry), so this file keeps no per-action
     # logic. It never raises -- a failure comes back as text for the approver.
-    text = web_registry.handle_slack_click(action_id, preview_id, user)
+    text = web_registry.handle_slack_click(
+        action_id, preview_id, user, interaction.get("trigger_id")
+    )
+
+    # Adjust & Approve opens a modal and leaves the message as it was, so
+    # there is nothing to replace it with.
+    if text is None:
+        return "", 200
 
     # The message was posted proactively with chat.postMessage, so an inline
     # `replace_original` response does not reliably update it. POST to the

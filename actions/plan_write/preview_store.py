@@ -44,6 +44,9 @@ STATUS_COMMITTING = "committing"
 STATUS_COMMITTED = "committed"
 STATUS_REJECTED = "rejected"
 STATUS_EXPIRED = "expired"
+# Replaced by an adjusted copy under a new preview_id. The original must not
+# also be approvable, or the same plan could be committed twice over.
+STATUS_SUPERSEDED = "superseded"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS previews (
@@ -61,6 +64,9 @@ CREATE TABLE IF NOT EXISTS previews (
 _ADDED_COLUMNS = {
     "site_code": "TEXT",
     "institution_id": "TEXT",
+    # The pricing group the computed plan priced against. Needed to attach a
+    # totalAdjustments entry later, which must name the same group.
+    "pricing_group_id": "TEXT",
 }
 
 
@@ -78,6 +84,7 @@ class StoredPreview:
     # site it belongs to; nothing in the commit path reads it.
     site_code: str | None = None
     institution_id: str | None = None
+    pricing_group_id: str | None = None
 
     @property
     def is_expired(self) -> bool:
@@ -186,6 +193,7 @@ def _row_to_preview(row: sqlite3.Row) -> StoredPreview:
         status=row["status"],
         site_code=_column(row, "site_code"),
         institution_id=_column(row, "institution_id"),
+        pricing_group_id=_column(row, "pricing_group_id"),
     )
 
 
@@ -208,6 +216,7 @@ def save(
     version: int | None,
     site_code: str | None = None,
     institution_id: str | None = None,
+    pricing_group_id: str | None = None,
 ) -> None:
     """Record a previewed plan as pending approval.
 
@@ -221,8 +230,8 @@ def save(
         connection.execute(
             "INSERT OR REPLACE INTO previews "
             "(preview_id, plan_body, child_id, version, created_at, status, "
-            "site_code, institution_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "site_code, institution_id, pricing_group_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 preview_id,
                 json.dumps(plan_body),
@@ -232,6 +241,7 @@ def save(
                 STATUS_PENDING,
                 site_code,
                 institution_id,
+                pricing_group_id,
             ),
         )
 

@@ -47,11 +47,31 @@ import requests
 logger = logging.getLogger(__name__)
 
 POST_MESSAGE_URL = "https://slack.com/api/chat.postMessage"
+VIEWS_OPEN_URL = "https://slack.com/api/views.open"
 POST_TIMEOUT = 10
 
 # action_id values carried by the buttons. The inbound handler switches on these.
 ACTION_APPROVE = "plan_approve"
 ACTION_REJECT = "plan_reject"
+# Opens the adjustment modal. It does NOT act on the plan by itself -- the
+# modal's submission does, and the plan it commits goes through the ordinary
+# Approve path under a fresh preview_id.
+ACTION_ADJUST = "plan_adjust"
+
+# Interaction types Slack posts to the same endpoint.
+TYPE_BLOCK_ACTIONS = "block_actions"
+TYPE_VIEW_SUBMISSION = "view_submission"
+
+# Modal plumbing. The block id is what an inline validation error is keyed to.
+ADJUST_CALLBACK_ID = "plan_adjust_modal"
+ADJUST_BLOCK_ID = "adjustment_block"
+ADJUST_INPUT_ID = "adjustment_input"
+
+# Hard boundary on a rounding adjustment, in pounds. Enforced on submission,
+# and again before the adjusted body is stored -- the modal's own hint is a
+# courtesy, not a control.
+MIN_ADJUSTMENT = -1.00
+MAX_ADJUSTMENT = 1.00
 
 # Slack signs with this version prefix.
 SIGNATURE_VERSION = "v0"
@@ -165,6 +185,11 @@ def _active_pricing_group(plan: Any) -> str | None:
     Taken from the plan itself, falling back to the first plan state (the
     current period) when the plan node does not carry it.
     """
+    # The Plan model owns this; the fallbacks below cover a duck-typed stand-in.
+    group = getattr(plan, "active_pricing_group_id", None)
+    if group:
+        return group
+
     group = getattr(plan, "pricing_group_id", None)
     if group:
         return group
@@ -398,6 +423,16 @@ def _approval_blocks(summary_text: str, preview_id: str) -> list:
                 },
                 {
                     "type": "button",
+                    "text": {
+                        "type": "plain_text",
+                        "text": "Adjust & Approve",
+                        "emoji": True,
+                    },
+                    "action_id": ACTION_ADJUST,
+                    "value": preview_id,
+                },
+                {
+                    "type": "button",
                     "text": {"type": "plain_text", "text": "Reject", "emoji": True},
                     "style": "danger",
                     "action_id": ACTION_REJECT,
@@ -472,6 +507,204 @@ def post_preview(summary_text: str, preview_id: str) -> bool:
         return False
 
     logger.info("Posted plan preview to Slack: preview_id=%s", preview_id)
+    return True
+
+
+def adjustment_modal(preview_id: str) -> dict:
+    """The Adjust & Approve modal: one number field.
+
+    `private_metadata` carries the preview_id, which is how the submission
+    knows which plan it is adjusting -- a submission payload has no button, and
+    so no value of its own.
+    """
+    return {
+        "type": "modal",
+        "callback_id": ADJUST_CALLBACK_ID,
+        "private_metadata": preview_id,
+        "title": {"type": "plain_text", "text": "Adjust plan"},
+        "submit": {"type": "plain_text", "text": "Re-price"},
+        "close": {"type": "plain_text", "text": "Cancel"},
+        "blocks": [
+            {
+                "type": "input",
+                "block_id": ADJUST_BLOCK_ID,
+                "label": {
+                    "type": "plain_text",
+                    "text": (
+                        f"Adjustment (£, between {MIN_ADJUSTMENT:.2f} and "
+                        f"{MAX_ADJUSTMENT:.2f})"
+                    ),
+                },
+                "element": {
+                    "type": "plain_text_input",
+                    "action_id": ADJUST_INPUT_ID,
+                    "placeholder": {"type": "plain_text", "text": "e.g. 0.50"},
+                },
+                "hint": {
+                    "type": "plain_text",
+                    "text": "A small rounding adjustment. Re-prices before committing.",
+                },
+            }
+        ],
+    }
+
+
+def open_modal(trigger_id: str, view: dict) -> bool:
+    """Open a modal via views.open.
+
+    Returns True when Slack accepted it. Never raises -- a failed modal leaves
+    the original message and its buttons untouched, so the approver can retry
+    or use plain Approve.
+
+    `trigger_id` is short-lived (a few seconds), so this must be called
+    promptly after the click.
+    """
+    import os
+
+    token = os.environ.get("SLACK_BOT_TOKEN", "").strip()
+    if not token or not trigger_id:
+        logger.warning("Cannot open the Slack modal: missing token or trigger_id")
+        return False
+
+    try:
+        response = requests.post(
+            VIEWS_OPEN_URL,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json; charset=utf-8",
+            },
+            json={"trigger_id": trigger_id, "view": view},
+            timeout=POST_TIMEOUT,
+        )
+    except Exception as exc:  # noqa: BLE001 - Slack must never break the caller
+        logger.warning("views.open failed: %s", exc)
+        return False
+
+    try:
+        body = response.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+
+    if response.status_code != 200 or not body.get("ok"):
+        logger.warning(
+            "Slack rejected views.open: HTTP %s %s",
+            response.status_code,
+            body.get("error") or response.text[:200],
+        )
+        return False
+
+    return True
+
+
+def modal_error(message: str) -> dict:
+    """A `response_action: errors` body, shown inline under the input.
+
+    This must be the HTTP response to the view_submission request itself --
+    Slack will not display it any other way.
+    """
+    return {
+        "response_action": "errors",
+        "errors": {ADJUST_BLOCK_ID: message},
+    }
+
+
+def post_adjusted(summary_text: str, preview_id: str) -> bool:
+    """Post the re-priced plan with a single Confirm Commit button.
+
+    The button carries ACTION_APPROVE, so the click lands in exactly the same
+    handler, guards and idempotency as an ordinary approval -- the only
+    difference is the preview_id it names, which holds the adjusted body.
+    """
+    blocks = [
+        {"type": "section", "text": {"type": "mrkdwn", "text": summary_text}},
+        {
+            "type": "context",
+            "elements": [{"type": "mrkdwn", "text": f"preview_id: `{preview_id}`"}],
+        },
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {
+                        "type": "plain_text",
+                        "text": "Confirm Commit",
+                        "emoji": True,
+                    },
+                    "style": "primary",
+                    "action_id": ACTION_APPROVE,
+                    "value": preview_id,
+                }
+            ],
+        },
+    ]
+
+    if not _post_message(summary_text, blocks, label=f"adjusted plan {preview_id}"):
+        return False
+
+    logger.info("Posted adjusted plan to Slack: preview_id=%s", preview_id)
+    return True
+
+
+def post_notice(text: str) -> bool:
+    """Post a plain message to the channel -- no buttons, nothing to click.
+
+    Used to tell the approver that background work failed. Without it a failed
+    re-price would leave them waiting on a Confirm Commit message that is never
+    coming.
+
+    Never raises, same as every other poster here.
+    """
+    return _post_message(text, None, label="notice")
+
+
+def _post_message(text: str, blocks, label: str) -> bool:
+    """Post to the configured channel. Returns True only when Slack accepted it.
+
+    Shared by the posters so they fail identically: log, return False, never
+    raise at the caller.
+    """
+    import os
+
+    token = os.environ.get("SLACK_BOT_TOKEN", "").strip()
+    channel = os.environ.get("SLACK_CHANNEL_ID", "").strip()
+
+    if not token or not channel:
+        logger.warning("Slack not configured; dropping %s", label)
+        return False
+
+    payload = {"channel": channel, "text": text}
+    if blocks:
+        payload["blocks"] = blocks
+
+    try:
+        response = requests.post(
+            POST_MESSAGE_URL,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json; charset=utf-8",
+            },
+            json=payload,
+            timeout=POST_TIMEOUT,
+        )
+    except Exception as exc:  # noqa: BLE001 - Slack must never break the caller
+        logger.warning("Slack post failed (%s): %s", label, exc)
+        return False
+
+    try:
+        body = response.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+
+    if response.status_code != 200 or not body.get("ok"):
+        logger.warning(
+            "Slack rejected a post (%s): HTTP %s %s",
+            label,
+            response.status_code,
+            body.get("error") or response.text[:200],
+        )
+        return False
+
     return True
 
 
@@ -621,16 +854,23 @@ def parse_interaction(raw_body: Any) -> dict:
 
     Slack posts this URL-encoded, with the JSON in a `payload` form field.
 
+    Handles both interaction types Slack posts here: a button click
+    (`block_actions`) and a modal submission (`view_submission`). A submission
+    has no button, so its preview_id comes from the view's `private_metadata`.
+
     Returns:
-        A dict with `action_id`, `preview_id`, `user`, `response_url` and the
-        full `payload`. Missing pieces come back as None -- defensive
-        throughout, since this parses untrusted input.
+        A dict with `type`, `action_id`, `preview_id`, `user`, `response_url`,
+        `trigger_id`, `adjustment` and the full `payload`. Missing pieces come
+        back as None -- defensive throughout, since this parses untrusted input.
     """
     empty = {
+        "type": None,
         "action_id": None,
         "preview_id": None,
         "user": None,
         "response_url": None,
+        "trigger_id": None,
+        "adjustment": None,
         "payload": None,
     }
 
@@ -654,20 +894,51 @@ def parse_interaction(raw_body: Any) -> dict:
     if not isinstance(payload, dict):
         return empty
 
-    actions = payload.get("actions")
-    action = actions[0] if isinstance(actions, list) and actions else {}
-    action = action if isinstance(action, dict) else {}
-
     user = payload.get("user")
     user_name = None
     if isinstance(user, dict):
         user_name = user.get("username") or user.get("name") or user.get("id")
 
+    interaction_type = payload.get("type")
+
+    if interaction_type == TYPE_VIEW_SUBMISSION:
+        # A modal submission carries no button, so the preview_id comes from
+        # private_metadata and the entered value from the view's state.
+        view = payload.get("view")
+        view = view if isinstance(view, dict) else {}
+
+        return {
+            **empty,
+            "type": TYPE_VIEW_SUBMISSION,
+            "action_id": view.get("callback_id"),
+            "preview_id": view.get("private_metadata") or None,
+            "user": user_name,
+            "adjustment": _view_value(view, ADJUST_BLOCK_ID, ADJUST_INPUT_ID),
+            "payload": payload,
+        }
+
+    actions = payload.get("actions")
+    action = actions[0] if isinstance(actions, list) and actions else {}
+    action = action if isinstance(action, dict) else {}
+
     return {
+        **empty,
+        "type": interaction_type or TYPE_BLOCK_ACTIONS,
         "action_id": action.get("action_id"),
         # The button carries the preview_id as its value.
         "preview_id": action.get("value"),
         "user": user_name,
         "response_url": payload.get("response_url"),
+        # Short-lived; needed to open a modal in response to this click.
+        "trigger_id": payload.get("trigger_id"),
         "payload": payload,
     }
+
+
+def _view_value(view: dict, block_id: str, action_id: str):
+    """Read one input's value out of a modal's state, defensively."""
+    state = view.get("state")
+    values = state.get("values") if isinstance(state, dict) else None
+    block = values.get(block_id) if isinstance(values, dict) else None
+    element = block.get(action_id) if isinstance(block, dict) else None
+    return element.get("value") if isinstance(element, dict) else None
