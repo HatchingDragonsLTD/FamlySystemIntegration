@@ -292,6 +292,214 @@ class SchemaPassThroughTests(unittest.TestCase):
         self.assertTrue(any("discounts[0]" in e for e in errors))
 
 
+class HalfDayAdjustmentTests(unittest.TestCase):
+    """A FIXED-amount discount, sitting alongside the three percentage slots.
+
+    HubSpot precomputes the figure (the server never works out a child's age),
+    so only the two values it can produce are accepted. Anything else means the
+    upstream calculation went wrong, and applying it on trust would alter a
+    family's bill by an amount nobody chose -- so it is excluded and warned
+    about, exactly like a malformed percentage slot.
+    """
+
+    def build(self, **overrides):
+        return flatten.build_discounts(flat_payload(**overrides))
+
+    def test_two_ninety_four_is_accepted(self):
+        discounts, problems = self.build(
+            half_day_adjustment="yes", half_day_amount="2.94"
+        )
+
+        self.assertEqual(problems, [])
+        self.assertEqual(len(discounts), 1)
+        self.assertEqual(
+            discounts[0],
+            {
+                "title": "Half Day Adjustment",
+                "amount": 2.94,
+                "ordering": 3,
+                "fePriceModifierType": "discount",
+                "isPercent": False,
+                "origin": "custom",
+                "period": "WEEKLY",
+                "showOnInvoice": True,
+            },
+        )
+
+    def test_three_fifty_three_is_accepted(self):
+        discounts, problems = self.build(
+            half_day_adjustment="yes", half_day_amount="3.53"
+        )
+
+        self.assertEqual(problems, [])
+        self.assertEqual(discounts[0]["amount"], 3.53)
+        self.assertIs(discounts[0]["isPercent"], False)
+
+    def test_any_other_amount_is_excluded_and_warned_about(self):
+        discounts, problems = self.build(
+            half_day_adjustment="yes", half_day_amount="3.00"
+        )
+
+        self.assertEqual(discounts, [])
+        self.assertEqual(len(problems), 1)
+        self.assertIn("Half day adjustment excluded", problems[0])
+        self.assertIn("3.00", problems[0])
+        self.assertIn("2.94 or 3.53", problems[0])
+
+    def test_a_missing_amount_is_excluded_and_warned_about(self):
+        discounts, problems = self.build(half_day_adjustment="yes")
+
+        self.assertEqual(discounts, [])
+        self.assertIn("half_day_amount is missing", problems[0])
+
+    def test_a_non_numeric_amount_is_excluded_and_warned_about(self):
+        discounts, problems = self.build(
+            half_day_adjustment="yes", half_day_amount="half"
+        )
+
+        self.assertEqual(discounts, [])
+        self.assertIn("is not a number", problems[0])
+
+    def test_no_means_no_discount_and_no_warning(self):
+        discounts, problems = self.build(
+            half_day_adjustment="no", half_day_amount="2.94"
+        )
+
+        self.assertEqual(discounts, [])
+        self.assertEqual(problems, [])
+
+    def test_absent_means_no_discount_and_no_warning(self):
+        discounts, problems = self.build()
+
+        self.assertEqual(discounts, [])
+        self.assertEqual(problems, [])
+
+    def test_it_sits_at_ordering_three_after_the_percentage_slots(self):
+        discounts, problems = self.build(
+            discount_1_name="Sibling",
+            discount_1_amount="0.05",
+            discount_2_name="Staff",
+            discount_2_amount="0.10",
+            discount_3_name="Trial",
+            discount_3_amount="0.025",
+            half_day_adjustment="yes",
+            half_day_amount="2.94",
+        )
+
+        self.assertEqual(problems, [])
+        self.assertEqual([d["ordering"] for d in discounts], [0, 1, 2, 3])
+        self.assertEqual([d["isPercent"] for d in discounts], [True, True, True, False])
+        self.assertEqual(discounts[3]["title"], "Half Day Adjustment")
+
+    def test_its_ordering_is_fixed_even_with_no_percentage_slots(self):
+        discounts, _ = self.build(half_day_adjustment="yes", half_day_amount="2.94")
+
+        # Ordering 3 regardless of what else is present -- not compacted to 0.
+        self.assertEqual(discounts[0]["ordering"], 3)
+
+    def test_a_bad_percentage_slot_does_not_lose_the_half_day_one(self):
+        discounts, problems = self.build(
+            discount_1_name="Broken",  # no amount
+            half_day_adjustment="yes",
+            half_day_amount="2.94",
+        )
+
+        self.assertEqual(len(discounts), 1)
+        self.assertEqual(discounts[0]["title"], "Half Day Adjustment")
+        self.assertEqual(len(problems), 1)
+
+    def test_it_reaches_the_plan_body_intact(self):
+        nested = flatten.flatten_to_nested(
+            flat_payload(half_day_adjustment="yes", half_day_amount="3.53")
+        )
+        plan_input = input_schema.from_dict(nested)
+        body = input_schema.to_plan_body(plan_input)
+
+        discounts = body["plan"]["planParts"][0]["discounts"]
+        self.assertEqual(len(discounts), 1)
+        self.assertEqual(discounts[0]["amount"], 3.53)
+        self.assertIs(discounts[0]["isPercent"], False)
+        # Advisory only, so nothing blocks.
+        self.assertEqual(input_schema.validate(plan_input), [])
+
+    def test_an_invalid_amount_still_previews_successfully(self):
+        nested = flatten.flatten_to_nested(
+            flat_payload(half_day_adjustment="yes", half_day_amount="9.99")
+        )
+        plan_input = input_schema.from_dict(nested)
+
+        # A warning, not a hard error: the rest of the plan still previews.
+        self.assertEqual(input_schema.validate(plan_input), [])
+        self.assertTrue(any("Half day adjustment" in p for p in plan_input.problems))
+        self.assertEqual(
+            input_schema.to_plan_body(plan_input)["plan"]["planParts"][0]["discounts"],
+            [],
+        )
+
+
+class MixedDiscountRenderingTests(unittest.TestCase):
+    """Both kinds appear in one list, so each must read in its own units."""
+
+    def _summary(self, discounts):
+        plan = parse_plan(
+            {
+                "childId": CHILD,
+                "from": "2026-09-01",
+                "planParts": [
+                    {
+                        "planPartId": "pp-1",
+                        "sessionBookings": [{"sessionId": SESSION, "day": "MONDAY"}],
+                        "discounts": discounts,
+                    }
+                ],
+            }
+        )
+        return slack.build_summary(plan, [])
+
+    def test_a_fixed_amount_shows_in_pounds(self):
+        text = self._summary(
+            [
+                {
+                    "title": "Half Day Adjustment",
+                    "amount": 2.94,
+                    "ordering": 3,
+                    "isPercent": False,
+                }
+            ]
+        )
+
+        self.assertIn("\u2022 Half Day Adjustment \u2014 \u00a32.94", text)
+        self.assertNotIn("294%", text)
+
+    def test_percentages_and_fixed_amounts_read_correctly_together(self):
+        discounts, _ = flatten.build_discounts(
+            flat_payload(
+                discount_1_name="Sibling Discount",
+                discount_1_amount="0.05",
+                half_day_adjustment="yes",
+                half_day_amount="3.53",
+            )
+        )
+        text = self._summary(discounts)
+
+        self.assertIn("*Discounts* (2)", text)
+        self.assertIn("\u2022 Sibling Discount \u2014 5%", text)
+        self.assertIn("\u2022 Half Day Adjustment \u2014 \u00a33.53", text)
+
+    def test_an_entry_with_no_isPercent_is_still_read_as_a_percentage(self):
+        # Every discount was a percentage before fixed ones existed.
+        text = self._summary([{"title": "Legacy", "amount": 0.05, "ordering": 0}])
+
+        self.assertIn("\u2022 Legacy \u2014 5%", text)
+
+    def test_a_fixed_amount_that_is_not_a_number_reads_as_unknown(self):
+        text = self._summary(
+            [{"title": "Broken", "amount": None, "isPercent": False, "ordering": 3}]
+        )
+
+        self.assertIn("\u2022 Broken \u2014 unknown", text)
+
+
 class MalformedSlotWarningTests(unittest.TestCase):
     """A malformed slot warns; it never blocks the preview.
 

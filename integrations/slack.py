@@ -179,6 +179,26 @@ def _percent(value: Any) -> str:
     return f"{percent:g}%"
 
 
+def _discount_amount(discount: dict) -> str:
+    """One discount's amount, in its own units.
+
+    Percentage and fixed-amount discounts sit in the same list, so the entry's
+    `isPercent` decides how it reads -- 0.05 is "5%" but 2.94 is "£2.94", and
+    showing either in the other's units would misstate a family's bill.
+
+    Anything not explicitly marked as fixed is treated as a percentage, which
+    is what every discount was before fixed ones existed.
+    """
+    amount = discount.get("amount")
+
+    if discount.get("isPercent") is False:
+        if isinstance(amount, (int, float)) and not isinstance(amount, bool):
+            return f"£{amount:,.2f}"
+        return "unknown"
+
+    return _percent(amount)
+
+
 def _active_pricing_group(plan: Any) -> str | None:
     """The pricing group whose prices apply to this plan.
 
@@ -322,7 +342,7 @@ def build_summary(
         lines.append(f"*Discounts* ({len(discounts)})")
         for discount in discounts:
             title = discount.get("title") or "untitled discount"
-            lines.append(f"• {title} — {_percent(discount.get('amount'))}")
+            lines.append(f"• {title} — {_discount_amount(discount)}")
 
     # --- Totals ------------------------------------------------------------ #
     lines.append("")
