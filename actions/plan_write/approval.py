@@ -28,6 +28,7 @@ import copy
 import logging
 import threading
 import uuid
+from datetime import date
 
 from core.config import ConfigError, load_config
 from core.rest_client import RestHTTPError
@@ -66,6 +67,7 @@ def handle_click(
     preview_id: str | None,
     user: str | None,
     trigger_id: str | None = None,
+    response_url: str | None = None,
 ) -> str | None:
     """Act on a verified Slack button click and return the message to show.
 
@@ -83,7 +85,7 @@ def handle_click(
     if action_id == slack.ACTION_REJECT:
         return _reject(preview_id, user)
     if action_id == slack.ACTION_ADJUST:
-        return handle_adjust_click(preview_id, user, trigger_id)
+        return handle_adjust_click(preview_id, user, trigger_id, response_url)
     return _approve(preview_id, user)
 
 
@@ -270,11 +272,16 @@ def _blocking_status(stored) -> str | None:
     return None
 
 
-def handle_adjust_click(preview_id, user, trigger_id) -> str | None:
+def handle_adjust_click(
+    preview_id, user, trigger_id, response_url=None
+) -> str | None:
     """Open the adjustment modal. Changes nothing by itself.
 
     Returns None when the modal opened (the message is left as it is), or text
     to show when it could not.
+
+    `response_url` is stashed in the modal so the submission can update this
+    message later -- Slack does not put one in a view_submission payload.
     """
     stored = preview_store.get(preview_id or "")
     blocked = _blocking_status(stored)
@@ -287,7 +294,15 @@ def handle_adjust_click(preview_id, user, trigger_id) -> str | None:
         )
         return blocked
 
-    if not slack.open_modal(trigger_id, slack.adjustment_modal(preview_id)):
+    # The estimate goes in the modal so it is visible while typing; the
+    # response_url travels with it because the submission will not get one.
+    view = slack.adjustment_modal(
+        preview_id,
+        estimate=stored.monthly_estimate,
+        response_url=response_url,
+    )
+
+    if not slack.open_modal(trigger_id, view):
         return _adjust_error("the Slack dialog could not be opened, please retry")
 
     logger.info("ADJUST MODAL opened preview_id=%s user=%s", preview_id, user)
@@ -425,7 +440,7 @@ def _spawn(work) -> None:
 
 
 def handle_adjust_submission(
-    preview_id, raw_adjustment, user, spawn=None
+    preview_id, raw_adjustment, user, spawn=None, response_url=None
 ) -> dict | None:
     """Validate an adjustment, then re-price it in the background.
 
@@ -470,6 +485,17 @@ def handle_adjust_submission(
 
     adjusted_body = _with_adjustment(stored.plan_body, pricing_group_id, value)
 
+    # Retire the original message now, not after the re-price: its buttons are
+    # live until it is replaced, and a plan that is being adjusted must not
+    # stay approvable in parallel. This does not depend on the re-price, so it
+    # happens alongside the ack rather than behind it.
+    if response_url:
+        slack.update_message(
+            response_url,
+            f"\U0001f527 Adjustment submitted (£{value:+.2f}) — "
+            f"see below for the re-priced total.",
+        )
+
     # Validation is done; everything past here is network work. Ack first.
     (spawn or _spawn)(
         lambda: _complete_adjustment(
@@ -502,6 +528,14 @@ def _complete_adjustment(
 
     estimate = getattr(result.plan, "monthly_estimate", None) if result.plan else None
     new_preview_id = str(uuid.uuid4())
+
+    # Record the adjustment in the plan's own note, so it is traceable inside
+    # Famly and not only in Slack. Done here rather than in _with_adjustment
+    # because the note quotes the billed total, which needs the re-priced
+    # estimate -- not known until the preview above returns.
+    adjusted_body = _with_note(
+        adjusted_body, _adjustment_note(value, user, total_to_bill(estimate, value))
+    )
 
     try:
         preview_store.save(
@@ -568,3 +602,33 @@ def _complete_adjustment(
             f"could not post the confirmation message. The adjusted preview is "
             f"`{new_preview_id}`."
         )
+
+
+def _adjustment_note(value: float, user, total) -> str:
+    """The audit line written into the plan's note field.
+
+    Famly holds the base estimate and the adjustment separately, so without
+    this the combined figure an approver signed off exists only in Slack.
+    """
+    total_text = f"£{total:,.2f}" if isinstance(total, (int, float)) else "unknown"
+    return (
+        f"Adjustment: £{value:+.2f}, approved by {user or 'unknown'}, "
+        f"total billed {total_text}, {date.today().isoformat()}"
+    )
+
+
+def _with_note(plan_body: dict, note: str) -> dict:
+    """A copy of the body with `note` set, appended to anything already there.
+
+    Captures show the note empty in practice, but overwriting a note someone
+    had written would destroy information, so it appends.
+    """
+    updated = copy.deepcopy(plan_body)
+    plan = updated.get("plan")
+    if not isinstance(plan, dict):
+        return updated
+
+    existing = plan.get("note")
+    existing = existing.strip() if isinstance(existing, str) else ""
+    plan["note"] = f"{existing}{chr(10)}{note}" if existing else note
+    return updated

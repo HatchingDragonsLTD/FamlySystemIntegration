@@ -510,21 +510,47 @@ def post_preview(summary_text: str, preview_id: str) -> bool:
     return True
 
 
-def adjustment_modal(preview_id: str) -> dict:
-    """The Adjust & Approve modal: one number field.
+def adjustment_modal(
+    preview_id: str, estimate=None, response_url: str | None = None
+) -> dict:
+    """The Adjust & Approve modal: the current estimate, and one number field.
 
-    `private_metadata` carries the preview_id, which is how the submission
-    knows which plan it is adjusting -- a submission payload has no button, and
-    so no value of its own.
+    `private_metadata` carries everything the submission needs, because a
+    submission payload has no button and NO response_url of its own. Slack
+    gives the message's response_url only on the click, so it is stashed here
+    to let the submission update that original message.
+
+    Encoded as JSON; a bare preview_id is still accepted on the way back in, so
+    a modal opened by an older build keeps working.
     """
+    metadata = {"preview_id": preview_id}
+    if response_url:
+        metadata["response_url"] = response_url
+
+    blocks = []
+    if isinstance(estimate, (int, float)) and not isinstance(estimate, bool):
+        # Shown so the approver can see what they are adjusting without
+        # scrolling back to the original message.
+        blocks.append(
+            {
+                "type": "context",
+                "elements": [
+                    {
+                        "type": "mrkdwn",
+                        "text": f"Current monthly estimate: *£{estimate:,.2f}*",
+                    }
+                ],
+            }
+        )
+
     return {
         "type": "modal",
         "callback_id": ADJUST_CALLBACK_ID,
-        "private_metadata": preview_id,
+        "private_metadata": json.dumps(metadata),
         "title": {"type": "plain_text", "text": "Adjust plan"},
         "submit": {"type": "plain_text", "text": "Re-price"},
         "close": {"type": "plain_text", "text": "Cancel"},
-        "blocks": [
+        "blocks": blocks + [
             {
                 "type": "input",
                 "block_id": ADJUST_BLOCK_ID,
@@ -907,12 +933,17 @@ def parse_interaction(raw_body: Any) -> dict:
         view = payload.get("view")
         view = view if isinstance(view, dict) else {}
 
+        metadata = _private_metadata(view.get("private_metadata"))
+
         return {
             **empty,
             "type": TYPE_VIEW_SUBMISSION,
             "action_id": view.get("callback_id"),
-            "preview_id": view.get("private_metadata") or None,
+            "preview_id": metadata.get("preview_id"),
             "user": user_name,
+            # The ORIGINAL message's response_url, stashed when the modal was
+            # opened -- a submission payload does not carry one.
+            "response_url": metadata.get("response_url"),
             "adjustment": _view_value(view, ADJUST_BLOCK_ID, ADJUST_INPUT_ID),
             "payload": payload,
         }
@@ -933,6 +964,26 @@ def parse_interaction(raw_body: Any) -> dict:
         "trigger_id": payload.get("trigger_id"),
         "payload": payload,
     }
+
+
+def _private_metadata(raw) -> dict:
+    """Decode a modal's private_metadata.
+
+    JSON since the response_url had to travel with the preview_id. A bare
+    preview_id string is still accepted, so a modal opened by an older build
+    submits successfully instead of failing to find its preview.
+    """
+    if not isinstance(raw, str) or not raw.strip():
+        return {}
+
+    try:
+        decoded = json.loads(raw)
+    except ValueError:
+        return {"preview_id": raw}
+
+    if isinstance(decoded, dict):
+        return decoded
+    return {"preview_id": raw}
 
 
 def _view_value(view: dict, block_id: str, action_id: str):

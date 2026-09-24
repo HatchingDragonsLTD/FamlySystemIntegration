@@ -234,7 +234,12 @@ def slack_interactivity():
     # rather than going through response_url.
     if interaction.get("type") == slack.TYPE_VIEW_SUBMISSION:
         body = web_registry.handle_slack_submission(
-            preview_id, interaction.get("adjustment"), user
+            preview_id,
+            interaction.get("adjustment"),
+            user,
+            # Carried through the modal: a submission has no response_url, so
+            # this is the ORIGINAL message's, used to retire its buttons.
+            response_url=interaction.get("response_url"),
         )
         # A body means "show this error and keep the modal open"; None closes it.
         return (jsonify(body), 200) if body else ("", 200)
@@ -262,7 +267,11 @@ def slack_interactivity():
     # live in the action (via the registry), so this file keeps no per-action
     # logic. It never raises -- a failure comes back as text for the approver.
     text = web_registry.handle_slack_click(
-        action_id, preview_id, user, interaction.get("trigger_id")
+        action_id,
+        preview_id,
+        user,
+        interaction.get("trigger_id"),
+        response_url=interaction.get("response_url"),
     )
 
     # Adjust & Approve opens a modal and leaves the message as it was, so

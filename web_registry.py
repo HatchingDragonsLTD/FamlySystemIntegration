@@ -36,22 +36,30 @@ def get_handler(action: str):
     return ACTIONS.get(action)
 
 
-def handle_slack_click(action_id: str, preview_id, user, trigger_id=None):
+def handle_slack_click(
+    action_id: str, preview_id, user, trigger_id=None, response_url=None
+):
     """Act on a verified Slack button click.
 
     Returns the message text to show, or None when there is nothing to say
     (opening a modal leaves the original message alone).
     """
-    return SLACK_CLICK_HANDLER(action_id, preview_id, user, trigger_id)
+    return SLACK_CLICK_HANDLER(
+        action_id, preview_id, user, trigger_id, response_url=response_url
+    )
 
 
-def handle_slack_submission(preview_id, adjustment, user) -> dict | None:
+def handle_slack_submission(
+    preview_id, adjustment, user, response_url=None
+) -> dict | None:
     """Act on a verified Slack modal submission.
 
     Returns a Slack `response_action` body to show an inline validation error,
     or None to close the modal.
     """
-    return SLACK_SUBMISSION_HANDLER(preview_id, adjustment, user)
+    return SLACK_SUBMISSION_HANDLER(
+        preview_id, adjustment, user, response_url=response_url
+    )
 
 
 def action_names() -> list[str]:
