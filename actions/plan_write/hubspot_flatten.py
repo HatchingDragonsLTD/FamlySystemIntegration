@@ -10,6 +10,7 @@ cannot hold arrays), and the native webhook forwards them as a flat JSON body:
     monday_session ... friday_session,   (sessionId per day, "" = not booked)
     funded, fundingMethod, fundingHours, maxFundedMinutes,
     discount_1_name/discount_1_amount ... discount_3_name/discount_3_amount,
+    half_day_adjustment ("yes"/"no") + half_day_amount (2.94 or 3.53),
     site_code                            (e.g. "HDCITY" -- metadata only),
     product_1_id, product_2_id, addon_quantity   (non-funded deals only)
 
@@ -58,6 +59,14 @@ _DISCOUNT_DEFAULTS = {
 # A fractional quantity rounds UP (2.5 -> 3, since a part-day of add-ons is
 # still a day the family receives them) and is then capped here.
 MAX_ADDON_DAYS = 3
+
+# The half-day adjustment is a FIXED amount, not a percentage, and HubSpot
+# precomputes it -- the server does not work out the child's age. Only these
+# two values are legitimate; anything else means the upstream calculation went
+# wrong, so the discount is excluded rather than applied on trust.
+HALF_DAY_TITLE = "Half Day Adjustment"
+HALF_DAY_ORDERING = 3
+VALID_HALF_DAY_AMOUNTS = (2.94, 3.53)
 
 # Amounts arrive as a FRACTION (5% is 0.05), so anything above 1.0 is a
 # fat-fingered percentage rather than a fraction. Rejecting it here stops a
@@ -125,6 +134,11 @@ def build_discounts(data: Any) -> tuple[list, list[str]]:
     skipped entirely; a half-filled or out-of-range one is reported as a
     problem and excluded, never guessed at.
 
+    A fourth, FIXED-amount discount is appended when `half_day_adjustment` is
+    yes: see `_half_day_discount`. It carries `isPercent: False`, so the two
+    kinds coexist in the list and anything reading them must check that flag
+    rather than assume a percentage.
+
     `ordering` is tied to the SLOT NUMBER (slot 1 -> 0, slot 3 -> 2) and is not
     compacted when a middle slot is empty, so a discount keeps its position
     regardless of what else is filled in.
@@ -185,7 +199,72 @@ def build_discounts(data: Any) -> tuple[list, list[str]]:
             }
         )
 
+    # The fixed-amount half-day adjustment sits after the three slots, at its
+    # own fixed ordering, whether or not any of them were filled.
+    half_day, half_day_problem = _half_day_discount(data)
+    if half_day is not None:
+        discounts.append(half_day)
+    if half_day_problem is not None:
+        problems.append(half_day_problem)
+
     return discounts, problems
+
+
+def _half_day_discount(data: dict) -> tuple[dict | None, str | None]:
+    """The fixed-amount half-day adjustment, when the deal has one.
+
+    Returns (discount, problem); at most one is ever set. Like the percentage
+    slots, a bad value is EXCLUDED and warned about rather than blocking the
+    preview -- an omitted discount is visible to the approver, whereas a wrong
+    one would quietly alter a family's bill.
+
+    `isPercent` is False here: this is pounds, not a fraction, so it must not
+    be read or displayed as a percentage.
+    """
+    if not _as_bool(data.get("half_day_adjustment")):
+        return None, None
+
+    raw_amount = _s(data.get("half_day_amount"))
+    expected = " or ".join(f"{amount:.2f}" for amount in VALID_HALF_DAY_AMOUNTS)
+
+    if raw_amount == "":
+        return None, (
+            f"Half day adjustment excluded: half_day_adjustment is yes but "
+            f"half_day_amount is missing (expected {expected})"
+        )
+
+    try:
+        amount = float(raw_amount)
+    except (TypeError, ValueError):
+        return None, (
+            f"Half day adjustment excluded: amount {raw_amount!r} is not a "
+            f"number (expected {expected})"
+        )
+
+    # Compared to the penny: these are exact figures HubSpot computed, and a
+    # near miss means the upstream calculation is wrong, not that it rounded.
+    if round(amount, 2) not in VALID_HALF_DAY_AMOUNTS:
+        # Echo what was sent, not a reformatted version of it: "3.00" reported
+        # back as "3" makes it harder to spot what was actually entered.
+        return None, (
+            f"Half day adjustment excluded: amount {raw_amount} is not a "
+            f"recognised value (expected {expected})"
+        )
+
+    return (
+        {
+            "title": HALF_DAY_TITLE,
+            "amount": amount,
+            "ordering": HALF_DAY_ORDERING,
+            "fePriceModifierType": "discount",
+            # NOT a percentage -- a fixed number of pounds.
+            "isPercent": False,
+            "origin": "custom",
+            "period": "WEEKLY",
+            "showOnInvoice": True,
+        },
+        None,
+    )
 
 
 def build_product_bookings(data: Any, booked_days: list[str]) -> tuple[list, list[str]]:
