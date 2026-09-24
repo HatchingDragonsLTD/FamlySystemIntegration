@@ -111,21 +111,42 @@ class ProductBookingTests(unittest.TestCase):
         self.assertEqual([b["day"] for b in bookings][:2], ["MONDAY", "MONDAY"])
         self.assertEqual(sorted({b["day"] for b in bookings}), ["MONDAY", "WEDNESDAY"])
 
-    def test_quantity_equal_to_booked_days_covers_them_all(self):
+    def test_quantity_equal_to_booked_days_covers_them_all_up_to_the_cap(self):
+        # Three booked days, quantity three: every one gets products.
+        payload = flat_payload(
+            days={
+                "monday_session": SESSION,
+                "wednesday_session": SESSION,
+                "thursday_session": SESSION,
+            },
+            product_1_id=PRODUCT_1,
+            product_2_id=PRODUCT_2,
+            addon_quantity="3",
+        )
+        bookings = bookings_of(payload)
+
+        self.assertEqual(len(bookings), 6)
+        self.assertEqual(
+            sorted({b["day"] for b in bookings}),
+            ["MONDAY", "THURSDAY", "WEDNESDAY"],
+        )
+        self.assertEqual(errors_of(payload), [])
+
+    def test_the_cap_limits_a_four_day_plan_to_three(self):
+        # Four booked days and quantity four: the cap wins, so the fourth day
+        # gets no products even though it was available.
         bookings = bookings_of(
             flat_payload(
                 product_1_id=PRODUCT_1, product_2_id=PRODUCT_2, addon_quantity="4"
             )
         )
 
-        self.assertEqual(len(bookings), 8)
+        self.assertEqual(len(bookings), 6)
         self.assertEqual(
             sorted({b["day"] for b in bookings}),
-            ["FRIDAY", "MONDAY", "THURSDAY", "WEDNESDAY"],
+            ["MONDAY", "THURSDAY", "WEDNESDAY"],
         )
-        self.assertEqual(errors_of(flat_payload(
-            product_1_id=PRODUCT_1, product_2_id=PRODUCT_2, addon_quantity="4"
-        )), [])
+        self.assertNotIn("FRIDAY", [b["day"] for b in bookings])
 
     def test_a_funded_deal_sends_none_of_the_fields_and_books_nothing(self):
         payload = flat_payload(funded="true")
@@ -150,28 +171,159 @@ class ProductBookingTests(unittest.TestCase):
         self.assertEqual(errors_of(payload), [])
 
 
+class FractionalQuantityTests(unittest.TestCase):
+    """addon_quantity may be fractional: round UP, then cap at three days.
+
+    A half day of add-ons still means the family receives them that day, so
+    2.5 covers three days rather than two. The cap exists because no plan
+    books products on more than three days however large the figure entered.
+    """
+
+    def days_with_products(self, quantity, booked):
+        payload = flat_payload(
+            days={f"{day.lower()}_session": SESSION for day in booked},
+            product_1_id=PRODUCT_1,
+            product_2_id=PRODUCT_2,
+            addon_quantity=quantity,
+        )
+        bookings = bookings_of(payload)
+        ordered = []
+        for booking in bookings:
+            if booking["day"] not in ordered:
+                ordered.append(booking["day"])
+        return ordered, errors_of(payload)
+
+    def test_two_point_five_over_three_days_rounds_up_to_three(self):
+        days, errors = self.days_with_products(
+            "2.5", ["MONDAY", "WEDNESDAY", "THURSDAY"]
+        )
+
+        self.assertEqual(errors, [])
+        self.assertEqual(days, ["MONDAY", "WEDNESDAY", "THURSDAY"])
+
+    def test_three_point_five_over_four_days_caps_at_three(self):
+        days, errors = self.days_with_products(
+            "3.5", ["MONDAY", "WEDNESDAY", "THURSDAY", "FRIDAY"]
+        )
+
+        self.assertEqual(errors, [])
+        # Rounds to 4, capped to 3: Friday misses out though it was available.
+        self.assertEqual(days, ["MONDAY", "WEDNESDAY", "THURSDAY"])
+
+    def test_four_point_five_over_five_days_caps_at_three(self):
+        days, errors = self.days_with_products(
+            "4.5", ["MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY"]
+        )
+
+        self.assertEqual(errors, [])
+        self.assertEqual(days, ["MONDAY", "TUESDAY", "WEDNESDAY"])
+
+    def test_a_whole_number_is_unaffected(self):
+        days, errors = self.days_with_products(
+            "2.0", ["MONDAY", "WEDNESDAY", "THURSDAY"]
+        )
+
+        self.assertEqual(errors, [])
+        self.assertEqual(days, ["MONDAY", "WEDNESDAY"])
+
+    def test_exactly_three_needs_no_rounding_or_capping(self):
+        days, errors = self.days_with_products(
+            "3.0", ["MONDAY", "WEDNESDAY", "THURSDAY"]
+        )
+
+        self.assertEqual(errors, [])
+        self.assertEqual(days, ["MONDAY", "WEDNESDAY", "THURSDAY"])
+
+    def test_four_point_five_over_two_days_is_an_error(self):
+        # Capped to three, which is still more than the two days booked.
+        days, errors = self.days_with_products("4.5", ["MONDAY", "WEDNESDAY"])
+
+        self.assertEqual(days, [])
+        self.assertEqual(len(errors), 1)
+        self.assertIn("exceeds the number of booked days (2)", errors[0])
+
+    def test_a_bare_fraction_rounds_up_to_one(self):
+        days, errors = self.days_with_products("0.5", ["MONDAY", "WEDNESDAY"])
+
+        self.assertEqual(errors, [])
+        self.assertEqual(days, ["MONDAY"])
+
+    def test_each_selected_day_still_gets_both_products_at_one(self):
+        payload = flat_payload(
+            days={
+                "monday_session": SESSION,
+                "wednesday_session": SESSION,
+                "thursday_session": SESSION,
+            },
+            product_1_id=PRODUCT_1,
+            product_2_id=PRODUCT_2,
+            addon_quantity="2.5",
+        )
+        bookings = bookings_of(payload)
+
+        self.assertEqual(len(bookings), 6)
+        for booking in bookings:
+            self.assertEqual(booking["amount"], 1)
+        self.assertEqual(
+            {b["productId"] for b in bookings}, {PRODUCT_1, PRODUCT_2}
+        )
+
+
 class ProductHardErrorTests(unittest.TestCase):
     """These must block: capping or guessing would bill someone wrongly."""
 
     def test_quantity_exceeding_booked_days_is_an_error(self):
+        # Two booked days, quantity three: the capped figure still exceeds.
         errors = errors_of(
             flat_payload(
-                product_1_id=PRODUCT_1, product_2_id=PRODUCT_2, addon_quantity="5"
+                days={"monday_session": SESSION, "wednesday_session": SESSION},
+                product_1_id=PRODUCT_1,
+                product_2_id=PRODUCT_2,
+                addon_quantity="3",
             )
         )
 
         self.assertEqual(len(errors), 1)
         self.assertEqual(
-            errors[0], "addon_quantity (5) exceeds the number of booked days (4)"
+            errors[0], "addon_quantity (3) exceeds the number of booked days (2)"
         )
+
+    def test_a_capped_quantity_is_checked_against_the_booked_days(self):
+        # 4.5 rounds to 5 and caps to 3; with only two days booked that is
+        # still too many, and the message explains how it got to three.
+        errors = errors_of(
+            flat_payload(
+                days={"monday_session": SESSION, "wednesday_session": SESSION},
+                product_1_id=PRODUCT_1,
+                product_2_id=PRODUCT_2,
+                addon_quantity="4.5",
+            )
+        )
+
+        self.assertEqual(len(errors), 1)
+        self.assertIn("4.5 -> 3", errors[0])
+        self.assertIn("capping at 3", errors[0])
+        self.assertIn("booked days (2)", errors[0])
+
+    def test_a_large_quantity_is_fine_when_enough_days_are_booked(self):
+        # The cap means 5 no longer exceeds four booked days -- it books three.
+        payload = flat_payload(
+            product_1_id=PRODUCT_1, product_2_id=PRODUCT_2, addon_quantity="5"
+        )
+
+        self.assertEqual(errors_of(payload), [])
+        self.assertEqual(len({b["day"] for b in bookings_of(payload)}), 3)
 
     def test_nothing_is_booked_when_the_quantity_is_too_high(self):
         bookings = bookings_of(
             flat_payload(
-                product_1_id=PRODUCT_1, product_2_id=PRODUCT_2, addon_quantity="5"
+                days={"monday_session": SESSION, "wednesday_session": SESSION},
+                product_1_id=PRODUCT_1,
+                product_2_id=PRODUCT_2,
+                addon_quantity="3",
             )
         )
-        # Not capped at four -- nothing at all.
+        # Not trimmed to the two available days -- nothing at all.
         self.assertEqual(bookings, [])
 
     def test_only_product_1_sent_is_an_error(self):
@@ -201,7 +353,7 @@ class ProductHardErrorTests(unittest.TestCase):
                 product_1_id=PRODUCT_1, product_2_id=PRODUCT_2, addon_quantity="three"
             )
         )
-        self.assertIn("not an integer", errors[0])
+        self.assertIn("not a number", errors[0])
 
     def test_a_negative_quantity_is_an_error(self):
         errors = errors_of(
@@ -214,7 +366,10 @@ class ProductHardErrorTests(unittest.TestCase):
     def test_these_are_hard_errors_not_advisory_warnings(self):
         nested = flatten.flatten_to_nested(
             flat_payload(
-                product_1_id=PRODUCT_1, product_2_id=PRODUCT_2, addon_quantity="5"
+                days={"monday_session": SESSION, "wednesday_session": SESSION},
+                product_1_id=PRODUCT_1,
+                product_2_id=PRODUCT_2,
+                addon_quantity="3",
             )
         )
 
@@ -225,12 +380,15 @@ class ProductHardErrorTests(unittest.TestCase):
     def test_validate_reports_them_alongside_its_own_errors(self):
         nested = flatten.flatten_to_nested(
             flat_payload(
-                product_1_id=PRODUCT_1, product_2_id=PRODUCT_2, addon_quantity="5"
+                days={"monday_session": SESSION, "wednesday_session": SESSION},
+                product_1_id=PRODUCT_1,
+                product_2_id=PRODUCT_2,
+                addon_quantity="3",
             )
         )
         errors = input_schema.validate(input_schema.from_dict(nested))
 
-        self.assertTrue(any("addon_quantity (5) exceeds" in e for e in errors))
+        self.assertTrue(any("addon_quantity (3) exceeds" in e for e in errors))
 
 
 class ProductPreviewTests(unittest.TestCase):
@@ -258,12 +416,17 @@ class ProductPreviewTests(unittest.TestCase):
         env.start()
         self.addCleanup(env.stop)
 
-    def intake(self, **overrides):
-        return hubspot_intake.handle_intake(flat_payload(**overrides), version=3)
+    def intake(self, days=None, **overrides):
+        return hubspot_intake.handle_intake(
+            flat_payload(days=days, **overrides), version=3
+        )
 
     def test_quantity_exceeding_booked_days_blocks_with_no_famly_call(self):
         result = self.intake(
-            product_1_id=PRODUCT_1, product_2_id=PRODUCT_2, addon_quantity="5"
+            days={"monday_session": SESSION, "wednesday_session": SESSION},
+            product_1_id=PRODUCT_1,
+            product_2_id=PRODUCT_2,
+            addon_quantity="4.5",
         )
 
         self.assertFalse(result.ok)
