@@ -190,14 +190,34 @@ class Plan:
         period) when the plan node does not carry it. Prices are per pricing
         group, so anything reading or writing a price must name this one.
         """
+        return self.pricing_group_source()[0]
+
+    def pricing_group_source(self) -> tuple[str | None, str]:
+        """The active pricing group and WHERE it came from.
+
+        Three sources, most authoritative first. The source matters when an
+        adjustment does not take effect: a `totalAdjustments` entry naming a
+        group the plan is not actually priced under is accepted by Famly and
+        then does nothing, so knowing which of these answered is the first
+        thing to check.
+        """
         if self.pricing_group_id:
-            return self.pricing_group_id
+            return self.pricing_group_id, "plan.pricingGroupId"
 
         for state in self.plan_states:
             raw = getattr(state, "raw", None)
             if isinstance(raw, dict) and raw.get("pricingGroupId"):
-                return raw["pricingGroupId"]
-        return None
+                return raw["pricingGroupId"], "planStates[].pricingGroupId"
+
+        # Last resort: the group the plan's own prices are keyed under. If the
+        # two ever disagree, THIS is the one the money is expressed in.
+        for part in self.plan_parts:
+            for booking in part.session_bookings:
+                for price in booking.monthly_prices:
+                    if price.pricing_group_id:
+                        return price.pricing_group_id, "monthlyPrices[].pricingGroupId"
+
+        return None, "unresolved"
 
     @property
     def session_booking_count(self) -> int:

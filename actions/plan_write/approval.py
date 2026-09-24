@@ -341,16 +341,60 @@ def _with_adjustment(plan_body: dict, pricing_group_id: str, value: float) -> di
     return adjusted
 
 
-def _adjusted_summary(value: float, estimate, result) -> str:
-    """The re-priced message: what changed, and what it now costs."""
-    estimate_text = (
-        f"{estimate:,.2f}" if isinstance(estimate, (int, float)) else "unknown"
-    )
+def _money(value) -> str:
+    return f"{value:,.2f}" if isinstance(value, (int, float)) else "unknown"
+
+
+def _base_estimate_changed(before, after) -> bool:
+    """Whether Famly's base estimate differs from the pre-adjustment one.
+
+    DIAGNOSTIC ONLY -- logged, never shown, and not a problem either way.
+    `monthlyEstimate` and `totalAdjustments` are separate figures in Famly's
+    model: the adjustment is stored and applied at INVOICING, and is never
+    folded into the estimate. So an unchanged base estimate is the expected
+    result of a successful adjustment, not a sign that anything was ignored.
+
+    Kept because a base estimate that DOES move means something else about the
+    plan changed between previews, which is worth being able to see in a log.
+    """
+    if not isinstance(before, (int, float)) or not isinstance(after, (int, float)):
+        return False
+    return abs(float(after) - float(before)) >= 0.005
+
+
+def total_to_bill(estimate, value):
+    """What the family is actually charged: Famly's base plus the adjustment.
+
+    Famly computes this only at invoicing time -- there is no combined figure
+    anywhere in the preview response -- so it is worked out here for the
+    approver to confirm against.
+
+    Returns None when the base estimate is unknown, since a total built on a
+    missing number would be a guess presented as a fact.
+    """
+    if not isinstance(estimate, (int, float)) or isinstance(estimate, bool):
+        return None
+    return float(estimate) + float(value)
+
+
+def _adjusted_summary(value: float, before, estimate, result, pricing_group_id) -> str:
+    """The re-priced message: the base figure, the adjustment, and the real total.
+
+    Famly keeps `monthlyEstimate` and `totalAdjustments` apart and only combines
+    them when it invoices, so the preview will NOT show a changed estimate. The
+    approver is confirming money, so all three numbers are spelled out and the
+    total is calculated here rather than left for them to do in their head.
+    """
+    total = total_to_bill(estimate, value)
 
     lines = [
         "*Adjusted plan — awaiting final confirmation*",
+        f"• Base monthly estimate (Famly, pre-adjustment — unchanged by "
+        f"this adjustment): {_money(estimate)}",
         f"• Adjustment applied: £{value:+.2f}",
-        f"• New monthly estimate: {estimate_text}",
+        f"• *Total to be billed: {_money(total)}*",
+        "_(Famly bills base + adjustment at invoicing; this total is "
+        "calculated here for confirmation.)_",
     ]
 
     warnings = getattr(result, "warnings", None) or []
@@ -456,6 +500,7 @@ def _complete_adjustment(
         )
         return
 
+    estimate = getattr(result.plan, "monthly_estimate", None) if result.plan else None
     new_preview_id = str(uuid.uuid4())
 
     try:
@@ -467,6 +512,7 @@ def _complete_adjustment(
             site_code=stored.site_code,
             institution_id=stored.institution_id,
             pricing_group_id=pricing_group_id,
+            monthly_estimate=estimate,
         )
 
         # Only now is the original replaced. Doing it earlier would strand the
@@ -481,18 +527,34 @@ def _complete_adjustment(
         )
         return
 
-    estimate = getattr(result.plan, "monthly_estimate", None) if result.plan else None
+    before = stored.monthly_estimate
+
+    # Which source answered for the pricing group. Retained because it confirms
+    # the adjustment reached Famly against the group the plan is priced under,
+    # which is worth being able to check independently of any figure.
+    source = "stored"
+    if result.plan is not None and hasattr(result.plan, "pricing_group_source"):
+        _, source = result.plan.pricing_group_source()
+
     logger.info(
-        "ADJUSTED preview_id=%s -> %s adjustment=%.2f estimate=%s user=%s",
+        "ADJUSTED preview_id=%s -> %s adjustment=%.2f base_estimate=%s -> %s "
+        "(base_changed=%s, expected False) total_to_bill=%s pricing_group=%s "
+        "(source=%s) user=%s",
         preview_id,
         new_preview_id,
         value,
+        before,
         estimate,
+        _base_estimate_changed(before, estimate),
+        total_to_bill(estimate, value),
+        pricing_group_id,
+        source,
         user,
     )
 
     if not slack.post_adjusted(
-        _adjusted_summary(value, estimate, result), new_preview_id
+        _adjusted_summary(value, before, estimate, result, pricing_group_id),
+        new_preview_id,
     ):
         # The plan is re-priced and stored, but the approver cannot see it.
         # Name the preview_id so it is still traceable.

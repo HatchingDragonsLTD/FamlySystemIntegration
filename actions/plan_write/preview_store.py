@@ -67,6 +67,10 @@ _ADDED_COLUMNS = {
     # The pricing group the computed plan priced against. Needed to attach a
     # totalAdjustments entry later, which must name the same group.
     "pricing_group_id": "TEXT",
+    # The estimate as first previewed. Kept so a re-price can be COMPARED
+    # against it -- otherwise an adjustment Famly silently ignored looks
+    # identical to one that worked.
+    "monthly_estimate": "REAL",
 }
 
 
@@ -85,6 +89,8 @@ class StoredPreview:
     site_code: str | None = None
     institution_id: str | None = None
     pricing_group_id: str | None = None
+    # The estimate as first previewed, so a re-price can be compared with it.
+    monthly_estimate: float | None = None
 
     @property
     def is_expired(self) -> bool:
@@ -194,6 +200,7 @@ def _row_to_preview(row: sqlite3.Row) -> StoredPreview:
         site_code=_column(row, "site_code"),
         institution_id=_column(row, "institution_id"),
         pricing_group_id=_column(row, "pricing_group_id"),
+        monthly_estimate=_column(row, "monthly_estimate"),
     )
 
 
@@ -217,6 +224,7 @@ def save(
     site_code: str | None = None,
     institution_id: str | None = None,
     pricing_group_id: str | None = None,
+    monthly_estimate: float | None = None,
 ) -> None:
     """Record a previewed plan as pending approval.
 
@@ -230,8 +238,8 @@ def save(
         connection.execute(
             "INSERT OR REPLACE INTO previews "
             "(preview_id, plan_body, child_id, version, created_at, status, "
-            "site_code, institution_id, pricing_group_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "site_code, institution_id, pricing_group_id, monthly_estimate) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 preview_id,
                 json.dumps(plan_body),
@@ -242,6 +250,7 @@ def save(
                 site_code,
                 institution_id,
                 pricing_group_id,
+                monthly_estimate,
             ),
         )
 
