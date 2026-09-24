@@ -23,6 +23,7 @@ the plan previews normally.
 billingProfileId is intentionally absent (the server resolves it separately).
 """
 
+import math
 from datetime import datetime, timezone
 from typing import Any
 
@@ -52,6 +53,11 @@ _DISCOUNT_DEFAULTS = {
     "period": "WEEKLY",
     "showOnInvoice": True,
 }
+
+# The most days products can be booked on, however large addon_quantity is.
+# A fractional quantity rounds UP (2.5 -> 3, since a part-day of add-ons is
+# still a day the family receives them) and is then capped here.
+MAX_ADDON_DAYS = 3
 
 # Amounts arrive as a FRACTION (5% is 0.05), so anything above 1.0 is a
 # fat-fingered percentage rather than a fraction. Rejecting it here stops a
@@ -192,6 +198,11 @@ def build_product_bookings(data: Any, booked_days: list[str]) -> tuple[list, lis
     Days are taken in week order (the order `_DAYS` already produced the
     session bookings in), so "the first 3 of Mon/Wed/Thu/Fri" is Mon, Wed, Thu.
 
+    `addon_quantity` may be fractional. It is rounded UP and then capped at
+    MAX_ADDON_DAYS: 2.5 -> 3, and 4.5 -> 5 -> 3. The capped figure is what the
+    day count is checked against, so 4.5 against two booked days is still an
+    error (3 > 2), while 4.5 against five booked days books the first three.
+
     UNLIKE the discount slots, a malformed product setup is a HARD error, not a
     warning. There is no safe partial behaviour: capping the quantity, or
     guessing which of the two products to drop, would silently bill the family
@@ -234,17 +245,30 @@ def build_product_bookings(data: Any, booked_days: list[str]) -> tuple[list, lis
         ]
 
     try:
-        quantity = int(float(raw_quantity))
+        raw_value = float(raw_quantity)
     except (TypeError, ValueError):
-        return [], [f"addon_quantity: {raw_quantity!r} is not an integer"]
+        return [], [f"addon_quantity: {raw_quantity!r} is not a number"]
 
-    if quantity < 0:
-        return [], [f"addon_quantity ({quantity}) cannot be negative"]
+    if raw_value < 0:
+        return [], [f"addon_quantity ({raw_value:g}) cannot be negative"]
+
+    # Round up, then cap. A half day of add-ons still means the family gets
+    # them that day, so 2.5 covers three days; and no plan books products on
+    # more than MAX_ADDON_DAYS days whatever was entered.
+    quantity = min(math.ceil(raw_value), MAX_ADDON_DAYS)
 
     if quantity > len(booked_days):
+        # Report the effective figure, and how it was reached when that is not
+        # simply what was typed.
+        if quantity != raw_value:
+            entered = (
+                f"addon_quantity ({raw_value:g} -> {quantity} after rounding up"
+                f"{' and capping at ' + str(MAX_ADDON_DAYS) if math.ceil(raw_value) > MAX_ADDON_DAYS else ''})"
+            )
+        else:
+            entered = f"addon_quantity ({quantity})"
         return [], [
-            f"addon_quantity ({quantity}) exceeds the number of booked days "
-            f"({len(booked_days)})"
+            f"{entered} exceeds the number of booked days ({len(booked_days)})"
         ]
 
     bookings = []
