@@ -97,6 +97,15 @@ class AdjustTestCase(unittest.TestCase):
         notice.start()
         self.addCleanup(notice.stop)
 
+        self.updated = []
+        updater = mock.patch.object(
+            slack,
+            "update_message",
+            lambda url, text: self.updated.append((url, text)) or True,
+        )
+        updater.start()
+        self.addCleanup(updater.stop)
+
         opener = mock.patch.object(
             slack, "open_modal", lambda trigger, view: self.opened.append((trigger, view)) or True
         )
@@ -115,7 +124,7 @@ class AdjustTestCase(unittest.TestCase):
             monthly_estimate=estimate,
         )
 
-    def submit(self, value, preview_id=PREVIEW_ID):
+    def submit(self, value, preview_id=PREVIEW_ID, response_url=None):
         """Submit, running the background work inline.
 
         The real handler hands the re-price to a thread; running it inline here
@@ -123,7 +132,11 @@ class AdjustTestCase(unittest.TestCase):
         by AsyncAckTests below.
         """
         return approval.handle_adjust_submission(
-            preview_id, value, "drew", spawn=lambda work: work()
+            preview_id,
+            value,
+            "drew",
+            spawn=lambda work: work(),
+            response_url=response_url,
         )
 
     def new_preview_id(self):
@@ -143,7 +156,8 @@ class AdjustClickTests(AdjustTestCase):
         self.assertEqual(len(self.opened), 1)
         trigger, view = self.opened[0]
         self.assertEqual(trigger, "trigger-1")
-        self.assertEqual(view["private_metadata"], PREVIEW_ID)
+        # private_metadata is JSON now: it carries the response_url too.
+        self.assertEqual(json.loads(view["private_metadata"])["preview_id"], PREVIEW_ID)
         # Nothing previewed, nothing stored, nothing changed.
         self.assertEqual(self.previews, [])
         self.assertEqual(
@@ -416,6 +430,180 @@ class AsyncAckTests(AdjustTestCase):
         # The plan was re-priced and stored, so the id must be recoverable.
         self.assertEqual(len(self.notices), 1)
         self.assertIn("could not post", self.notices[0])
+
+
+ORIGINAL_RESPONSE_URL = "https://hooks.slack.com/actions/T/ORIGINAL/abc"
+
+
+class ModalContextTests(AdjustTestCase):
+    """The approver should see what they are adjusting while typing."""
+
+    def test_the_modal_shows_the_current_estimate(self):
+        self.save_pending(estimate=1499.91)
+
+        approval.handle_adjust_click(
+            PREVIEW_ID, "drew", "trigger-1", ORIGINAL_RESPONSE_URL
+        )
+
+        _, view = self.opened[-1]
+        context = view["blocks"][0]
+        self.assertEqual(context["type"], "context")
+        self.assertIn("Current monthly estimate", context["elements"][0]["text"])
+        self.assertIn("1,499.91", context["elements"][0]["text"])
+
+    def test_an_unknown_estimate_omits_the_line_rather_than_guessing(self):
+        self.save_pending(estimate=None)
+
+        approval.handle_adjust_click(
+            PREVIEW_ID, "drew", "trigger-1", ORIGINAL_RESPONSE_URL
+        )
+
+        _, view = self.opened[-1]
+        self.assertEqual([b["type"] for b in view["blocks"]], ["input"])
+
+    def test_the_original_response_url_travels_in_private_metadata(self):
+        # A view_submission payload carries no response_url of its own, so
+        # stashing it here is the only way to update the original message.
+        self.save_pending()
+
+        approval.handle_adjust_click(
+            PREVIEW_ID, "drew", "trigger-1", ORIGINAL_RESPONSE_URL
+        )
+
+        _, view = self.opened[-1]
+        metadata = json.loads(view["private_metadata"])
+        self.assertEqual(metadata["preview_id"], PREVIEW_ID)
+        self.assertEqual(metadata["response_url"], ORIGINAL_RESPONSE_URL)
+
+    def test_a_bare_preview_id_is_still_accepted_on_the_way_back(self):
+        # A modal opened by an older build must still submit successfully.
+        from urllib.parse import urlencode
+
+        payload = {
+            "type": "view_submission",
+            "user": {"username": "drew"},
+            "view": {
+                "callback_id": slack.ADJUST_CALLBACK_ID,
+                "private_metadata": "legacy-id",
+                "state": {
+                    "values": {
+                        slack.ADJUST_BLOCK_ID: {slack.ADJUST_INPUT_ID: {"value": "0.10"}}
+                    }
+                },
+            },
+        }
+        parsed = slack.parse_interaction(urlencode({"payload": json.dumps(payload)}))
+
+        self.assertEqual(parsed["preview_id"], "legacy-id")
+        self.assertIsNone(parsed["response_url"])
+
+
+class OriginalMessageRetiredTests(AdjustTestCase):
+    """A plan being adjusted must not stay clickable in parallel."""
+
+    def test_the_original_message_is_replaced_on_submission(self):
+        self.save_pending()
+
+        self.submit("-0.50", response_url=ORIGINAL_RESPONSE_URL)
+
+        self.assertEqual(len(self.updated), 1)
+        url, text = self.updated[0]
+        # The ORIGINAL message's url, not the new preview's message.
+        self.assertEqual(url, ORIGINAL_RESPONSE_URL)
+        self.assertIn("Adjustment submitted", text)
+
+    def test_the_replacement_leaves_no_clickable_buttons(self):
+        self.save_pending()
+
+        self.submit("-0.50", response_url=ORIGINAL_RESPONSE_URL)
+
+        _, text = self.updated[0]
+        # update_message posts text only -- no blocks, so no buttons survive.
+        for label in ("Approve", "Reject", "Adjust &"):
+            self.assertNotIn(label, text)
+
+    def test_the_new_message_is_posted_separately_from_the_update(self):
+        self.save_pending()
+
+        self.submit("-0.50", response_url=ORIGINAL_RESPONSE_URL)
+
+        # One update to the old message, one fresh post for the new one.
+        self.assertEqual(len(self.updated), 1)
+        self.assertEqual(len(self.posted), 1)
+        self.assertNotEqual(self.posted[-1][1], PREVIEW_ID)
+
+    def test_an_invalid_submission_does_not_retire_the_original(self):
+        # Nothing changed, so the plan stays approvable exactly as it was.
+        self.save_pending()
+
+        self.submit("1.50", response_url=ORIGINAL_RESPONSE_URL)
+
+        self.assertEqual(self.updated, [])
+
+    def test_a_missing_response_url_is_not_fatal(self):
+        self.save_pending()
+
+        self.assertIsNone(self.submit("-0.50"))
+        self.assertEqual(self.updated, [])
+        self.assertEqual(len(self.posted), 1)
+
+
+class AdjustmentNoteTests(AdjustTestCase):
+    """The adjustment must be traceable inside Famly, not only in Slack."""
+
+    def _note(self):
+        return preview_store.get(self.new_preview_id()).plan_body["plan"]["note"]
+
+    def test_the_note_records_value_user_total_and_date(self):
+        from datetime import date
+
+        self.save_pending()  # the stub re-prices to 812.50
+
+        self.submit("-0.50")
+
+        self.assertEqual(
+            self._note(),
+            "Adjustment: \u00a3-0.50, approved by drew, total billed "
+            "\u00a3812.00, " + date.today().isoformat(),
+        )
+
+    def test_a_positive_adjustment_reads_correctly(self):
+        from datetime import date
+
+        self.save_pending()
+
+        self.submit("0.35")
+
+        self.assertEqual(
+            self._note(),
+            "Adjustment: \u00a3+0.35, approved by drew, total billed "
+            "\u00a3812.85, " + date.today().isoformat(),
+        )
+
+    def test_the_original_stored_body_keeps_its_empty_note(self):
+        self.save_pending()
+
+        self.submit("-0.50")
+
+        self.assertEqual(
+            preview_store.get(PREVIEW_ID).plan_body["plan"].get("note", ""), ""
+        )
+
+    def test_an_existing_note_is_appended_to_not_overwritten(self):
+        body = {"plan": {"note": "Termly review agreed", "planParts": [{}]}}
+
+        updated = approval._with_note(body, "Adjustment: ...")
+
+        self.assertEqual(
+            updated["plan"]["note"], "Termly review agreed\nAdjustment: ..."
+        )
+        # And the input itself is untouched.
+        self.assertEqual(body["plan"]["note"], "Termly review agreed")
+
+    def test_an_unknown_total_is_not_invented_in_the_note(self):
+        self.assertIn(
+            "total billed unknown", approval._adjustment_note(-0.50, "drew", None)
+        )
 
 
 class BilledTotalTests(AdjustTestCase):
