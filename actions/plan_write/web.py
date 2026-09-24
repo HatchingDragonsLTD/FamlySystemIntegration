@@ -185,6 +185,8 @@ def handle(payload: dict) -> tuple[dict, int]:
             # Recorded so an adjustment can name the same pricing group the
             # plan was priced against.
             pricing_group_id=getattr(preview.plan, "active_pricing_group_id", None),
+            # Kept so an adjustment can tell whether the re-price moved.
+            monthly_estimate=getattr(preview.plan, "monthly_estimate", None),
         )
     except Exception as exc:  # noqa: BLE001 - storing must not break the preview
         logger.warning(

@@ -103,9 +103,16 @@ class AdjustTestCase(unittest.TestCase):
         opener.start()
         self.addCleanup(opener.stop)
 
-    def save_pending(self, preview_id=PREVIEW_ID, pricing_group=PRICING_GROUP):
+    def save_pending(
+        self, preview_id=PREVIEW_ID, pricing_group=PRICING_GROUP, estimate=900.00
+    ):
         preview_store.save(
-            preview_id, PLAN_BODY, CHILD, 3, pricing_group_id=pricing_group
+            preview_id,
+            PLAN_BODY,
+            CHILD,
+            3,
+            pricing_group_id=pricing_group,
+            monthly_estimate=estimate,
         )
 
     def submit(self, value, preview_id=PREVIEW_ID):
@@ -409,6 +416,150 @@ class AsyncAckTests(AdjustTestCase):
         # The plan was re-priced and stored, so the id must be recoverable.
         self.assertEqual(len(self.notices), 1)
         self.assertIn("could not post", self.notices[0])
+
+
+class BilledTotalTests(AdjustTestCase):
+    """The approver is confirming money, so all three figures must be right.
+
+    Famly keeps `monthlyEstimate` and `totalAdjustments` apart and only combines
+    them at invoicing, so the base estimate does NOT move when an adjustment is
+    applied. The combined total therefore has to be calculated here.
+    """
+
+    def test_an_unchanged_base_estimate_is_not_flagged(self):
+        # The normal, expected case: Famly never folds the adjustment into the
+        # estimate. Warning about it would fire on every successful adjustment.
+        self.save_pending(estimate=812.50)  # the stub re-prices to 812.50 too
+
+        self.submit("-0.50")
+
+        text, _ = self.posted[-1]
+        self.assertNotIn("did not change", text)
+        self.assertNotIn("ignored", text)
+        self.assertNotIn(":warning:", text)
+
+    def test_a_negative_adjustment_subtracts_from_the_base(self):
+        self.save_pending()
+
+        self.submit("-0.50")
+
+        text, _ = self.posted[-1]
+        self.assertIn("Base monthly estimate", text)
+        self.assertIn("812.50", text)
+        self.assertIn("£-0.50", text)
+        self.assertIn("Total to be billed: 812.00", text)
+
+    def test_a_positive_adjustment_adds_to_the_base(self):
+        self.save_pending()
+
+        self.submit("0.35")
+
+        text, _ = self.posted[-1]
+        self.assertIn("£+0.35", text)
+        self.assertIn("Total to be billed: 812.85", text)
+
+    def test_a_zero_adjustment_leaves_the_total_at_the_base(self):
+        self.save_pending()
+
+        self.submit("0")
+
+        text, _ = self.posted[-1]
+        self.assertIn("£+0.00", text)
+        self.assertIn("Total to be billed: 812.50", text)
+
+    def test_the_total_is_always_base_plus_adjustment(self):
+        for estimate, adjustment, expected in (
+            (812.50, -0.50, 812.00),
+            (812.50, 0.35, 812.85),
+            (812.50, 0.00, 812.50),
+            (0.00, 1.00, 1.00),
+            (100.00, -1.00, 99.00),
+        ):
+            self.assertAlmostEqual(
+                approval.total_to_bill(estimate, adjustment),
+                expected,
+                places=2,
+                msg=f"{estimate} + {adjustment}",
+            )
+
+    def test_an_unknown_base_gives_no_invented_total(self):
+        # A total built on a missing number would be a guess shown as a fact.
+        self.assertIsNone(approval.total_to_bill(None, -0.50))
+        self.assertIsNone(approval.total_to_bill("n/a", -0.50))
+
+    def test_the_message_explains_where_the_total_comes_from(self):
+        self.save_pending()
+
+        self.submit("-0.50")
+
+        text, _ = self.posted[-1]
+        self.assertIn("invoicing", text)
+        self.assertIn("calculated here", text)
+
+    def test_the_plan_warnings_line_is_still_shown(self):
+        self.save_pending()
+
+        class WarnResult:
+            plan = FakePlan()
+            warnings = ["w1", "w2"]
+
+        with mock.patch.object(
+            approval.runner, "preview", lambda b, v, client=None: WarnResult()
+        ):
+            self.submit("-0.50")
+
+        self.assertIn("2 warning(s)", self.posted[-1][0])
+
+    def test_the_baseline_is_still_tracked_for_diagnostics(self):
+        # Kept though no longer shown: a base estimate that DOES move means
+        # something else about the plan changed between previews.
+        self.save_pending(estimate=900.00)
+
+        self.submit("-0.50")
+
+        stored = preview_store.get(self.new_preview_id())
+        self.assertEqual(stored.monthly_estimate, 812.50)
+        self.assertFalse(approval._base_estimate_changed(812.50, 812.50))
+        self.assertTrue(approval._base_estimate_changed(900.00, 812.50))
+
+
+class PricingGroupSourceTests(unittest.TestCase):
+    """Where the pricing group came from, for diagnosing a no-op."""
+
+    def test_the_sources_are_tried_in_order(self):
+        from actions.read_child_plans.runner import parse_plan
+
+        cases = [
+            ({"pricingGroupId": "pg-plan"}, "pg-plan", "plan.pricingGroupId"),
+            (
+                {"planStates": [{"pricingGroupId": "pg-state"}]},
+                "pg-state",
+                "planStates[].pricingGroupId",
+            ),
+            (
+                {
+                    "planParts": [
+                        {
+                            "sessionBookings": [
+                                {
+                                    "monthlyPrices": [
+                                        {"pricingGroupId": "pg-price", "price": 1}
+                                    ]
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "pg-price",
+                "monthlyPrices[].pricingGroupId",
+            ),
+            ({}, None, "unresolved"),
+        ]
+
+        for node, expected_id, expected_source in cases:
+            plan = parse_plan(node)
+            self.assertEqual(plan.pricing_group_source(), (expected_id, expected_source))
+            self.assertEqual(plan.active_pricing_group_id, expected_id)
 
 
 class ConfirmCommitTests(AdjustTestCase):
