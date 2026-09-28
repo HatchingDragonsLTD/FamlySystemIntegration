@@ -134,6 +134,9 @@ class PlanPartInput:
 class PlanInput:
     child_id: str | None = None
     from_date: str | None = None
+    # None means open-ended -- every prior real capture sends "to": null for
+    # that case, so absence here must never be treated as missing data.
+    to_date: str | None = None
     rule_group_id: str | None = None
     note: str = ""
     plan_parts: list[PlanPartInput] = field(default_factory=list)
@@ -266,6 +269,7 @@ def from_dict(data: Any) -> PlanInput:
     return PlanInput(
         child_id=_first(data, "childId", "child_id"),
         from_date=_first(data, "from", "from_date"),
+        to_date=_first(data, "to", "to_date"),
         rule_group_id=_first(data, "ruleGroupId", "rule_group_id"),
         note=note if isinstance(note, str) else "",
         plan_parts=[_parse_plan_part(p) for p in parts]
@@ -374,6 +378,17 @@ def validate(plan_input: PlanInput) -> list[str]:
         except (ValueError, TypeError):
             errors.append(
                 f"from: {plan_input.from_date!r} is not an ISO date (YYYY-MM-DD)"
+            )
+
+    # Unlike `from`, `to` is genuinely optional: None means an open-ended plan,
+    # exactly what every prior real capture sends ("to": null), so a missing
+    # value here is NOT an error. Only a present-but-malformed one is.
+    if plan_input.to_date is not None:
+        try:
+            date.fromisoformat(str(plan_input.to_date))
+        except (ValueError, TypeError):
+            errors.append(
+                f"to: {plan_input.to_date!r} is not an ISO date (YYYY-MM-DD)"
             )
 
     # ruleGroupId is a Famly ULID (e.g. 01M0SM9F...), not a UUID. Optional:
@@ -505,6 +520,7 @@ def to_plan_body(plan_input: PlanInput) -> dict:
     return builder.build_plan_body(
         child_id=plan_input.child_id,
         from_date=plan_input.from_date,
+        to=plan_input.to_date,
         rule_group_id=plan_input.rule_group_id,
         note=plan_input.note,
         plan_parts=parts,
