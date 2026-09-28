@@ -14,12 +14,16 @@ IMPORTANT: the endpoint returns HTTP 200 even when the plan is invalid. The
 warnings in `behaviors[]` are the only signal, so every call here extracts them.
 """
 
+import json
+import logging
 from dataclasses import dataclass, field
 from typing import Any
 
 from actions.read_child_plans.runner import Plan, parse_plan
 from actions.plan_write import warnings as plan_warnings
-from core.rest_client import RestClient
+from core.rest_client import RestClient, RestHTTPError
+
+logger = logging.getLogger(__name__)
 
 # Path under the configured REST base URL (which already ends in /api).
 PLANS_PATH = "/v2/plans"
@@ -91,6 +95,15 @@ def _post_plan(
     place both preview() and commit() go through, and both get them the same
     way. `old_plan_id=None` (every existing call site) leaves the query string
     completely unchanged from before these parameters existed.
+
+    THIS IS ALSO THE ONE PLACE A FAILED FAMLY CALL CAN BE LOGGED WITH FULL
+    CONTEXT: every caller -- plan_preview's ordinary create, additional_plan's
+    second-plan preview, and both steps of a commit -- goes through here, so a
+    RestHTTPError is logged (request body, query params, and the error's own
+    status/body) right here and re-raised, rather than each call site having
+    to remember to do it. Before this, only a SUCCESSFUL preview was ever
+    logged (see plan_write.web's PLAN PREVIEW ... line); a failure left no
+    trace of what was actually sent or what Famly said back.
     """
     client = client or RestClient()
 
@@ -103,7 +116,22 @@ def _post_plan(
         params["oldPlanId"] = old_plan_id
         params["replaceOldPlan"] = "true" if replace_old_plan else "false"
 
-    return client.post(PLANS_PATH, params=params, json_body=plan_body)
+    try:
+        return client.post(PLANS_PATH, params=params, json_body=plan_body)
+    except RestHTTPError as exc:
+        try:
+            rendered_body = json.dumps(plan_body, default=str)
+        except (TypeError, ValueError):
+            rendered_body = repr(plan_body)
+        logger.error(
+            "FAMLY PLAN CALL FAILED params=%s status=%s error_body=%s "
+            "request_body=%s",
+            params,
+            exc.status_code,
+            exc.body,
+            rendered_body,
+        )
+        raise
 
 
 def child_id_of(plan_body: Any) -> str | None:
