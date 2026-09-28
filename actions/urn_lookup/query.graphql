@@ -1,0 +1,25 @@
+# TEMPORARY backfill query -- see runner.py's module docstring for what this
+# is and when to delete it. Minimal field selection only (id, externalId,
+# name.fullName): the caller matches on externalId and shows fullName as a
+# sanity-check label, nothing else.
+#
+# PAGINATION ARGUMENT UNCONFIRMED AGAINST THE LIVE SCHEMA: `next` on `list` is
+# the cursor field's own name, re-supplied as the query variable -- the
+# obvious minimal convention, not independently verified here. If Famly
+# returns a GraphQL error naming a different or missing argument (on this or
+# the very first, cursor-less call), that must be diagnosed against the real
+# API and this file corrected -- never guessed around further.
+query Children($next: String) {
+  children {
+    list(next: $next) {
+      result {
+        id
+        externalId
+        name {
+          fullName
+        }
+      }
+      next
+    }
+  }
+}
