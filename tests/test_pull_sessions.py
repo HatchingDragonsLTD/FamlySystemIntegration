@@ -369,5 +369,110 @@ class SkippedInstitutionTests(PullSessionsTestCase):
         self.assertEqual(client.calls, [])
 
 
+class InstitutionFilterTests(PullSessionsTestCase):
+    """The --institution / `institutions=` filter, at the runner level."""
+
+    def test_filtering_to_one_institution_only_calls_that_ones_api(self):
+        client = FakeRest(
+            {
+                CITY_ID: [session("s-1", "Full Day")],
+                CW_ID: [session("s-2", "Full Day")],
+            }
+        )
+
+        result = pull_sessions.pull_all(client=client, institutions=["HDCITY"])
+
+        called_institution_ids = {params["institutionId"] for _path, params in client.calls}
+        self.assertEqual(called_institution_ids, {CITY_ID})
+        self.assertEqual(result.institutions_pulled, ["HDCITY"])
+        self.assertNotIn("HDCW", result.written_counts)
+
+    def test_filtering_leaves_other_institutions_catalogue_entries_untouched(self):
+        self.write_existing_session_catalogue(
+            {
+                "institutions": {
+                    "HDCW": {
+                        "funded": {},
+                        "non_funded": {"full_day": AFTERNOON_UUID},
+                    }
+                }
+            }
+        )
+
+        client = FakeRest({CITY_ID: [session("s-1", "Full Day")], CW_ID: []})
+        result = pull_sessions.pull_all(client=client, institutions=["HDCITY"])
+
+        # HDCW was never touched by this run, but its existing entry survives
+        # the merge exactly as it was.
+        self.assertEqual(
+            result.catalogue["institutions"]["HDCW"]["non_funded"]["full_day"],
+            AFTERNOON_UUID,
+        )
+        self.assertEqual(
+            result.catalogue["institutions"]["HDCITY"]["non_funded"]["full_day"],
+            "s-1",
+        )
+
+    def test_multiple_institutions_can_be_named(self):
+        client = FakeRest(
+            {
+                CITY_ID: [session("s-1", "Full Day")],
+                CW_ID: [session("s-2", "Full Day")],
+            }
+        )
+
+        result = pull_sessions.pull_all(
+            client=client, institutions=["HDCITY", "HDCW"]
+        )
+
+        self.assertEqual(set(result.institutions_pulled), {"HDCITY", "HDCW"})
+
+    def test_matching_is_case_insensitive_and_trimmed(self):
+        client = FakeRest({CITY_ID: [], CW_ID: []})
+        result = pull_sessions.pull_all(client=client, institutions=["  hdcity  "])
+        self.assertEqual(result.institutions_pulled, ["HDCITY"])
+
+    def test_an_unknown_institution_code_raises_with_zero_api_calls(self):
+        client = FakeRest({CITY_ID: [], CW_ID: []})
+
+        with self.assertRaises(pull_sessions.UnknownInstitutionError) as ctx:
+            pull_sessions.pull_all(client=client, institutions=["NOPE"])
+
+        self.assertIn("NOPE", str(ctx.exception))
+        self.assertEqual(client.calls, [])
+
+    def test_one_unknown_code_among_valid_ones_still_raises_before_any_call(self):
+        client = FakeRest({CITY_ID: [], CW_ID: []})
+
+        with self.assertRaises(pull_sessions.UnknownInstitutionError):
+            pull_sessions.pull_all(client=client, institutions=["HDCITY", "NOPE"])
+
+        self.assertEqual(client.calls, [])
+
+    def test_omitting_the_filter_behaves_like_the_unfiltered_run(self):
+        client = FakeRest(
+            {
+                CITY_ID: [session("s-1", "Full Day")],
+                CW_ID: [session("s-2", "Full Day")],
+            }
+        )
+
+        without_filter = pull_sessions.pull_all(client=client)
+        self.assertEqual(set(without_filter.institutions_pulled), {"HDCITY", "HDCW"})
+
+        client_again = FakeRest(
+            {
+                CITY_ID: [session("s-1", "Full Day")],
+                CW_ID: [session("s-2", "Full Day")],
+            }
+        )
+        explicit_all = pull_sessions.pull_all(
+            client=client_again, institutions=None
+        )
+        self.assertEqual(
+            without_filter.written_counts, explicit_all.written_counts
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

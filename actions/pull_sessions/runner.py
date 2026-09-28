@@ -74,6 +74,14 @@ class TitleParseError(ValueError):
     """A session title did not cleanly match the prefix/slot convention."""
 
 
+class UnknownInstitutionError(ValueError):
+    """An `institutions` filter named a code not in catalogue.json's sites.
+
+    Raised before any Famly call is made -- an unrecognised code is a mistake
+    worth stopping for, not a silent no-op that quietly pulls nothing.
+    """
+
+
 @dataclass
 class ParsedTitle:
     funded: bool
@@ -232,7 +240,13 @@ def _merge_institution(existing: Any, new_entries: dict) -> dict:
     return merged
 
 
-def pull_all(client: RestClient | None = None) -> PullResult:
+def _normalise_institution_code(code: str) -> str:
+    return (code or "").strip().upper()
+
+
+def pull_all(
+    client: RestClient | None = None, institutions: list[str] | None = None
+) -> PullResult:
     """Pull live session UUIDs for every institution in catalogue.json's sites.
 
     Nothing is written to disk here -- see `write_catalogue`. A per-institution
@@ -241,13 +255,37 @@ def pull_all(client: RestClient | None = None) -> PullResult:
 
     Args:
         client: optional RestClient, mainly for tests.
+        institutions: optional site codes (case-insensitive, matched the same
+            way `catalogue.resolve_site` does) restricting the pull to just
+            those institutions. None (the default) processes every site in
+            catalogue.json's sites section, unchanged from an unfiltered run.
+            An institution not found among those sites is not silently
+            skipped -- it means the filter itself is probably wrong, so it
+            raises UnknownInstitutionError before any Famly call is made.
 
     Returns:
         A PullResult ready to hand to `write_catalogue`.
+
+    Raises:
+        UnknownInstitutionError: `institutions` named a code catalogue.json's
+            sites do not have.
     """
     client = client or RestClient()
 
     sites = catalogue.load_sites()
+
+    if institutions is not None:
+        requested = [_normalise_institution_code(code) for code in institutions]
+        unknown = [code for code in requested if code not in sites]
+        if unknown:
+            raise UnknownInstitutionError(
+                f"unknown institution code(s): {', '.join(unknown)} "
+                f"(known: {', '.join(sorted(sites)) or 'none configured'})"
+            )
+        # De-duplicate while keeping only the requested sites, in case the
+        # same code was passed more than once.
+        sites = {code: sites[code] for code in dict.fromkeys(requested)}
+
     existing_raw = _read_existing_catalogue(session_catalogue.catalogue_path())
     existing_institutions = existing_raw.get("institutions")
     if not isinstance(existing_institutions, dict):

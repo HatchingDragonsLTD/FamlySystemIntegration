@@ -22,10 +22,20 @@ def add_args(parser: argparse.ArgumentParser) -> None:
             "session_catalogue.json or a backup"
         ),
     )
+    parser.add_argument(
+        "--institution",
+        action="append",
+        metavar="CODE",
+        help=(
+            "Restrict the pull to this site code (from catalogue.json). "
+            "Repeatable, e.g. --institution HDCITY --institution HDCW. "
+            "Omit to pull every configured institution (default)."
+        ),
+    )
 
 
 def handle(args: argparse.Namespace):
-    result = runner.pull_all()
+    result = runner.pull_all(institutions=args.institution)
 
     backup = None
     if not args.dry_run:
