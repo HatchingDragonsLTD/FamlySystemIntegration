@@ -16,12 +16,14 @@ status; the router wraps it in the standard envelope and classifies any
 exception it raises.
 """
 
+from actions.plan_status import web as plan_status_web
 from actions.plan_write import approval as plan_write_approval
 from actions.plan_write import web as plan_write_web
 
 # One line per action. ACTION_NAME -> handler.
 ACTIONS = {
     plan_write_web.ACTION_NAME: plan_write_web.handle,
+    plan_status_web.ACTION_NAME: plan_status_web.handle,
 }
 
 # Slack button clicks. The router verifies the signature and identifies the
