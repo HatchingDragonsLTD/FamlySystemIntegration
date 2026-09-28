@@ -34,6 +34,15 @@
       },
       "non_funded": {"morning": "", "afternoon": "", "full_day": ""}
     },
+    "HDWEST": {
+      "funded": {
+        "with_meals_and_activities": {"morning": "", "afternoon": "", "full_day": ""},
+        "no_meals": {"morning": "", "afternoon": "", "full_day": ""},
+        "no_activities": {"morning": "", "afternoon": "", "full_day": ""},
+        "neither": {"morning": "", "afternoon": "", "full_day": ""}
+      },
+      "non_funded": {"morning": "", "afternoon": "", "full_day": ""}
+    },
     "HDCW": {
       "funded": {
         "with_meals_and_activities": {"morning": "", "afternoon": "", "full_day": ""},
