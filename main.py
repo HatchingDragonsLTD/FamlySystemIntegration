@@ -19,6 +19,7 @@ from actions.pull_sessions import cli as pull_sessions
 from actions.read_child_plans import cli as read_child_plans
 from actions.staff_credentials import cli as staff_credentials
 from actions.plan_write.runner import PlanCommitRefused
+from actions.pull_sessions.runner import UnknownInstitutionError
 from core.client import GraphQLError, GraphQLHTTPError
 from core.config import ConfigError
 from core.rest_client import RestHTTPError
@@ -83,6 +84,9 @@ def main(argv: list[str] | None = None) -> int:
     except PlanCommitRefused as exc:
         print(f"Refused: {exc}", file=sys.stderr)
         return 3
+    except UnknownInstitutionError as exc:
+        print(f"Invalid --institution: {exc}", file=sys.stderr)
+        return 4
 
     _print_result(result)
     return 0
