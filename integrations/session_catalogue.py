@@ -109,8 +109,13 @@ def _variant_key(has_meals: bool, has_activities: bool) -> str:
     return VARIANT_NEITHER
 
 
-def _normalise_slot(slot: Any) -> str:
-    """`"full day"` / `"Full Day"` / `"full_day"` all normalise the same way."""
+def normalise_slot(slot: Any) -> str:
+    """`"full day"` / `"Full Day"` / `"full_day"` all normalise the same way.
+
+    Public so any other producer of a slot alias (e.g. the session-catalogue
+    pull script parsing Famly's own session titles) reuses this exact rule
+    rather than re-implementing it.
+    """
     if not isinstance(slot, str):
         return ""
     return slot.strip().lower().replace(" ", "_")
@@ -165,7 +170,7 @@ def resolve_session(
     if not isinstance(entry, dict):
         raise SessionCatalogueError(f"session_catalogue: no institution {institution!r}")
 
-    slot_key = _normalise_slot(slot)
+    slot_key = normalise_slot(slot)
     if slot_key not in VALID_SLOTS:
         raise SessionCatalogueError(
             f"session_catalogue: {slot!r} is not a valid slot (expected one of "
