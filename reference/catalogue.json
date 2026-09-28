@@ -45,7 +45,19 @@
 
     "4d8b109a-62e1-40eb-afab-242fc39cb71c": "Full Day",
     "a649ec9b-242d-479c-a572-3c4d83c715a8": "Morning",
-    "8f150941-08cd-4642-a50c-014c5429e94e": "Afternoon"
+    "8f150941-08cd-4642-a50c-014c5429e94e": "Afternoon",
+    
+    "be81b77f-27fd-4b89-8b0b-41c26c9aa2fe": "Funded Morning (No Meals)",
+    "6fb46863-6b38-44ec-8f74-8e8da552e25d": "Funded Afternoon (No Meals)",
+    "d2c6f9b3-e65a-4ffa-b676-81b74ee0182b": "Funded Full Day (No Meals)",
+    
+    "a4d74181-40d5-4355-9dd2-8e3ec3c04452": "Funded Morning (No Activities)",
+    "df362440-d235-4a1a-86bc-bc266f85dd6f": "Funded Afternoon (No Activities)",
+    "bce435b2-a91e-40bc-9d4f-aced25adf552": "Funded Full Day (No Activities)",
+     
+    "150de1f5-0fbf-49bd-8803-04df449e77a8": "Funded Morning (No Extras)",
+    "cbed5234-158e-4488-8231-17422fa0ac94": "Funded Afternoon (No Extras)",
+    "7bb38377-7083-4197-bf0c-53df691a4718": "Funded Full Day (No Extras)",
   },
 
   "products": {
