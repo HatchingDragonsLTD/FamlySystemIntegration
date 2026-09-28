@@ -15,6 +15,7 @@ import sys
 from dataclasses import asdict, is_dataclass
 
 from actions.plan_write import cli as plan_write
+from actions.pull_sessions import cli as pull_sessions
 from actions.read_child_plans import cli as read_child_plans
 from actions.staff_credentials import cli as staff_credentials
 from actions.plan_write.runner import PlanCommitRefused
@@ -27,6 +28,7 @@ ACTIONS = [
     staff_credentials,
     read_child_plans,
     plan_write,
+    pull_sessions,
 ]
 
 
