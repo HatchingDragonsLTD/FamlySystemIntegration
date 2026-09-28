@@ -7,20 +7,38 @@ cannot hold arrays), and the native webhook forwards them as a flat JSON body:
     childId, from, to, ruleGroupId, note,
     attendanceScheduleId, weeksOfCare, billingId, billingTitle, billingInvoices,
     termTimeOnly,
-    monday_session ... friday_session,   (sessionId per day, "" = not booked)
+    institution, has_meals, has_activities  (meals/activities only matter when
+                                              funded is true),
+    monday ... friday,                   (raw slot per day: "morning" /
+                                          "afternoon" / "full day", "" = not
+                                          booked -- NOT a pre-resolved UUID)
     funded, fundingMethod, fundingHours, maxFundedMinutes,
     discount_1_name/discount_1_amount ... discount_3_name/discount_3_amount,
     half_day_adjustment ("yes"/"no") + half_day_amount (2.94 or 3.53),
     site_code                            (e.g. "HDCITY" -- metadata only),
     product_1_id, product_2_id, addon_quantity   (non-funded deals only)
 
-This module reshapes that into the single-plan-part nested structure. It does
-NOT validate -- it only restructures; `input_schema.validate` still runs after.
-The one exception is the discount slots: pairing a name with an amount is only
-possible here, before the slots are flattened away, so problems found there are
-carried out under PROBLEMS_KEY. They are ADVISORY -- hubspot_intake turns them
-into warnings, so a malformed slot is excluded and flagged while the rest of
-the plan previews normally.
+This is the NEW contract: HubSpot sends a raw slot string per day plus
+institution/funded/meals/activities, and this module resolves each booked
+day's Famly session UUID via `integrations.session_catalogue` -- HubSpot no
+longer sends a pre-resolved UUID. The old `monday_session`-style fields are no
+longer read at all; a payload still sending them looks like a booking with no
+institution and no slot, and fails validation accordingly. Both shapes are
+deliberately NOT supported side by side, so there is no ambiguity about which
+contract is live.
+
+This module reshapes the payload into the single-plan-part nested structure.
+It does NOT validate -- it only restructures; `input_schema.validate` still
+runs after. Two kinds of problems a producer can find here ride separate
+channels:
+
+  * discount slots (pairing a name with an amount is only possible here,
+    before the slots are flattened away) are ADVISORY: PROBLEMS_KEY, turned
+    into warnings by hubspot_intake -- the plan still previews.
+  * a session catalogue gap for a booked day is a HARD failure: ERRORS_KEY,
+    same channel as a malformed product booking -- blocks the preview with
+    zero Famly calls, because there is no safe partial plan to fall back to.
+
 billingProfileId is intentionally absent (the server resolves it separately).
 """
 
@@ -28,15 +46,17 @@ import math
 from datetime import datetime, timezone
 from typing import Any
 
-from integrations import catalogue
+from integrations import catalogue, session_catalogue
 
-# HubSpot field prefix -> Famly day enum. Order fixed for stable output.
+# HubSpot field -> Famly day enum. Order fixed for stable output. Each field
+# carries a raw slot string ("morning"/"afternoon"/"full day"), resolved to a
+# session UUID via session_catalogue -- see build_session_bookings.
 _DAYS = [
-    ("monday_session", "MONDAY"),
-    ("tuesday_session", "TUESDAY"),
-    ("wednesday_session", "WEDNESDAY"),
-    ("thursday_session", "THURSDAY"),
-    ("friday_session", "FRIDAY"),
+    ("monday", "MONDAY"),
+    ("tuesday", "TUESDAY"),
+    ("wednesday", "WEDNESDAY"),
+    ("thursday", "THURSDAY"),
+    ("friday", "FRIDAY"),
 ]
 
 # Values HubSpot may send for a boolean field.
@@ -358,6 +378,66 @@ def build_product_bookings(data: Any, booked_days: list[str]) -> tuple[list, lis
     return bookings, []
 
 
+def build_session_bookings(data: Any) -> tuple[list, list[str]]:
+    """Build session bookings for the booked days, resolved via the catalogue.
+
+    Each day field (`monday`.."friday") carries a raw slot string ("morning",
+    "afternoon", "full day") or is empty (not booked). The Famly session UUID
+    for a booked day is resolved from `session_catalogue`, using the deal's
+    institution, funded flag, and -- for a funded deal -- its meals/activities
+    flags. HubSpot no longer sends a pre-resolved UUID.
+
+    A missing `institution` with at least one booked day is reported the same
+    way: there is no session to resolve without it, and naming it explicitly
+    beats a producer poking around inside a generic catalogue error.
+
+    A catalogue gap for ANY booked day is a HARD failure for the whole plan --
+    unlike the discount slots, there is no safe partial behaviour: skipping the
+    bad day and keeping the rest would produce a plan nobody asked for. See
+    `build_product_bookings` for the same reasoning on the product side.
+
+    Args:
+        data: the flat HubSpot payload.
+
+    Returns:
+        (session_bookings, errors). A non-empty `errors` means the preview
+        must not proceed; `session_bookings` is then empty.
+    """
+    if not isinstance(data, dict):
+        return [], []
+
+    funded = _as_bool(data.get("funded"))
+    institution = _s(data.get("institution"))
+    has_meals = _as_bool(data.get("has_meals"))
+    has_activities = _as_bool(data.get("has_activities"))
+
+    booked = [(day_key, day_enum, _s(data.get(day_key))) for day_key, day_enum in _DAYS]
+    booked = [(day_key, day_enum, slot) for day_key, day_enum, slot in booked if slot]
+
+    if not booked:
+        return [], []
+
+    if institution == "":
+        return [], ["institution: required, but missing or empty"]
+
+    bookings = []
+    errors = []
+    for _day_key, day_enum, slot in booked:
+        try:
+            session_id = session_catalogue.resolve_session(
+                institution, funded, slot, has_meals, has_activities
+            )
+        except session_catalogue.SessionCatalogueError as exc:
+            errors.append(str(exc))
+            continue
+        bookings.append({"sessionId": session_id, "day": day_enum, "fundable": funded})
+
+    if errors:
+        return [], errors
+
+    return bookings, []
+
+
 def build_site_metadata(data: Any) -> dict:
     """Resolve `site_code` into sibling metadata for the plan.
 
@@ -419,7 +499,10 @@ def is_flat_payload(data: Any) -> bool:
 def flatten_to_nested(data: Any) -> dict:
     """Reshape the flat HubSpot payload into the nested plan dict.
 
-    Skips any day whose *_session value is empty (not booked). Attaches
+    Skips any day whose slot value is empty (not booked). A booked day's
+    session UUID is resolved via the session catalogue (see
+    `build_session_bookings`); a gap there rides ERRORS_KEY as a hard failure,
+    same channel as a malformed product booking. Attaches
     publicFundingSettings only when `funded` is truthy. Passes identity fields
     through unchanged. Never raises; missing fields simply come through empty so
     validate() can report them.
@@ -427,18 +510,12 @@ def flatten_to_nested(data: Any) -> dict:
     if not isinstance(data, dict):
         return {}
 
-    # Session bookings: one per booked day. fundable is the deal-wide `funded`
-    # flag applied to every booking (a child is entirely funded or entirely
-    # non-funded; the funded/non-funded session UUIDs are chosen upstream).
+    # Session bookings: one per booked day, resolved via the session catalogue
+    # (see build_session_bookings). fundable is the deal-wide `funded` flag
+    # applied to every booking -- a child is entirely funded or entirely
+    # non-funded.
     funded = _as_bool(data.get("funded"))
-    session_bookings = []
-    for day_key, day_enum in _DAYS:
-        session_id = _s(data.get(day_key))
-        if session_id == "":
-            continue  # not booked that day
-        session_bookings.append(
-            {"sessionId": session_id, "day": day_enum, "fundable": funded}
-        )
+    session_bookings, session_errors = build_session_bookings(data)
 
     # Up to three custom discounts. A half-filled or out-of-range slot yields a
     # problem instead of a discount, and the problems ride along so validate()
@@ -446,9 +523,12 @@ def flatten_to_nested(data: Any) -> dict:
     discounts, discount_problems = build_discounts(data)
 
     # Product bookings land on the first `addon_quantity` booked days, in week
-    # order. A malformed setup is a hard error and blocks the preview.
-    booked_days = [booking["day"] for booking in session_bookings]
+    # order. A malformed setup is a hard error and blocks the preview. Booked
+    # days are taken from the raw slot fields, not from `session_bookings`, so
+    # a session catalogue gap does not also masquerade as "nothing booked" here.
+    booked_days = [day_enum for day_key, day_enum in _DAYS if _s(data.get(day_key))]
     product_bookings, product_errors = build_product_bookings(data, booked_days)
+    errors = session_errors + product_errors
 
     plan_part = {
         "billingProfileId": _s(data.get("billingProfileId")) or None,
@@ -478,8 +558,8 @@ def flatten_to_nested(data: Any) -> dict:
     if discount_problems:
         nested[PROBLEMS_KEY] = discount_problems
 
-    if product_errors:
-        nested[ERRORS_KEY] = product_errors
+    if errors:
+        nested[ERRORS_KEY] = errors
 
     # Site context rides alongside the plan, never inside it.
     nested[METADATA_KEY] = build_site_metadata(data)

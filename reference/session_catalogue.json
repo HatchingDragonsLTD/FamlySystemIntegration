@@ -1,0 +1,47 @@
+{
+  "_comment": [
+    "FUNCTIONALLY LOAD-BEARING -- unlike reference/catalogue.json (display",
+    "names only), this file DECIDES which Famly session gets booked. An empty",
+    "or missing UUID here is not a cosmetic gap: it blocks the whole plan",
+    "preview with a hard validation error naming exactly which path was",
+    "missing, rather than booking the wrong session or none at all.",
+    "",
+    "Structure: institutions.<code>.funded.<variant>.<slot> and",
+    "institutions.<code>.non_funded.<slot>. <code> is the `institution` field",
+    "HubSpot sends (matched case-insensitively). <slot> is one of morning,",
+    "afternoon, full_day (HubSpot may send 'full day' with a space -- the",
+    "loader normalises it).",
+    "",
+    "<variant> describes what is MISSING from the funded session, not what is",
+    "present:",
+    "  with_meals_and_activities  has_meals=true,  has_activities=true",
+    "  no_activities              has_meals=true,  has_activities=false",
+    "  no_meals                   has_meals=false, has_activities=true",
+    "  neither                    has_meals=false, has_activities=false",
+    "",
+    "The file is re-read on every call, so edits take effect without a server",
+    "restart. Point SESSION_CATALOGUE_FILE elsewhere to override the path.",
+    "Fill in each PASTE-... placeholder with the real Famly session UUID."
+  ],
+
+  "institutions": {
+    "HDCITY": {
+      "funded": {
+        "with_meals_and_activities": {"morning": "", "afternoon": "", "full_day": ""},
+        "no_meals": {"morning": "", "afternoon": "", "full_day": ""},
+        "no_activities": {"morning": "", "afternoon": "", "full_day": ""},
+        "neither": {"morning": "", "afternoon": "", "full_day": ""}
+      },
+      "non_funded": {"morning": "", "afternoon": "", "full_day": ""}
+    },
+    "HDCW": {
+      "funded": {
+        "with_meals_and_activities": {"morning": "", "afternoon": "", "full_day": ""},
+        "no_meals": {"morning": "", "afternoon": "", "full_day": ""},
+        "no_activities": {"morning": "", "afternoon": "", "full_day": ""},
+        "neither": {"morning": "", "afternoon": "", "full_day": ""}
+      },
+      "non_funded": {"morning": "", "afternoon": "", "full_day": ""}
+    }
+  }
+}

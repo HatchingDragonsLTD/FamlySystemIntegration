@@ -16,6 +16,7 @@ nobody chose.
 
 import json
 import logging
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -34,13 +35,57 @@ SCHEDULE = "00000000-0000-0000-0000-000000000003"
 PRODUCT_1 = "aaaaaaaa-0000-0000-0000-000000000001"
 PRODUCT_2 = "bbbbbbbb-0000-0000-0000-000000000002"
 
+# Session-booking resolution is not what this file is about (see
+# test_session_catalogue.py and test_session_booking.py for that), so every
+# slot for this institution resolves to the same SESSION UUID regardless of
+# funded/meals/activities -- these tests only care about day distribution.
+INSTITUTION = "HDCITY"
+SLOT = "full_day"
+
+
+def _slot_map(uuid_value):
+    return {"morning": uuid_value, "afternoon": uuid_value, "full_day": uuid_value}
+
+
+def _full_session_catalogue(uuid_value):
+    return {
+        "institutions": {
+            INSTITUTION: {
+                "funded": {
+                    "with_meals_and_activities": _slot_map(uuid_value),
+                    "no_meals": _slot_map(uuid_value),
+                    "no_activities": _slot_map(uuid_value),
+                    "neither": _slot_map(uuid_value),
+                },
+                "non_funded": _slot_map(uuid_value),
+            }
+        }
+    }
+
+
+_catalogue_dir = None
+
+
+def setUpModule():
+    global _catalogue_dir
+    _catalogue_dir = tempfile.TemporaryDirectory()
+    path = Path(_catalogue_dir.name) / "session_catalogue.json"
+    path.write_text(json.dumps(_full_session_catalogue(SESSION)), encoding="utf-8")
+    os.environ["SESSION_CATALOGUE_FILE"] = str(path)
+
+
+def tearDownModule():
+    os.environ.pop("SESSION_CATALOGUE_FILE", None)
+    _catalogue_dir.cleanup()
+
+
 # Mon/Wed/Thu/Fri booked -- deliberately NOT contiguous, so "the first three"
 # is a real ordering question rather than just "the first three weekdays".
 FOUR_DAYS = {
-    "monday_session": SESSION,
-    "wednesday_session": SESSION,
-    "thursday_session": SESSION,
-    "friday_session": SESSION,
+    "monday": SLOT,
+    "wednesday": SLOT,
+    "thursday": SLOT,
+    "friday": SLOT,
 }
 
 
@@ -53,6 +98,7 @@ def flat_payload(days=None, **overrides) -> dict:
         "billingId": "ANNUALIZED_V2",
         "billingTitle": "Monthly",
         "billingInvoices": "ADVANCE",
+        "institution": INSTITUTION,
         "funded": "false",
     }
     payload.update(FOUR_DAYS if days is None else days)
@@ -115,9 +161,9 @@ class ProductBookingTests(unittest.TestCase):
         # Three booked days, quantity three: every one gets products.
         payload = flat_payload(
             days={
-                "monday_session": SESSION,
-                "wednesday_session": SESSION,
-                "thursday_session": SESSION,
+                "monday": SLOT,
+                "wednesday": SLOT,
+                "thursday": SLOT,
             },
             product_1_id=PRODUCT_1,
             product_2_id=PRODUCT_2,
@@ -181,7 +227,7 @@ class FractionalQuantityTests(unittest.TestCase):
 
     def days_with_products(self, quantity, booked):
         payload = flat_payload(
-            days={f"{day.lower()}_session": SESSION for day in booked},
+            days={day.lower(): SLOT for day in booked},
             product_1_id=PRODUCT_1,
             product_2_id=PRODUCT_2,
             addon_quantity=quantity,
@@ -251,9 +297,9 @@ class FractionalQuantityTests(unittest.TestCase):
     def test_each_selected_day_still_gets_both_products_at_one(self):
         payload = flat_payload(
             days={
-                "monday_session": SESSION,
-                "wednesday_session": SESSION,
-                "thursday_session": SESSION,
+                "monday": SLOT,
+                "wednesday": SLOT,
+                "thursday": SLOT,
             },
             product_1_id=PRODUCT_1,
             product_2_id=PRODUCT_2,
@@ -276,7 +322,7 @@ class ProductHardErrorTests(unittest.TestCase):
         # Two booked days, quantity three: the capped figure still exceeds.
         errors = errors_of(
             flat_payload(
-                days={"monday_session": SESSION, "wednesday_session": SESSION},
+                days={"monday": SLOT, "wednesday": SLOT},
                 product_1_id=PRODUCT_1,
                 product_2_id=PRODUCT_2,
                 addon_quantity="3",
@@ -293,7 +339,7 @@ class ProductHardErrorTests(unittest.TestCase):
         # still too many, and the message explains how it got to three.
         errors = errors_of(
             flat_payload(
-                days={"monday_session": SESSION, "wednesday_session": SESSION},
+                days={"monday": SLOT, "wednesday": SLOT},
                 product_1_id=PRODUCT_1,
                 product_2_id=PRODUCT_2,
                 addon_quantity="4.5",
@@ -317,7 +363,7 @@ class ProductHardErrorTests(unittest.TestCase):
     def test_nothing_is_booked_when_the_quantity_is_too_high(self):
         bookings = bookings_of(
             flat_payload(
-                days={"monday_session": SESSION, "wednesday_session": SESSION},
+                days={"monday": SLOT, "wednesday": SLOT},
                 product_1_id=PRODUCT_1,
                 product_2_id=PRODUCT_2,
                 addon_quantity="3",
@@ -366,7 +412,7 @@ class ProductHardErrorTests(unittest.TestCase):
     def test_these_are_hard_errors_not_advisory_warnings(self):
         nested = flatten.flatten_to_nested(
             flat_payload(
-                days={"monday_session": SESSION, "wednesday_session": SESSION},
+                days={"monday": SLOT, "wednesday": SLOT},
                 product_1_id=PRODUCT_1,
                 product_2_id=PRODUCT_2,
                 addon_quantity="3",
@@ -380,7 +426,7 @@ class ProductHardErrorTests(unittest.TestCase):
     def test_validate_reports_them_alongside_its_own_errors(self):
         nested = flatten.flatten_to_nested(
             flat_payload(
-                days={"monday_session": SESSION, "wednesday_session": SESSION},
+                days={"monday": SLOT, "wednesday": SLOT},
                 product_1_id=PRODUCT_1,
                 product_2_id=PRODUCT_2,
                 addon_quantity="3",
@@ -423,7 +469,7 @@ class ProductPreviewTests(unittest.TestCase):
 
     def test_quantity_exceeding_booked_days_blocks_with_no_famly_call(self):
         result = self.intake(
-            days={"monday_session": SESSION, "wednesday_session": SESSION},
+            days={"monday": SLOT, "wednesday": SLOT},
             product_1_id=PRODUCT_1,
             product_2_id=PRODUCT_2,
             addon_quantity="4.5",

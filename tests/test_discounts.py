@@ -14,7 +14,11 @@ rather than a hard error: the rest of the plan still previews, and the human
 approving in Slack sees both the plan and the flag.
 """
 
+import json
+import os
+import tempfile
 import unittest
+from pathlib import Path
 
 from unittest import mock
 
@@ -27,6 +31,48 @@ CHILD = "00000000-0000-0000-0000-000000000001"
 SESSION = "00000000-0000-0000-0000-000000000005"
 SCHEDULE = "00000000-0000-0000-0000-000000000003"
 
+# Session-booking resolution is not what this file is about (see
+# test_session_catalogue.py and test_session_booking.py for that), so every
+# slot for this institution resolves to the same SESSION UUID regardless of
+# funded/meals/activities, keeping the discount-focused payloads simple.
+INSTITUTION = "HDCITY"
+
+
+def _slot_map(uuid_value):
+    return {"morning": uuid_value, "afternoon": uuid_value, "full_day": uuid_value}
+
+
+def _full_session_catalogue(uuid_value):
+    return {
+        "institutions": {
+            INSTITUTION: {
+                "funded": {
+                    "with_meals_and_activities": _slot_map(uuid_value),
+                    "no_meals": _slot_map(uuid_value),
+                    "no_activities": _slot_map(uuid_value),
+                    "neither": _slot_map(uuid_value),
+                },
+                "non_funded": _slot_map(uuid_value),
+            }
+        }
+    }
+
+
+_catalogue_dir = None
+
+
+def setUpModule():
+    global _catalogue_dir
+    _catalogue_dir = tempfile.TemporaryDirectory()
+    path = Path(_catalogue_dir.name) / "session_catalogue.json"
+    path.write_text(json.dumps(_full_session_catalogue(SESSION)), encoding="utf-8")
+    os.environ["SESSION_CATALOGUE_FILE"] = str(path)
+
+
+def tearDownModule():
+    os.environ.pop("SESSION_CATALOGUE_FILE", None)
+    _catalogue_dir.cleanup()
+
 
 def flat_payload(**overrides) -> dict:
     """A valid flat payload, with discount slots layered on top."""
@@ -38,7 +84,8 @@ def flat_payload(**overrides) -> dict:
         "billingId": "ANNUALIZED_V2",
         "billingTitle": "Monthly",
         "billingInvoices": "ADVANCE",
-        "monday_session": SESSION,
+        "institution": INSTITUTION,
+        "monday": "full_day",
         "funded": "false",
     }
     payload.update(overrides)
