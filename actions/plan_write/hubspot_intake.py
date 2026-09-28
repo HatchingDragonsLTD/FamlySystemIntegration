@@ -79,6 +79,8 @@ def handle_intake(
     version: int,
     dry_run: bool = True,
     client=None,
+    old_plan_id: str | None = None,
+    replace_old_plan: bool = False,
 ) -> IntakeResult:
     """Parse, validate, and (when valid) preview a plan from a webhook payload.
 
@@ -90,6 +92,12 @@ def handle_intake(
         version: the plan version the request targets.
         dry_run: must stay True. Preview only -- never writes.
         client: optional RestClient, mainly for tests.
+        old_plan_id: passed straight through to `runner.preview` -- set this to
+            preview as a SECOND plan alongside an existing one (Famly's
+            oldPlanId), used by `actions.additional_plan`. None (the default)
+            leaves the ordinary create-plan preview completely unchanged.
+        replace_old_plan: passed straight through to `runner.preview`, only
+            meaningful alongside `old_plan_id`.
 
     Returns:
         IntakeResult. When `ok` is False, `errors` says why and nothing was sent.
@@ -114,7 +122,13 @@ def handle_intake(
         return IntakeResult(ok=False, errors=errors, plan_input=plan_input)
 
     plan_body = input_schema.to_plan_body(plan_input)
-    result = runner.preview(plan_body, version, client=client)
+    result = runner.preview(
+        plan_body,
+        version,
+        client=client,
+        old_plan_id=old_plan_id,
+        replace_old_plan=replace_old_plan,
+    )
 
     # Advisory input problems (e.g. a malformed discount slot, already excluded
     # from the body) ride the SAME warnings channel as Famly's own, so the

@@ -69,8 +69,21 @@ class StoreTestCase(unittest.TestCase):
         env.start()
         self.addCleanup(env.stop)
 
-    def save_pending(self, preview_id=PREVIEW_ID, child_id=CHILD_ID):
-        preview_store.save(preview_id, PLAN_BODY, child_id, 3)
+    def save_pending(
+        self,
+        preview_id=PREVIEW_ID,
+        child_id=CHILD_ID,
+        old_plan_id=None,
+        replace_old_plan=False,
+    ):
+        preview_store.save(
+            preview_id,
+            PLAN_BODY,
+            child_id,
+            3,
+            old_plan_id=old_plan_id,
+            replace_old_plan=replace_old_plan,
+        )
 
     def approve(self, preview_id=PREVIEW_ID):
         return approval.handle_click("plan_approve", preview_id, "drew")
@@ -106,6 +119,21 @@ class PreviewStoreTests(StoreTestCase):
         # A fresh connection, as a restarted process would open.
         self.save_pending()
         self.assertEqual(preview_store.get(PREVIEW_ID).plan_body, PLAN_BODY)
+
+    def test_old_plan_id_and_replace_old_plan_round_trip(self):
+        self.save_pending(old_plan_id="existing-plan-1", replace_old_plan=True)
+        stored = preview_store.get(PREVIEW_ID)
+
+        self.assertEqual(stored.old_plan_id, "existing-plan-1")
+        self.assertIs(stored.replace_old_plan, True)
+
+    def test_old_plan_id_defaults_to_none_and_false(self):
+        # An ordinary create -- no old_plan_id given at all.
+        self.save_pending()
+        stored = preview_store.get(PREVIEW_ID)
+
+        self.assertIsNone(stored.old_plan_id)
+        self.assertIs(stored.replace_old_plan, False)
 
     def test_entries_past_the_ttl_are_expired(self):
         self.save_pending()
@@ -161,6 +189,46 @@ class ApproveTests(StoreTestCase):
         self.assertEqual(
             preview_store.get(PREVIEW_ID).status, preview_store.STATUS_COMMITTED
         )
+
+    def test_an_ordinary_preview_commits_with_no_old_plan_id(self):
+        # Confirms the new params default to a no-op for every preview stored
+        # before old_plan_id existed, or any plain create today.
+        self.save_pending()
+
+        with mock.patch.object(
+            approval.runner, "commit", return_value=FakeResult()
+        ) as commit:
+            self.approve()
+
+        _, kwargs = commit.call_args
+        self.assertIsNone(kwargs["old_plan_id"])
+        self.assertIs(kwargs["replace_old_plan"], False)
+
+    def test_approve_passes_through_old_plan_id_and_replace_old_plan(self):
+        self.save_pending(old_plan_id="existing-plan-1", replace_old_plan=False)
+
+        with mock.patch.object(
+            approval.runner, "commit", return_value=FakeResult()
+        ) as commit:
+            self.approve()
+
+        _, kwargs = commit.call_args
+        self.assertEqual(kwargs["old_plan_id"], "existing-plan-1")
+        self.assertIs(kwargs["replace_old_plan"], False)
+
+    def test_a_commit_with_old_plan_id_is_still_refused_for_a_disallowed_child(self):
+        # The test-child guard must apply identically whether or not this
+        # commit is adding a second plan -- no separate or weaker path.
+        self.save_pending(
+            child_id=OTHER_CHILD, old_plan_id="existing-plan-1", replace_old_plan=False
+        )
+
+        with mock.patch.object(approval.runner, "commit") as commit:
+            text = self.approve()
+
+        commit.assert_not_called()
+        self.assertIn("Commit refused", text)
+        self.assertIn(OTHER_CHILD, text)
 
     def test_double_click_does_not_commit_twice(self):
         self.save_pending()

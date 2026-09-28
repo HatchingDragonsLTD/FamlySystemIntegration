@@ -5,6 +5,11 @@ intake call, the plan summary, the warning serialisation, and posting the
 result to Slack for approval. The router knows only this module's ACTION_NAME
 and `handle`.
 
+`run_preview_and_post` is also called directly by `actions.additional_plan`,
+with `old_plan_id` set -- see its docstring. `handle` itself is unchanged:
+plan_preview never sets `old_plan_id`, so its behaviour is exactly as before
+that parameter existed.
+
 Preview only. `handle_intake` is dry-run by construction and raises if asked to
 write, so there is no commit path through the web layer. The Slack buttons this
 posts are inert -- clicking them is logged, not acted on (see
@@ -112,7 +117,26 @@ def _catalogue_titles() -> tuple[dict, dict]:
 
 
 def handle(payload: dict) -> tuple[dict, int]:
-    """Run a dry-run plan preview for a webhook payload.
+    """The plan_preview action: a dry-run preview with no old plan involved."""
+    return run_preview_and_post(payload)
+
+
+def run_preview_and_post(
+    payload: dict,
+    *,
+    old_plan_id: str | None = None,
+    replace_old_plan: bool = False,
+) -> tuple[dict, int]:
+    """Run a dry-run plan preview for a webhook payload, then post it to Slack.
+
+    Shared by `handle` (plan_preview, no old plan) and the additional_plan
+    action, which calls this directly with `old_plan_id` set to the child's
+    existing plan id. Everything below -- validation, the preview call, the
+    stored record, the Slack summary and its Approve/Adjust/Reject buttons --
+    is IDENTICAL either way; the only difference is that `old_plan_id` (and
+    `replace_old_plan`) ride along into the preview call and the stored
+    record, so a later Approve click commits with the same params (see
+    `runner.preview`/`commit` and `preview_store`).
 
     On success: logs the full plan against a generated `preview_id` and posts a
     readable summary to Slack with Approve / Reject buttons. A Slack failure is
@@ -123,6 +147,12 @@ def handle(payload: dict) -> tuple[dict, int]:
         payload: the request body. Plan fields may sit at the top level or be
             nested under `properties`/`data`; the `action` field the router
             dispatched on is ignored here.
+        old_plan_id: when set, this previews (and later commits) as a SECOND
+            plan alongside the child's existing one (Famly's oldPlanId +
+            replaceOldPlan), rather than a plain create. None (the default)
+            is the ordinary plan_preview path, completely unchanged.
+        replace_old_plan: only meaningful alongside `old_plan_id`. False for
+            additional_plan -- the existing plan is kept, not replaced.
 
     Returns:
         (data, status). `data` carries `plan`, `previewed`, `preview_id` and
@@ -139,6 +169,8 @@ def handle(payload: dict) -> tuple[dict, int]:
         payload,
         version=PLAN_VERSION,
         dry_run=True,  # never commit from the webhook path
+        old_plan_id=old_plan_id,
+        replace_old_plan=replace_old_plan,
     )
 
     preview = result.result
@@ -187,6 +219,12 @@ def handle(payload: dict) -> tuple[dict, int]:
             pricing_group_id=getattr(preview.plan, "active_pricing_group_id", None),
             # Kept so an adjustment can tell whether the re-price moved.
             monthly_estimate=getattr(preview.plan, "monthly_estimate", None),
+            # So a later Approve (or Adjust & Approve) commits with the SAME
+            # oldPlanId/replaceOldPlan this preview used. None/False for an
+            # ordinary plan_preview -- unchanged from before this parameter
+            # existed.
+            old_plan_id=old_plan_id,
+            replace_old_plan=replace_old_plan,
         )
     except Exception as exc:  # noqa: BLE001 - storing must not break the preview
         logger.warning(
