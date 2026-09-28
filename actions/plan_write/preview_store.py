@@ -71,6 +71,13 @@ _ADDED_COLUMNS = {
     # against it -- otherwise an adjustment Famly silently ignored looks
     # identical to one that worked.
     "monthly_estimate": "REAL",
+    # Famly operation #3 (add a second plan alongside an existing one). When
+    # set, a commit of this preview must send oldPlanId/replaceOldPlan --
+    # recorded here so approval.py does not have to rebuild or guess them at
+    # commit time. NULL/0 for an ordinary create, which is every preview
+    # stored before these columns existed.
+    "old_plan_id": "TEXT",
+    "replace_old_plan": "INTEGER",
 }
 
 
@@ -91,6 +98,10 @@ class StoredPreview:
     pricing_group_id: str | None = None
     # The estimate as first previewed, so a re-price can be compared with it.
     monthly_estimate: float | None = None
+    # Famly operation #3 params. old_plan_id is None for an ordinary create;
+    # replace_old_plan is only meaningful alongside it.
+    old_plan_id: str | None = None
+    replace_old_plan: bool = False
 
     @property
     def is_expired(self) -> bool:
@@ -201,6 +212,8 @@ def _row_to_preview(row: sqlite3.Row) -> StoredPreview:
         institution_id=_column(row, "institution_id"),
         pricing_group_id=_column(row, "pricing_group_id"),
         monthly_estimate=_column(row, "monthly_estimate"),
+        old_plan_id=_column(row, "old_plan_id"),
+        replace_old_plan=bool(_column(row, "replace_old_plan")),
     )
 
 
@@ -225,6 +238,8 @@ def save(
     institution_id: str | None = None,
     pricing_group_id: str | None = None,
     monthly_estimate: float | None = None,
+    old_plan_id: str | None = None,
+    replace_old_plan: bool = False,
 ) -> None:
     """Record a previewed plan as pending approval.
 
@@ -233,13 +248,20 @@ def save(
 
     `site_code`/`institution_id` are metadata: stored so a preview carries its
     site context, read by nothing in the commit path.
+
+    `old_plan_id`/`replace_old_plan`: when this preview added a plan alongside
+    an existing one (Famly operation #3), these are read back at commit time
+    (see `claim_for_commit`/`approval.py`) so the write uses the SAME params
+    the approver's preview used. None/False (the defaults) for an ordinary
+    create, unchanged from before these parameters existed.
     """
     with _open() as connection:
         connection.execute(
             "INSERT OR REPLACE INTO previews "
             "(preview_id, plan_body, child_id, version, created_at, status, "
-            "site_code, institution_id, pricing_group_id, monthly_estimate) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "site_code, institution_id, pricing_group_id, monthly_estimate, "
+            "old_plan_id, replace_old_plan) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 preview_id,
                 json.dumps(plan_body),
@@ -251,6 +273,8 @@ def save(
                 institution_id,
                 pricing_group_id,
                 monthly_estimate,
+                old_plan_id,
+                int(bool(replace_old_plan)),
             ),
         )
 

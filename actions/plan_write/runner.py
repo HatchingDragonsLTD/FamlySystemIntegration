@@ -78,20 +78,32 @@ def _post_plan(
     version: int,
     *,
     preview_only: bool,
+    old_plan_id: str | None = None,
+    replace_old_plan: bool = False,
     client: RestClient | None = None,
 ) -> Any:
-    """POST the plan body with the preview flag set as asked."""
+    """POST the plan body with the preview flag set as asked.
+
+    `oldPlanId`/`replaceOldPlan` are added to the query string ONLY when
+    `old_plan_id` is given (Famly operation #3: add a second plan alongside an
+    existing one). Per the captured request, they must be present at PREVIEW
+    time too, not just on the real write -- so this one function is the single
+    place both preview() and commit() go through, and both get them the same
+    way. `old_plan_id=None` (every existing call site) leaves the query string
+    completely unchanged from before these parameters existed.
+    """
     client = client or RestClient()
 
-    return client.post(
-        PLANS_PATH,
-        params={
-            # The API takes these as strings in the captured requests.
-            "preview": "true" if preview_only else "false",
-            "version": str(version),
-        },
-        json_body=plan_body,
-    )
+    params = {
+        # The API takes these as strings in the captured requests.
+        "preview": "true" if preview_only else "false",
+        "version": str(version),
+    }
+    if old_plan_id is not None:
+        params["oldPlanId"] = old_plan_id
+        params["replaceOldPlan"] = "true" if replace_old_plan else "false"
+
+    return client.post(PLANS_PATH, params=params, json_body=plan_body)
 
 
 def child_id_of(plan_body: Any) -> str | None:
@@ -109,6 +121,9 @@ def preview(
     plan_body: dict,
     version: int,
     client: RestClient | None = None,
+    *,
+    old_plan_id: str | None = None,
+    replace_old_plan: bool = False,
 ) -> ParsedPlanResult:
     """Have the server compute the plan without persisting it.
 
@@ -118,11 +133,24 @@ def preview(
         plan_body: the `{"plan": {...}}` body, e.g. from builder.build_plan_body.
         version: the plan version the request targets.
         client: optional client, mainly for tests or reuse across calls.
+        old_plan_id: set to add this plan alongside an EXISTING plan (Famly
+            operation #3) rather than create a standalone one. None (the
+            default) leaves this call completely unchanged from before this
+            parameter existed.
+        replace_old_plan: only meaningful alongside `old_plan_id`; sent to
+            Famly as `replaceOldPlan`.
 
     Returns:
         The computed plan and its classified warnings.
     """
-    body = _post_plan(plan_body, version, preview_only=True, client=client)
+    body = _post_plan(
+        plan_body,
+        version,
+        preview_only=True,
+        old_plan_id=old_plan_id,
+        replace_old_plan=replace_old_plan,
+        client=client,
+    )
     return _parse_result(body, committed=False)
 
 
@@ -133,6 +161,8 @@ def commit(
     confirm: bool,
     allowed_child_ids: set[str],
     client: RestClient | None = None,
+    old_plan_id: str | None = None,
+    replace_old_plan: bool = False,
 ) -> ParsedPlanResult:
     """Persist a plan. GUARDED -- this is the only function here that writes.
 
@@ -149,12 +179,23 @@ def commit(
     untracked one escalated through warnings.notify) and returned on the result
     so a caller can still act on them.
 
+    `old_plan_id`/`replace_old_plan` apply IDENTICALLY to steps 3 and 4 -- both
+    go through `_post_plan`, and neither guard above is affected by them in any
+    way: a commit adding a second plan is refused by the exact same
+    `confirm`/`allowed_child_ids` checks as an ordinary create.
+
     Args:
         plan_body: the `{"plan": {...}}` body to write.
         version: the plan version the request targets.
         confirm: must be True. Exists so a write is never one typo away.
         allowed_child_ids: the child IDs this commit is permitted to touch.
         client: optional client, mainly for tests or reuse across calls.
+        old_plan_id: set to add this plan alongside an EXISTING plan (Famly
+            operation #3) instead of creating a standalone one. None (the
+            default) leaves commit() completely unchanged from before this
+            parameter existed.
+        replace_old_plan: only meaningful alongside `old_plan_id`; sent to
+            Famly as `replaceOldPlan`.
 
     Returns:
         The committed plan and its classified warnings.
@@ -190,10 +231,23 @@ def commit(
 
     # Step 3: preview before writing. Warnings are extracted and any untracked
     # one is escalated by classify_all inside _parse_result.
-    preview_result = preview(plan_body, version, client=client)
+    preview_result = preview(
+        plan_body,
+        version,
+        client=client,
+        old_plan_id=old_plan_id,
+        replace_old_plan=replace_old_plan,
+    )
 
     # Step 4: the actual write.
-    body = _post_plan(plan_body, version, preview_only=False, client=client)
+    body = _post_plan(
+        plan_body,
+        version,
+        preview_only=False,
+        old_plan_id=old_plan_id,
+        replace_old_plan=replace_old_plan,
+        client=client,
+    )
     result = _parse_result(body, committed=True)
 
     # Carry forward any preview warning the commit response did not repeat, so

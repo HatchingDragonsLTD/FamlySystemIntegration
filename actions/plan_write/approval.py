@@ -14,8 +14,13 @@ load-bearing; read before changing:
   5. `runner.commit` is called with confirm=True, and does its own preview
      before writing.
 
-Scope: CREATE only. Overwriting a plan and adding a second plan are separate
-operations and are not built.
+Scope: CREATE, plus adding a SECOND plan alongside an existing one (Famly's
+oldPlanId + replaceOldPlan=false, from `actions.additional_plan` -- see the
+stored preview's `old_plan_id`/`replace_old_plan`, passed straight through to
+`runner.commit` below). Every guard above applies identically regardless: an
+`old_plan_id` on the stored preview does not open, skip, or weaken any of
+them. Overwriting an existing plan (`replaceOldPlan=true`) is a separate
+operation and is still not built.
 
 The committed body is the exact one that was previewed, read back from the
 store -- never rebuilt, so what is written is what the approver saw.
@@ -195,6 +200,11 @@ def _approve(preview_id: str | None, user: str | None) -> str:
             claimed.version,
             confirm=True,
             allowed_child_ids=allowed_child_ids,
+            # Famly operation #3: set only when this preview added a plan
+            # alongside an existing one. None/False for an ordinary create,
+            # so every guard above runs identically either way.
+            old_plan_id=claimed.old_plan_id,
+            replace_old_plan=claimed.replace_old_plan,
         )
     except runner.PlanCommitRefused as exc:
         # A guard inside the runner stopped it. Nothing was written.
@@ -515,7 +525,12 @@ def _complete_adjustment(
     never comes. Every failure is reported into the channel instead.
     """
     try:
-        result = runner.preview(adjusted_body, stored.version)
+        result = runner.preview(
+            adjusted_body,
+            stored.version,
+            old_plan_id=stored.old_plan_id,
+            replace_old_plan=stored.replace_old_plan,
+        )
     except Exception as exc:  # noqa: BLE001 - reported, never raised
         logger.exception("ADJUST RE-PREVIEW FAILED preview_id=%s", preview_id)
         slack.post_notice(
@@ -547,6 +562,10 @@ def _complete_adjustment(
             institution_id=stored.institution_id,
             pricing_group_id=pricing_group_id,
             monthly_estimate=estimate,
+            # Carried forward so the adjusted copy still commits with the same
+            # oldPlanId/replaceOldPlan the original preview used.
+            old_plan_id=stored.old_plan_id,
+            replace_old_plan=stored.replace_old_plan,
         )
 
         # Only now is the original replaced. Doing it earlier would strand the

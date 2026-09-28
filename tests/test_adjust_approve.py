@@ -71,7 +71,9 @@ class AdjustTestCase(unittest.TestCase):
         self.posted = []
         self.opened = []
 
-        def fake_preview(body, version, client=None):
+        def fake_preview(
+            body, version, client=None, old_plan_id=None, replace_old_plan=False
+        ):
             self.previews.append((body, version))
             return FakeResult()
 
@@ -356,7 +358,9 @@ class AsyncAckTests(AdjustTestCase):
         release = threading.Event()
         finished = threading.Event()
 
-        def blocking_preview(body, version, client=None):
+        def blocking_preview(
+            body, version, client=None, old_plan_id=None, replace_old_plan=False
+        ):
             started.set()
             release.wait(timeout=5)
             finished.set()
@@ -692,7 +696,9 @@ class BilledTotalTests(AdjustTestCase):
             warnings = ["w1", "w2"]
 
         with mock.patch.object(
-            approval.runner, "preview", lambda b, v, client=None: WarnResult()
+            approval.runner,
+            "preview",
+            lambda b, v, client=None, old_plan_id=None, replace_old_plan=False: WarnResult(),
         ):
             self.submit("-0.50")
 
