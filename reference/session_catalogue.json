@@ -23,34 +23,93 @@
     "restart. Point SESSION_CATALOGUE_FILE elsewhere to override the path.",
     "Fill in each PASTE-... placeholder with the real Famly session UUID."
   ],
-
   "institutions": {
     "HDCITY": {
       "funded": {
-        "with_meals_and_activities": {"morning": "", "afternoon": "", "full_day": ""},
-        "no_meals": {"morning": "", "afternoon": "", "full_day": ""},
-        "no_activities": {"morning": "", "afternoon": "", "full_day": ""},
-        "neither": {"morning": "", "afternoon": "", "full_day": ""}
+        "with_meals_and_activities": {
+          "morning": "",
+          "afternoon": "",
+          "full_day": ""
+        },
+        "no_meals": {
+          "morning": "",
+          "afternoon": "",
+          "full_day": ""
+        },
+        "no_activities": {
+          "morning": "",
+          "afternoon": "",
+          "full_day": ""
+        },
+        "neither": {
+          "morning": "",
+          "afternoon": "",
+          "full_day": ""
+        }
       },
-      "non_funded": {"morning": "", "afternoon": "", "full_day": ""}
+      "non_funded": {
+        "morning": "",
+        "afternoon": "",
+        "full_day": ""
+      }
     },
     "HDWEST": {
       "funded": {
-        "with_meals_and_activities": {"morning": "", "afternoon": "", "full_day": ""},
-        "no_meals": {"morning": "", "afternoon": "", "full_day": ""},
-        "no_activities": {"morning": "", "afternoon": "", "full_day": ""},
-        "neither": {"morning": "", "afternoon": "", "full_day": ""}
+        "with_meals_and_activities": {
+          "morning": "",
+          "afternoon": "",
+          "full_day": ""
+        },
+        "no_meals": {
+          "morning": "",
+          "afternoon": "",
+          "full_day": ""
+        },
+        "no_activities": {
+          "morning": "",
+          "afternoon": "",
+          "full_day": ""
+        },
+        "neither": {
+          "morning": "",
+          "afternoon": "",
+          "full_day": ""
+        }
       },
-      "non_funded": {"morning": "", "afternoon": "", "full_day": ""}
+      "non_funded": {
+        "morning": "",
+        "afternoon": "",
+        "full_day": ""
+      }
     },
     "HDCW": {
       "funded": {
-        "with_meals_and_activities": {"morning": "", "afternoon": "", "full_day": ""},
-        "no_meals": {"morning": "", "afternoon": "", "full_day": ""},
-        "no_activities": {"morning": "", "afternoon": "", "full_day": ""},
-        "neither": {"morning": "", "afternoon": "", "full_day": ""}
+        "with_meals_and_activities": {
+          "morning": "75040dda-848c-468e-9efe-74b203ca2ea1",
+          "afternoon": "c6fe35a4-3fea-4c30-9313-f10fc969fb5b",
+          "full_day": "222faa9f-b12e-498c-aac4-28fc442e4989"
+        },
+        "no_meals": {
+          "morning": "be81b77f-27fd-4b89-8b0b-41c26c9aa2fe",
+          "afternoon": "6fb46863-6b38-44ec-8f74-8e8da552e25d",
+          "full_day": "d2c6f9b3-e65a-4ffa-b676-81b74ee0182b"
+        },
+        "no_activities": {
+          "morning": "a4d74181-40d5-4355-9dd2-8e3ec3c04452",
+          "afternoon": "df362440-d235-4a1a-86bc-bc266f85dd6f",
+          "full_day": "bce435b2-a91e-40bc-9d4f-aced25adf552"
+        },
+        "neither": {
+          "morning": "150de1f5-0fbf-49bd-8803-04df449e77a8",
+          "afternoon": "cbed5234-158e-4488-8231-17422fa0ac94",
+          "full_day": "7bb38377-7083-4197-bf0c-53df691a4718"
+        }
       },
-      "non_funded": {"morning": "", "afternoon": "", "full_day": ""}
+      "non_funded": {
+        "morning": "a649ec9b-242d-479c-a572-3c4d83c715a8",
+        "afternoon": "8f150941-08cd-4642-a50c-014c5429e94e",
+        "full_day": "4d8b109a-62e1-40eb-afab-242fc39cb71c"
+      }
     }
   }
 }
