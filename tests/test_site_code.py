@@ -32,6 +32,12 @@ SCHEDULE = "00000000-0000-0000-0000-000000000003"
 
 CITY_INSTITUTION = "11111111-1111-1111-1111-111111111111"
 
+# The `institution` field used to resolve session UUIDs (session_catalogue) --
+# deliberately distinct from `site_code` (metadata only, resolved via
+# catalogue.py). They may name the same real place, but nothing here requires
+# them to match.
+BOOKING_INSTITUTION = "HDCITY"
+
 CATALOGUE = {
     "sites": {
         "HDCITY": {
@@ -45,6 +51,25 @@ CATALOGUE = {
 }
 
 
+def _slot_map(uuid_value):
+    return {"morning": uuid_value, "afternoon": uuid_value, "full_day": uuid_value}
+
+
+SESSION_CATALOGUE = {
+    "institutions": {
+        BOOKING_INSTITUTION: {
+            "funded": {
+                "with_meals_and_activities": _slot_map(SESSION),
+                "no_meals": _slot_map(SESSION),
+                "no_activities": _slot_map(SESSION),
+                "neither": _slot_map(SESSION),
+            },
+            "non_funded": _slot_map(SESSION),
+        }
+    }
+}
+
+
 def flat_payload(**overrides) -> dict:
     payload = {
         "childId": CHILD,
@@ -54,7 +79,8 @@ def flat_payload(**overrides) -> dict:
         "billingId": "ANNUALIZED_V2",
         "billingTitle": "Monthly",
         "billingInvoices": "ADVANCE",
-        "monday_session": SESSION,
+        "institution": BOOKING_INSTITUTION,
+        "monday": "full_day",
         "funded": "false",
     }
     payload.update(overrides)
@@ -72,10 +98,16 @@ class SiteTestCase(unittest.TestCase):
         catalogue_file = tmp / "catalogue.json"
         catalogue_file.write_text(json.dumps(CATALOGUE), encoding="utf-8")
 
+        session_catalogue_file = tmp / "session_catalogue.json"
+        session_catalogue_file.write_text(
+            json.dumps(SESSION_CATALOGUE), encoding="utf-8"
+        )
+
         env = mock.patch.dict(
             "os.environ",
             {
                 "FAMLY_CATALOGUE_FILE": str(catalogue_file),
+                "SESSION_CATALOGUE_FILE": str(session_catalogue_file),
                 "PREVIEW_STORE_PATH": str(tmp / "store.sqlite3"),
                 "FAMLY_ACCESS_TOKEN": "test-token",
             },
