@@ -13,6 +13,7 @@ the next and make results order-dependent.
 """
 
 import logging
+import os
 import unittest
 from unittest import mock
 
@@ -160,31 +161,39 @@ class FetchRosterTests(UrnLookupTestCase):
 
 
 # --------------------------------------------------------------------------- #
-# Caching: reused within the TTL, refetched once it expires.
+# Caching: reused within the TTL, refetched once it expires. Parametrized via
+# the env var rather than tied to whatever DEFAULT_CACHE_TTL_SECONDS happens
+# to be -- these tests only ever set/force staleness relative to whatever TTL
+# is configured, never a hardcoded number of seconds.
 # --------------------------------------------------------------------------- #
 class CacheTests(UrnLookupTestCase):
     def test_the_cache_is_reused_within_the_ttl(self):
-        client = FakeGraphQLClient(pages=[page_body([child_node("c-1", "urn:1", "Ada")])])
+        with mock.patch.dict("os.environ", {"URN_LOOKUP_CACHE_TTL_SECONDS": "60"}):
+            client = FakeGraphQLClient(
+                pages=[page_body([child_node("c-1", "urn:1", "Ada")])]
+            )
 
-        first = runner.get_roster(client=client)
-        second = runner.get_roster(client=client)
+            first = runner.get_roster(client=client)
+            second = runner.get_roster(client=client)
 
         self.assertEqual(len(client.calls), 1)  # only ONE fetch across two lookups
         self.assertEqual(first, second)
 
     def test_the_cache_refetches_once_the_ttl_expires(self):
-        client = FakeGraphQLClient(
-            pages=[
-                page_body([child_node("c-1", "urn:1", "Ada")]),
-                page_body([child_node("c-1", "urn:1", "Ada")]),
-            ]
-        )
+        with mock.patch.dict("os.environ", {"URN_LOOKUP_CACHE_TTL_SECONDS": "60"}):
+            client = FakeGraphQLClient(
+                pages=[
+                    page_body([child_node("c-1", "urn:1", "Ada")]),
+                    page_body([child_node("c-1", "urn:1", "Ada")]),
+                ]
+            )
 
-        runner.get_roster(client=client)
-        # Force staleness directly rather than sleeping or mocking
-        # time.monotonic() call-by-call.
-        runner._cache_fetched_at -= runner.CACHE_TTL_SECONDS + 1
-        runner.get_roster(client=client)
+            runner.get_roster(client=client)
+            # Force staleness directly, relative to whatever TTL is
+            # configured, rather than sleeping or mocking time.monotonic()
+            # call-by-call.
+            runner._cache_fetched_at -= runner.cache_ttl_seconds() + 1
+            runner.get_roster(client=client)
 
         self.assertEqual(len(client.calls), 2)
 
@@ -200,6 +209,26 @@ class CacheTests(UrnLookupTestCase):
         runner.get_roster(client=client, force_refresh=True)
 
         self.assertEqual(len(client.calls), 2)
+
+
+class CacheTtlConfigTests(unittest.TestCase):
+    """The TTL itself: default, env override, and a malformed value."""
+
+    def test_the_default_is_900_seconds(self):
+        with mock.patch.dict("os.environ"):
+            os.environ.pop("URN_LOOKUP_CACHE_TTL_SECONDS", None)
+            self.assertEqual(runner.cache_ttl_seconds(), 900)
+            self.assertEqual(runner.DEFAULT_CACHE_TTL_SECONDS, 900)
+
+    def test_the_environment_variable_overrides_the_default(self):
+        with mock.patch.dict("os.environ", {"URN_LOOKUP_CACHE_TTL_SECONDS": "1800"}):
+            self.assertEqual(runner.cache_ttl_seconds(), 1800)
+
+    def test_a_non_numeric_value_falls_back_to_the_default(self):
+        with mock.patch.dict("os.environ", {"URN_LOOKUP_CACHE_TTL_SECONDS": "soon"}):
+            self.assertEqual(
+                runner.cache_ttl_seconds(), runner.DEFAULT_CACHE_TTL_SECONDS
+            )
 
 
 # --------------------------------------------------------------------------- #

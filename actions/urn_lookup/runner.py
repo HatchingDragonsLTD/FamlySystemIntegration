@@ -15,6 +15,7 @@ Server-importable: no argparse, no Flask.
 """
 
 import logging
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,16 +29,37 @@ QUERY_PATH = Path(__file__).with_name("query.graphql")
 OPERATION_NAME = "Children"
 
 # How long the in-memory roster cache stays fresh before a lookup refetches
-# it. Deliberately short: this is a backfill, not a latency-sensitive path,
-# so favouring freshness over call volume is the right tradeoff.
-CACHE_TTL_SECONDS = 5 * 60
+# it. 15 minutes by default: this backfill is typically driven by a BATCH of
+# webhooks arriving close together, so the goal is one fetch per batch rather
+# than one per request -- the first call in a window fetches fresh, every
+# other call within the same window reuses it, and a call after the window
+# expires triggers exactly one refetch and starts the window over.
+DEFAULT_CACHE_TTL_SECONDS = 900
+
+
+def cache_ttl_seconds() -> float:
+    """The configured TTL, read fresh each time (like preview_store.ttl_hours())
+    so a changed environment variable takes effect without a restart."""
+    raw = os.environ.get("URN_LOOKUP_CACHE_TTL_SECONDS", "").strip()
+    if not raw:
+        return DEFAULT_CACHE_TTL_SECONDS
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning(
+            "URN_LOOKUP_CACHE_TTL_SECONDS=%r is not a number; using %s",
+            raw,
+            DEFAULT_CACHE_TTL_SECONDS,
+        )
+        return DEFAULT_CACHE_TTL_SECONDS
+
 
 # Note on the cache below: it is MODULE-LEVEL, IN-MEMORY, PER-PROCESS. Under
 # gunicorn each worker imports this module separately and keeps its own copy
 # -- there is no cross-worker sharing or invalidation. That is fine here: the
 # child roster changes slowly, a handful of workers independently refetching
-# on their own 5-minute clocks costs nothing that matters for a backfill, and
-# there is no shared store worth the complexity for a temporary utility.
+# on their own clocks costs nothing that matters for a backfill, and there is
+# no shared store worth the complexity for a temporary utility.
 _cache_rows: list["ChildRow"] | None = None
 _cache_fetched_at: float | None = None
 
@@ -134,7 +156,7 @@ def _cache_is_fresh() -> bool:
     return (
         _cache_rows is not None
         and _cache_fetched_at is not None
-        and (time.monotonic() - _cache_fetched_at) < CACHE_TTL_SECONDS
+        and (time.monotonic() - _cache_fetched_at) < cache_ttl_seconds()
     )
 
 
