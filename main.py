@@ -15,14 +15,18 @@ import sys
 from dataclasses import asdict, is_dataclass
 
 from actions.plan_write import cli as plan_write
+from actions.pull_groups import cli as pull_groups
+from actions.pull_products import cli as pull_products
+from actions.pull_references import cli as pull_references
+from actions.pull_roster import cli as pull_roster
 from actions.pull_sessions import cli as pull_sessions
 from actions.read_child_plans import cli as read_child_plans
 from actions.staff_credentials import cli as staff_credentials
 from actions.plan_write.runner import PlanCommitRefused
-from actions.pull_sessions.runner import UnknownInstitutionError
 from core.client import GraphQLError, GraphQLHTTPError
 from core.config import ConfigError
 from core.rest_client import RestHTTPError
+from integrations.catalogue import UnknownInstitutionError
 
 # One line per action. main.py does not grow beyond this list.
 ACTIONS = [
@@ -30,6 +34,10 @@ ACTIONS = [
     read_child_plans,
     plan_write,
     pull_sessions,
+    pull_groups,
+    pull_products,
+    pull_references,
+    pull_roster,
 ]
 
 

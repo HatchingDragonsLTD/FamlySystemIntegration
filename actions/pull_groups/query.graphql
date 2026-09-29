@@ -1,0 +1,24 @@
+# CONFIRMED AGAINST THE LIVE API (2026-09-29), not just the docs, through
+# three corrections found this way:
+#   1. docs.famly.co described a `GroupQueries.list` wrapper
+#      (`groups { list { ... } }`) -- the real endpoint rejects it:
+#      "Cannot query field 'list' on type 'Group'". `groups` returns
+#      `[Group]` directly.
+#   2. `groups` is NOT argument-less: it requires exactly one of
+#      `institutionIds`, `groupIds` or `siteSetIds` ("Please provide only
+#      one of ..."). This pull always supplies `institutionIds`.
+#   3. `institutionIds`'s element type is the custom scalar `InstitutionId`,
+#      not `ID`.
+# No pagination cursor exists on this query -- one call with every known
+# institutionId returns every group across all of them in one response.
+#
+# Minimal field selection only (id, title, institutionId) -- description,
+# site, staffRatio, ordering and profileImage exist on Group but are not
+# needed here.
+query Groups($institutionIds: [InstitutionId!]) {
+  groups(institutionIds: $institutionIds) {
+    id
+    title
+    institutionId
+  }
+}

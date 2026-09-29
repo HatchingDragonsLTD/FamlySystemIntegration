@@ -477,6 +477,124 @@ Create `actions/<name>/web.py` exposing `ACTION_NAME` and
 `web_registry.ACTIONS`. `server.py` does not change. Handlers are plain
 functions — unit-testable without Flask or a running server.
 
+## Reference-data pulls (sessions, groups, products)
+
+Three maintenance commands refresh the local JSON reference files that other
+actions read, replacing manual copy-paste from Famly:
+
+| Command | Writes | Status |
+| --- | --- | --- |
+| `python main.py pull-sessions` | `reference/session_catalogue.json` | live -- functionally load-bearing (booking logic reads it) |
+| `python main.py pull-groups` | `reference/groups_catalogue.json` | live -- informational only today, nothing reads it yet |
+| `python main.py pull-products` | `reference/products_catalogue.json` | **stubbed** -- Famly's public API has no products/billing-profile query; every institution reports "not yet implemented" until a real query is confirmed and wired into `actions/pull_products/` |
+
+Each is independently runnable, and all three share the same conventions:
+
+- `--institution CODE` (repeatable) restricts the pull to one or more sites
+  from `reference/catalogue.json`'s `sites` section; an unrecognised code is a
+  clear error before anything is fetched, never a silent no-op.
+- `--dry-run` fetches and reports what would change without writing a file or
+  a backup.
+- The existing file is always backed up first, timestamped alongside it
+  (`<name>.<UTC timestamp>.bak.json`), before anything is overwritten.
+- Writing **merges** into the existing file -- an institution (or a group/
+  session/product within one) this run did not touch is left exactly as it
+  was, never wiped by a partial or filtered run.
+- Anything Famly returns that cannot be cleanly matched to a configured
+  institution is reported (not guessed at) and written nowhere.
+
+`python main.py pull-references [--institution CODE] [--dry-run]` runs all
+three together under one command, for a single weekly cron entry. One pull
+failing entirely (a bad `--institution` filter, a connection error, or
+`pull-products`' stubbed state) is reported for that pull only and does not
+stop the other two from running and writing.
+
+### Scheduling it weekly
+
+Not installed by this repo -- add a cron entry pointing at the project's
+Python interpreter, for example (Sundays at 03:00, adjust the paths):
+
+```cron
+0 3 * * 0 cd /path/to/famly-integration && /path/to/.venv/bin/python main.py pull-references >> var/pull-references.log 2>&1
+```
+
+Make sure the environment the cron job runs in has `FAMLY_ACCESS_TOKEN` (and
+any of `FAMLY_CATALOGUE_FILE` / `SESSION_CATALOGUE_FILE` / `GROUPS_CATALOGUE_FILE`
+/ `PRODUCTS_CATALOGUE_FILE`, if overridden) available -- crontab does not load
+`.env` on its own, so either source it in the command or configure the
+variables in the crontab/systemd unit itself.
+
+## The daily people-roster cache (`pull-roster`)
+
+`python main.py pull-roster [--institution CODE] [--dry-run]` refreshes a
+**separate, local, gitignored** SQLite cache of Famly children/contacts/
+bill-payer identifying fields, for the upcoming contact/child-creation
+pipeline to match against. It shares `pull-sessions`/`pull-groups`' backup,
+per-institution-isolation and `--institution`/`--dry-run` conventions, but is
+otherwise independent: it is **not** part of `pull-references`, runs on its
+own daily schedule, writes SQLite instead of JSON, and -- notably -- talks to
+a **different Famly endpoint**.
+
+### Different endpoint
+
+Every other GraphQL action here (`staff_credentials`, `pull_groups`,
+`urn_lookup`) uses Famly's **internal** app API at `FAMLY_GRAPHQL_URL`
+(default `https://app.famly.co/graphql`). That schema has no bulk way to list
+a child's `externalId` or list contacts/bill payers the way this pull needs.
+`pull_roster` instead uses Famly's **separate public API**
+(`FAMLY_PUBLIC_GRAPHQL_URL`, default `https://famlyapi.famly.co/v1/graphql`),
+confirmed live: `children { listBySiteIds }` (contacts come back nested per
+child, so no second call is needed) and `billPayers { listBySiteIds }`, both
+paginated via their own real cursor arguments. Same `FAMLY_ACCESS_TOKEN`,
+different URL -- see `actions/pull_roster/runner.py`'s module docstring.
+
+### ⚠️ This cache holds real child/family data -- never commit or back it up
+
+`roster_cache.db` (default `var/roster_cache.db`, override with
+`ROSTER_CACHE_PATH`) is treated **exactly like `.env`**: it is explicitly
+gitignored (see `.gitignore`), and it **must never be included in any backup
+or export that leaves the server**. It exists only for the local matching
+functions below.
+
+### What this cache is for, and what it must NEVER be used for
+
+`actions/pull_roster/store.py` exposes normalized lookups (trim + casefold,
+the same convention `actions.urn_lookup` uses):
+
+```python
+from actions.pull_roster import store
+
+store.find_child_by_external_id(urn)
+store.find_contact_by_email(email)
+store.find_bill_payer_by_email(email)
+```
+
+These are for **matching an already-known identifier** so the
+contact/child-creation pipeline can link the record it is about to write --
+never for deciding whether a child, contact or bill payer **already exists**
+before creating one. That existence check must be a **live Famly call made at
+creation time** (per the idempotency design already agreed) -- this cache can
+be up to 24 hours stale, so using it for a pre-creation check risks creating a
+duplicate Famly already has, or skipping a creation for something already
+gone. When that pipeline is built, its existence check must carry a comment
+pointing back to this paragraph, and must not import `store`'s lookup
+functions for that purpose. See `store.py`'s module docstring for the full
+reasoning, and `tests/test_pull_roster.py`'s `ExistenceCheckGuardTests` for
+the TODO that enforces it once the pipeline exists.
+
+### Scheduling it daily
+
+Also not installed by this repo -- a separate, daily cron entry (unlike
+`pull-references`' weekly one), for example (every night at 02:00):
+
+```cron
+0 2 * * * cd /path/to/famly-integration && /path/to/.venv/bin/python main.py pull-roster >> var/pull-roster.log 2>&1
+```
+
+Same note on environment variables as `pull-references` above --
+`FAMLY_ACCESS_TOKEN` (and `FAMLY_PUBLIC_GRAPHQL_URL`/`ROSTER_CACHE_PATH`, if
+overridden) must be available to the cron job's environment.
+
 ## Tests
 
 ```bash

@@ -1,0 +1,30 @@
+# CONFIRMED AGAINST THE LIVE PUBLIC API (2026-09-29) -- see runner.py's module
+# docstring for why this hits a DIFFERENT endpoint than every other action.
+#
+# `children.listBySiteIds` paginates via `nextToken`/`ChildCursor`, returning
+# `{ result: [Child!]!, next: ChildCursor }`. `siteIds` accepts the exact same
+# institutionId UUIDs reference/catalogue.json already stores (confirmed by
+# calling it with them) -- despite the "site" name, it is not a separate id
+# space this project needs to learn.
+#
+# Minimal field selection only (id, externalId, and each child's nested
+# contacts' id + email) -- Child has many more fields (name, birthday,
+# currentGroup, records, ...) not needed here. Fetching contacts NESTED here,
+# rather than via the separate `contacts { list(childIds, nextToken) }` query,
+# avoids a second round trip per child: this query already returns every
+# contact for every child in the same page.
+query PullRosterChildren($siteIds: [SiteId!]!, $next: ChildCursor) {
+  children {
+    listBySiteIds(siteIds: $siteIds, nextToken: $next) {
+      result {
+        id
+        externalId
+        contacts {
+          id
+          email
+        }
+      }
+      next
+    }
+  }
+}
