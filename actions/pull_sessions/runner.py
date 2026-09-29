@@ -48,6 +48,7 @@ from typing import Any
 
 from core.rest_client import RestClient, RestHTTPError
 from integrations import catalogue, session_catalogue
+from integrations.catalogue import UnknownInstitutionError  # re-exported; see there
 
 logger = logging.getLogger(__name__)
 
@@ -72,14 +73,6 @@ _PREFIX_RE = re.compile(r"^\(([^)]*)\)\s*(.*)$")
 
 class TitleParseError(ValueError):
     """A session title did not cleanly match the prefix/slot convention."""
-
-
-class UnknownInstitutionError(ValueError):
-    """An `institutions` filter named a code not in catalogue.json's sites.
-
-    Raised before any Famly call is made -- an unrecognised code is a mistake
-    worth stopping for, not a silent no-op that quietly pulls nothing.
-    """
 
 
 @dataclass

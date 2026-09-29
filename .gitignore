@@ -14,6 +14,16 @@ var/
 *.sqlite3-wal
 *.sqlite3-shm
 
+# The daily roster cache (actions/pull_roster) holds child/contact/bill-payer
+# ids and emails -- treated exactly like .env: never commit it, and never
+# include it in any backup or export that leaves the server. Already covered
+# by var/ above (its default location), but listed explicitly too so this
+# rule survives even if ROSTER_CACHE_PATH ever points it elsewhere.
+roster_cache.db
+roster_cache.db-wal
+roster_cache.db-shm
+*.bak.db
+
 # Plan payloads and CSV batches hold real child data -- keep them local.
 *.plan.json
 *.csv

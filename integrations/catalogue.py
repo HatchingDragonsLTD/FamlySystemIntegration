@@ -37,6 +37,17 @@ logger = logging.getLogger(__name__)
 DEFAULT_CATALOGUE_PATH = Path(__file__).resolve().parent.parent / "reference" / "catalogue.json"
 
 
+class UnknownInstitutionError(ValueError):
+    """An `--institution` filter named a code not in catalogue.json's sites.
+
+    Shared by every reference-data pull (pull_sessions, pull_groups,
+    pull_products, pull_references) so main.py's CLI dispatcher can catch one
+    exception type regardless of which pull raised it. Raised before any
+    Famly call is made -- an unrecognised code is a mistake worth stopping
+    for, not a silent no-op that quietly pulls nothing.
+    """
+
+
 def catalogue_path() -> Path:
     """The catalogue file in use."""
     override = os.environ.get("FAMLY_CATALOGUE_FILE", "").strip()

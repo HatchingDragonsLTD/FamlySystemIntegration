@@ -1,0 +1,22 @@
+{
+  "_comment": [
+    "Product ids per institution -- STUBBED, not yet populated.",
+    "",
+    "`python main.py pull-products` (and the combined `pull-references` weekly",
+    "run) will fill this in once actions/pull_products/ has a real query wired",
+    "up -- see actions/pull_products/runner.py's module docstring for status.",
+    "Running it today is safe but writes nothing: every institution fails with",
+    "a clear 'not yet implemented' reason, reported rather than guessed at.",
+    "",
+    "Intended structure once implemented: institutions.<site_code>.products.",
+    "<product_id> -> title, matching reference/groups_catalogue.json's shape.",
+    "<site_code> is a key from reference/catalogue.json's `sites` section.",
+    "",
+    "This is separate from reference/catalogue.json's own flat `products`",
+    "section, which is a hand-maintained, DISPLAY-ONLY id -> name map used only",
+    "to label the Slack plan-preview summary and is not institution-keyed.",
+    "",
+    "Point PRODUCTS_CATALOGUE_FILE elsewhere to override the path."
+  ],
+  "institutions": {}
+}

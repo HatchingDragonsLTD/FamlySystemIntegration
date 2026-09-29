@@ -1,0 +1,19 @@
+# CONFIRMED AGAINST THE LIVE PUBLIC API (2026-09-29). `billPayers.listBySiteIds`
+# paginates via `nextToken`/`BillPayerCursor`, returning
+# `{ result: [BillPayer!]!, next: BillPayerCursor }`, 50 per page in practice.
+#
+# Minimal field selection only (billPayerId, email) -- BillPayer has many more
+# fields (name, address, accountNumber, sortCode, balance, ...) not needed
+# here. `email` is nullable on the public schema's BillPayer type -- a bill
+# payer without one on file is skipped by runner.py, not guessed at.
+query PullRosterBillPayers($siteIds: [SiteId!]!, $next: BillPayerCursor) {
+  billPayers {
+    listBySiteIds(siteIds: $siteIds, nextToken: $next) {
+      result {
+        billPayerId
+        email
+      }
+      next
+    }
+  }
+}

@@ -1,0 +1,19 @@
+# PLACEHOLDER -- NOT A REAL QUERY. Do not send this.
+#
+# Checked against https://docs.famly.co on 2026-09-29: Famly's public GraphQL
+# API has no products or billing-profile root query at all. The full root
+# Query field list (accidentReports, accounts, bankhours, billPayers,
+# checkins, children, contacts, contractedhours, customRegistrationForms,
+# employees, formResponses, groups, inquiries, invoices, leaveBalances,
+# leaves, meals, payments, roles, shiftplanner, sites, staffAbsenceSettings,
+# staffhourstotals, workTags, workavailability) has nothing for products;
+# `productId` only ever appears nested inside an invoice line item.
+#
+# The user has said they will supply the real query shape separately.
+# Replace this file with it when that happens, keeping a cursor-style
+# argument (e.g. `$next: String`, matching pull_sessions' convention) if the
+# real query paginates -- runner.py's `fetch_institution_products` loop
+# already expects `_fetch_product_page` to return (rows, next_cursor) and
+# will follow it correctly once that function is filled in.
+#
+# query Products($institutionId: ID!, $next: String) { ... }
