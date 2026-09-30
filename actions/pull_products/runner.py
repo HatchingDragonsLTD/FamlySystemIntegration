@@ -1,37 +1,59 @@
-"""STUBBED pull for `reference/products_catalogue.json` -- awaiting a
-confirmed products-listing query.
+"""Pull Famly's live product ids for every institution into
+`reference/products_catalogue.json` (the flat id -> title display map, used
+only for Slack summaries), AND resolve each institution's two fixed add-on
+product ids into `reference/institution_defaults.json` as `addonProducts`.
 
-STATUS: NOT YET IMPLEMENTED. Checked against https://docs.famly.co on
-2026-09-29: Famly's public GraphQL API has no products or billing-profile
-root query at all -- a product only ever appears as an id nested inside an
-invoice line item, never as a queryable, listable entity. The user has said
-they will supply the real query shape separately.
+REST ENDPOINT CONFIRMED LIVE (2026-09-30), replacing an earlier GraphQL
+workaround (`finance.overview(...).filtersContext.products`): the FIRST build
+of this action never actually tried the REST API -- it searched GraphQL
+introspection and docs.famly.co, found nothing named "products", and built
+against `filtersContext.products` instead, without trying
+`GET v2/products` even though `pull_sessions` sits right next to it using the
+equivalent `GET v2/sessions`. That was an oversight, not a rejected option:
+once tried, `v2/products` works exactly like `v2/sessions` --
 
-Everything AROUND the actual fetch is built and tested exactly like
-`actions/pull_sessions` and `actions/pull_groups` -- per-institution loop,
-backup-before-write, merge-not-replace, `--institution` filter, dry-run,
-per-institution failure isolation, unmatched-not-guessed reporting -- so that
-once a real query is confirmed, only `_fetch_product_page` and
-`query.graphql` need filling in. `fetch_institution_products`'s pagination
-loop (follow a cursor until it is empty/null) is complete and covered by
-tests/test_pull_products.py against a fake page-fetcher; only the real
-GraphQL call and response parsing are missing.
+    GET {rest_base}/v2/products?institutionId=<id>&validOn=<today>
+        &includeDiscontinued=false&behaviors=1
+        &includePricesForAllPricingGroups=true
+    -> 200 {"products": [{"id", "title", ...}, ...], "behaviors": [...]}
 
-Running this action today is safe but useless: `pull_all` attempts every
-institution, each one fails with a `ProductsQueryNotImplemented` (a
-`NotImplementedError`) from `_fetch_product_page`, and every failure is
-recorded under `institutions_failed` -- exactly the same per-institution
-isolation pull_sessions already gives a real, transient Famly failure. Nothing
-is silently guessed or written.
+-- confirmed for all three configured institutions. `includeDiscontinued=false`
+matches `pull_sessions`' deliberate choice, for the same reason: a discontinued
+product must never be matched into `addonProducts` for a new booking. (None of
+the three institutions currently has a discontinued product, so this made no
+observable difference in testing -- it is a forward-looking safeguard, same as
+`pull_sessions`' identical choice.)
 
-TO FINISH THIS ACTION:
-    1. Confirm the real query name/shape (the user has this) -- do not guess.
-    2. Replace query.graphql with the real query, keeping a cursor-style
-       argument if the API paginates.
-    3. Replace `_fetch_product_page`'s body (currently `raise
-       ProductsQueryNotImplemented`) with the real `client.execute` call and
-       response parsing, returning `(rows, next_cursor)` like
-       `pull_sessions.runner._fetch_page`.
+TWO SEPARATE CONCERNS, not to be confused:
+
+  1. `pull_all` / `write_catalogue` -- the flat id -> title map for EVERY
+     product Famly returns, unconditionally (informational only, same as
+     before). Untouched by concern 2 below; a title-matching failure there
+     never blocks this.
+
+  2. `resolve_addon_products` / `write_addon_products` -- for each
+     institution, find the ONE product whose title is EXACTLY "Meals &
+     Snacks" -> mealsProductId, and the ONE whose title is EXACTLY
+     "Educational Activities & Extras" -> activitiesProductId. Case-sensitive,
+     no normalization: these are fixed, known titles, and normalizing could
+     mask a real naming drift -- which happened for real during this
+     feature's build-out (titles were briefly inconsistent across
+     institutions while being corrected by hand in Famly). Zero or 2+ matches
+     for either title is a hard, reportable anomaly for that institution;
+     nothing is guessed or written for it. Written into
+     `reference/institution_defaults.json` under `addonProducts`, NOT into
+     products_catalogue.json.
+
+SHARED FILE, SEPARATE OWNERSHIP: `institution_defaults.json` is also written
+by `actions/pull_institution_defaults` (ruleGroupId + schedules). Each pull
+merges only ITS OWN top-level key(s) into an institution's existing entry,
+preserving whatever the other pull already wrote there -- see
+`write_addon_products` here and `pull_institution_defaults.runner.pull_all`'s
+matching merge. Neither pull replaces the other's data.
+
+Institutions come from reference/catalogue.json's `sites` section, same as
+every other pull. Same conventions otherwise: --institution filter, --dry-run,
+timestamped backup-before-write, per-institution failure isolation.
 """
 
 import json
@@ -39,22 +61,27 @@ import logging
 import os
 import shutil
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from core.client import GraphQLClient, GraphQLError, GraphQLHTTPError
-from integrations import catalogue
+from core.rest_client import RestClient, RestHTTPError
+from integrations import catalogue, institution_defaults
 from integrations.catalogue import UnknownInstitutionError  # re-exported; see there
 
 logger = logging.getLogger(__name__)
 
-QUERY_PATH = Path(__file__).with_name("query.graphql")
-OPERATION_NAME = "Products"
+PRODUCTS_PATH = "v2/products"
 
 DEFAULT_CATALOGUE_PATH = (
     Path(__file__).resolve().parents[2] / "reference" / "products_catalogue.json"
 )
+
+# The two fixed, known titles this pull resolves into addonProducts. EXACT,
+# case-sensitive match only -- see the module docstring for why normalizing
+# these would be actively wrong.
+MEALS_TITLE = "Meals & Snacks"
+ACTIVITIES_TITLE = "Educational Activities & Extras"
 
 
 def catalogue_path() -> Path:
@@ -63,8 +90,11 @@ def catalogue_path() -> Path:
     return Path(override) if override else DEFAULT_CATALOGUE_PATH
 
 
-class ProductsQueryNotImplemented(NotImplementedError):
-    """No confirmed products-listing query exists yet -- see the module docstring."""
+class AddonProductAnomaly(RuntimeError):
+    """A hard, reportable data problem resolving one institution's addon
+    products -- either fixed title matched zero or 2+ products. Never guessed
+    around: see the module docstring.
+    """
 
 
 @dataclass
@@ -92,50 +122,107 @@ class PullResult:
     institutions_pulled: list[str] = field(default_factory=list)
     institutions_skipped: dict[str, str] = field(default_factory=dict)
     institutions_failed: dict[str, str] = field(default_factory=dict)
+    # code -> {"mealsProductId", "activitiesProductId"}, for institutions
+    # whose product list resolved both fixed titles cleanly.
+    addon_products: dict[str, dict] = field(default_factory=dict)
+    # code -> reason, for institutions where the flat product list was
+    # fetched fine but the addon-title resolution failed (see
+    # AddonProductAnomaly). Independent of institutions_failed: a fetch
+    # failure lands there instead, and skips addon resolution entirely.
+    addon_products_failed: dict[str, str] = field(default_factory=dict)
 
 
 def _normalise_institution_code(code: str) -> str:
     return (code or "").strip().upper()
 
 
-def _fetch_product_page(
-    client: GraphQLClient, institution_id: str, cursor: str | None
-) -> tuple[list[ProductRow], str | None]:
-    """One page of one institution's products.
+def _parse_product(node: Any) -> ProductRow | None:
+    if not isinstance(node, dict):
+        return None
+    return ProductRow(id=node.get("id"), title=node.get("title"))
 
-    NOT YET IMPLEMENTED -- see the module docstring. Deliberately raises
-    rather than returning an empty page: a run of this action must fail
-    loudly and immediately, never silently produce an empty catalogue that
-    looks like "this institution just has no products".
+
+def _parse_products_response(body: Any) -> list[dict]:
+    """The response's product list, defensively.
+
+    Confirmed live to be `{"products": [...], "behaviors": [...]}`, same
+    envelope shape as `pull_sessions`' `v2/sessions` response -- this also
+    accepts a bare list or a couple of other plausible keys, matching that
+    module's defensive style, so an unexpected but non-error shape degrades
+    to zero products pulled rather than raising.
     """
-    raise ProductsQueryNotImplemented(
-        "pull_products: no confirmed products-listing query yet -- fill in "
-        "actions/pull_products/query.graphql and _fetch_product_page in "
-        "runner.py once the real API shape is confirmed (see the module "
-        "docstring)."
-    )
+    if isinstance(body, list):
+        candidates: Any = body
+    elif isinstance(body, dict):
+        candidates = body.get("products") or body.get("data") or body.get("results") or []
+    else:
+        candidates = []
+
+    if not isinstance(candidates, list):
+        return []
+    return [p for p in candidates if isinstance(p, dict)]
 
 
 def fetch_institution_products(
-    institution_id: str, client: GraphQLClient
+    institution_id: str, client: RestClient | None = None, *, today: str | None = None
 ) -> list[ProductRow]:
-    """Fetch ALL pages of one institution's products, following a cursor
-    until it comes back empty/null -- the same shape as
-    `pull_sessions.runner.fetch_institution_sessions`.
+    """Every non-discontinued product configured for one institution, in ONE
+    call -- mirrors `pull_sessions.fetch_institution_sessions`.
 
-    This loop itself is complete and tested; only `_fetch_product_page` needs
-    a real implementation (see the module docstring).
+    `includeDiscontinued=false`: matches `pull_sessions`' deliberate choice --
+    a discontinued product must never be matched into `addonProducts` for a
+    new booking. No pagination on this endpoint.
+
+    Raises:
+        RestHTTPError: propagated deliberately, uncaught.
     """
-    rows: list[ProductRow] = []
-    cursor: str | None = None
+    client = client or RestClient()
 
-    while True:
-        page, cursor = _fetch_product_page(client, institution_id, cursor)
-        rows.extend(page)
-        if not cursor:
-            break
+    params = {
+        "institutionId": institution_id,
+        "validOn": today or date.today().isoformat(),
+        "includeDiscontinued": "false",
+        "behaviors": 1,
+        "includePricesForAllPricingGroups": "true",
+    }
+    body = client.get(PRODUCTS_PATH, params=params)
+    products = _parse_products_response(body)
 
-    return rows
+    return [row for row in (_parse_product(node) for node in products) if row is not None]
+
+
+def resolve_addon_products(products: list[ProductRow]) -> dict:
+    """Find the two fixed add-on products by EXACT title match.
+
+    Args:
+        products: one institution's full product list (as fetched by
+            `fetch_institution_products`).
+
+    Returns:
+        {"mealsProductId": ..., "activitiesProductId": ...}.
+
+    Raises:
+        AddonProductAnomaly: either title matched zero or 2+ products --
+            named explicitly, including every duplicate id when there is
+            more than one match. Never guessed at: see the module docstring.
+    """
+
+    def _match(title: str) -> str:
+        matches = [p for p in products if p.id and p.title == title]
+        if not matches:
+            raise AddonProductAnomaly(f"no product titled {title!r} was found")
+        if len(matches) > 1:
+            ids = ", ".join(p.id for p in matches)
+            raise AddonProductAnomaly(
+                f"{len(matches)} products are titled {title!r} (ids: {ids}) -- "
+                f"a duplicate title, not guessed at"
+            )
+        return matches[0].id
+
+    return {
+        "mealsProductId": _match(MEALS_TITLE),
+        "activitiesProductId": _match(ACTIVITIES_TITLE),
+    }
 
 
 def _read_existing_catalogue(path: Path) -> dict:
@@ -155,20 +242,21 @@ def _read_existing_catalogue(path: Path) -> dict:
 
 
 def pull_all(
-    client: GraphQLClient | None = None, institutions: list[str] | None = None
+    client: RestClient | None = None, institutions: list[str] | None = None
 ) -> PullResult:
     """Pull products for every institution in catalogue.json's sites.
 
-    Currently every institution ends up in `institutions_failed` via
-    `ProductsQueryNotImplemented` -- see the module docstring. The mechanics
-    (institution loop, --institution filter, merge, skip, isolation) are
-    otherwise identical to `pull_sessions.runner.pull_all`.
+    For each successfully fetched institution, this ALSO attempts addon-
+    product resolution (see `resolve_addon_products`); that is an independent
+    outcome from the flat catalogue write -- a title-matching anomaly lands
+    in `addon_products_failed` and never blocks or rolls back the flat
+    catalogue entry, which is written exactly as before.
 
     Raises:
         UnknownInstitutionError: `institutions` named a code catalogue.json's
             sites do not have.
     """
-    client = client or GraphQLClient()
+    client = client or RestClient()
 
     sites = catalogue.load_sites()
 
@@ -193,6 +281,8 @@ def pull_all(
     pulled: list[str] = []
     skipped: dict[str, str] = {}
     failed: dict[str, str] = {}
+    addon_products: dict[str, dict] = {}
+    addon_products_failed: dict[str, str] = {}
 
     for code, entry in sites.items():
         institution_id = entry.get("institutionId") if isinstance(entry, dict) else None
@@ -202,7 +292,7 @@ def pull_all(
 
         try:
             products = fetch_institution_products(institution_id, client)
-        except (GraphQLError, GraphQLHTTPError, NotImplementedError) as exc:
+        except RestHTTPError as exc:
             failed[code] = str(exc)
             continue
 
@@ -231,6 +321,11 @@ def pull_all(
         written_counts[code] = len(new_products)
         pulled.append(code)
 
+        try:
+            addon_products[code] = resolve_addon_products(products)
+        except AddonProductAnomaly as exc:
+            addon_products_failed[code] = str(exc)
+
     return PullResult(
         catalogue={"institutions": merged_institutions},
         comment=existing_raw.get("_comment"),
@@ -239,17 +334,23 @@ def pull_all(
         institutions_pulled=pulled,
         institutions_skipped=skipped,
         institutions_failed=failed,
+        addon_products=addon_products,
+        addon_products_failed=addon_products_failed,
     )
 
 
 def backup_path(path: Path) -> Path:
-    """A timestamped sibling path, e.g. products_catalogue.2026-09-29T120000Z.bak.json."""
+    """A timestamped sibling path, e.g. products_catalogue.2026-09-30T120000Z.bak.json."""
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     return path.with_name(f"{path.stem}.{stamp}.bak{path.suffix}")
 
 
 def write_catalogue(result: PullResult, path: Path | None = None) -> Path | None:
-    """Back up the existing file, then write the merged catalogue."""
+    """Back up the existing file, then write the merged FLAT catalogue.
+
+    This is the id -> title display map only -- see `write_addon_products`
+    for the separate institution_defaults.json write.
+    """
     path = path or catalogue_path()
     backup = None
 
@@ -261,6 +362,63 @@ def write_catalogue(result: PullResult, path: Path | None = None) -> Path | None
     if result.comment is not None:
         payload["_comment"] = result.comment
     payload.update(result.catalogue)
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+    return backup
+
+
+def _read_existing_institution_defaults(path: Path) -> dict:
+    """The current institution_defaults.json, or {} when there is none yet."""
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(
+            f"pull_products: {path} exists but could not be read as JSON "
+            f"({exc}); refusing to overwrite it -- fix or remove it by hand "
+            f"first"
+        ) from exc
+
+    return raw if isinstance(raw, dict) else {}
+
+
+def write_addon_products(result: PullResult, path: Path | None = None) -> Path | None:
+    """Merge resolved addonProducts into institution_defaults.json.
+
+    Backs up the existing file first, same convention as every other pull.
+    Only the `addonProducts` key of each successfully-resolved institution is
+    touched -- any `ruleGroupId`/`schedules` already there (written by
+    `pull_institution_defaults`) is preserved untouched, and so is every
+    OTHER institution's entire entry, whether or not it was in this run.
+
+    Returns:
+        The backup path, or None when there was no existing file to back up.
+    """
+    path = path or institution_defaults.catalogue_path()
+    backup = None
+
+    if path.exists():
+        backup = backup_path(path)
+        shutil.copy2(path, backup)
+
+    existing_raw = _read_existing_institution_defaults(path)
+    existing_institutions = existing_raw.get("institutions")
+    existing_institutions = existing_institutions if isinstance(existing_institutions, dict) else {}
+    merged_institutions = json.loads(json.dumps(existing_institutions))
+
+    for code, addon in result.addon_products.items():
+        existing_entry = merged_institutions.get(code)
+        entry = dict(existing_entry) if isinstance(existing_entry, dict) else {}
+        entry["addonProducts"] = addon
+        merged_institutions[code] = entry
+
+    payload: dict = {}
+    if existing_raw.get("_comment") is not None:
+        payload["_comment"] = existing_raw["_comment"]
+    payload["institutions"] = merged_institutions
 
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
@@ -288,5 +446,7 @@ def summary_payload(
             }
             for u in result.unmatched
         ],
+        "addonProductsResolved": sorted(result.addon_products),
+        "addonProductsFailed": result.addon_products_failed,
         "backupFile": str(backup) if backup else None,
     }

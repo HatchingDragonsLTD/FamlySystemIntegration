@@ -26,11 +26,21 @@ Structure (see reference/institution_defaults.json):
                                                "ANNUALIZED_V2")
     institutions.<code>.schedules.<schedule>.billingTitle          -> string
     institutions.<code>.schedules.<schedule>.billingInvoices       -> number
+    institutions.<code>.addonProducts.mealsProductId               -> UUID
+    institutions.<code>.addonProducts.activitiesProductId          -> UUID
 
 `schedule` is one of SCHEDULE_ALL_YEAR_ROUND / SCHEDULE_TERM_ONLY -- see
-`schedule_key`. `ruleGroupId` sits at the institution level, not inside a
-schedule bucket: Famly's pricing rule group does not vary by attendance
-schedule the way a billing profile does.
+`schedule_key`. `ruleGroupId` and `addonProducts` sit at the institution
+level, not inside a schedule bucket: neither varies by attendance schedule the
+way a billing profile does. `addonProducts` is written by
+`actions/pull_products` (exact product-title match, see its module
+docstring), NOT by `actions/pull_institution_defaults` -- each pull owns a
+different top-level key and merges without disturbing the other's (see both
+runners' "shared file, separate ownership" notes). `resolve_addon_products`
+below is deliberately a SEPARATE accessor from `resolve_defaults`: addon
+products only matter for a non-funded deal with `addon_quantity` set (see
+`hubspot_flatten.build_product_bookings`), so a plan that never touches that
+must not be forced to have `addonProducts` configured.
 
 The file is re-read on every call, matching `session_catalogue`'s reasoning:
 it is small, a preview is a rare event, and an edit then takes effect without
@@ -204,6 +214,66 @@ def resolve_defaults(institution: str, schedule: str) -> dict:
         raise InstitutionDefaultsError(
             f"institution_defaults: institution {institution!r} > schedules > "
             f"{schedule!r} is missing {', '.join(missing)}"
+        )
+
+    return result
+
+
+# The two addon-product fields resolve_addon_products checks for.
+_ADDON_PRODUCT_FIELDS = ("mealsProductId", "activitiesProductId")
+
+
+def resolve_addon_products(institution: str) -> dict:
+    """The institution's two fixed add-on product ids.
+
+    Written by `actions/pull_products` via an exact (case-sensitive) title
+    match against "Meals & Snacks" and "Educational Activities & Extras" --
+    see that module's docstring. Kept separate from `resolve_defaults` (see
+    the module docstring) since not every plan needs these.
+
+    Args:
+        institution: the institution code HubSpot sends, e.g. "HDCITY".
+            Matched case-insensitively and trimmed, same as
+            `resolve_defaults`.
+
+    Returns:
+        {"mealsProductId": ..., "activitiesProductId": ...}.
+
+    Raises:
+        InstitutionDefaultsError: naming exactly what was missing -- the
+            institution, or which of the two ids. There is no safe fallback:
+            a wrong or guessed product id would book/bill the wrong item.
+    """
+    raw = _read()
+
+    institutions = raw.get("institutions")
+    if not isinstance(institutions, dict):
+        raise InstitutionDefaultsError("institution_defaults: no 'institutions' section")
+
+    entry = _find_institution(institutions, institution)
+    if not isinstance(entry, dict):
+        raise InstitutionDefaultsError(
+            f"institution_defaults: no institution {institution!r}"
+        )
+
+    addon_products = entry.get("addonProducts")
+    if not isinstance(addon_products, dict):
+        raise InstitutionDefaultsError(
+            f"institution_defaults: no addonProducts for institution {institution!r}"
+        )
+
+    result: dict[str, Any] = {}
+    missing = []
+    for field_name in _ADDON_PRODUCT_FIELDS:
+        value = addon_products.get(field_name)
+        if not isinstance(value, str) or not value.strip():
+            missing.append(field_name)
+        result[field_name] = value
+
+    if missing:
+        raise InstitutionDefaultsError(
+            f"institution_defaults: institution {institution!r} > addonProducts "
+            f"is missing {', '.join(missing)}"
         )
 
     return result

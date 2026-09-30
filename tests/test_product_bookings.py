@@ -80,6 +80,15 @@ def _institution_defaults(institution) -> dict:
             institution: {
                 "ruleGroupId": "01RULEGROUP0000000000000000",
                 "schedules": {"all_year_round": bucket, "term_only": bucket},
+                # Reuses the same PRODUCT_1/PRODUCT_2 constants every test
+                # below already asserts against, so resolving via
+                # institution_defaults (instead of reading product_1_id/
+                # product_2_id straight from the payload) needs no other
+                # change to this file's expectations.
+                "addonProducts": {
+                    "mealsProductId": PRODUCT_1,
+                    "activitiesProductId": PRODUCT_2,
+                },
             }
         }
     }
@@ -143,7 +152,7 @@ class ProductBookingTests(unittest.TestCase):
     def test_quantity_three_over_four_days_books_the_first_three(self):
         bookings = bookings_of(
             flat_payload(
-                product_1_id=PRODUCT_1, product_2_id=PRODUCT_2, addon_quantity="3"
+                addon_quantity="3"
             )
         )
 
@@ -157,7 +166,7 @@ class ProductBookingTests(unittest.TestCase):
     def test_both_products_appear_on_each_selected_day_with_amount_one(self):
         bookings = bookings_of(
             flat_payload(
-                product_1_id=PRODUCT_1, product_2_id=PRODUCT_2, addon_quantity="3"
+                addon_quantity="3"
             )
         )
 
@@ -174,7 +183,7 @@ class ProductBookingTests(unittest.TestCase):
     def test_days_are_selected_in_week_order(self):
         bookings = bookings_of(
             flat_payload(
-                product_1_id=PRODUCT_1, product_2_id=PRODUCT_2, addon_quantity="2"
+                addon_quantity="2"
             )
         )
 
@@ -190,8 +199,6 @@ class ProductBookingTests(unittest.TestCase):
                 "wednesday": SLOT,
                 "thursday": SLOT,
             },
-            product_1_id=PRODUCT_1,
-            product_2_id=PRODUCT_2,
             addon_quantity="3",
         )
         bookings = bookings_of(payload)
@@ -208,7 +215,7 @@ class ProductBookingTests(unittest.TestCase):
         # gets no products even though it was available.
         bookings = bookings_of(
             flat_payload(
-                product_1_id=PRODUCT_1, product_2_id=PRODUCT_2, addon_quantity="4"
+                addon_quantity="4"
             )
         )
 
@@ -225,21 +232,51 @@ class ProductBookingTests(unittest.TestCase):
         self.assertEqual(bookings_of(payload), [])
         self.assertEqual(errors_of(payload), [])
 
-    def test_blank_product_fields_are_treated_as_absent(self):
-        payload = flat_payload(
-            product_1_id="", product_2_id="", addon_quantity=""
-        )
+    def test_a_blank_addon_quantity_books_nothing(self):
+        payload = flat_payload(addon_quantity="")
 
         self.assertEqual(bookings_of(payload), [])
         self.assertEqual(errors_of(payload), [])
 
     def test_quantity_zero_books_nothing_without_erroring(self):
         payload = flat_payload(
-            product_1_id=PRODUCT_1, product_2_id=PRODUCT_2, addon_quantity="0"
+            addon_quantity="0"
         )
 
         self.assertEqual(bookings_of(payload), [])
         self.assertEqual(errors_of(payload), [])
+
+
+class HubspotProductIdsAreIgnoredTests(unittest.TestCase):
+    """HubSpot no longer sends product_1_id/product_2_id -- see
+    hubspot_flatten's module docstring. Sending them anyway must change
+    NOTHING: institution_defaults is the only authoritative source now.
+    """
+
+    def test_sending_bogus_product_ids_does_not_override_the_resolved_ones(self):
+        bookings = bookings_of(
+            flat_payload(
+                addon_quantity="1",
+                product_1_id="00000000-bad0-bad0-bad0-badbadbadbad",
+                product_2_id="00000000-bad1-bad1-bad1-badbadbadbad",
+            )
+        )
+
+        product_ids = {b["productId"] for b in bookings}
+        self.assertEqual(product_ids, {PRODUCT_1, PRODUCT_2})
+        self.assertNotIn("00000000-bad0-bad0-bad0-badbadbadbad", product_ids)
+        self.assertNotIn("00000000-bad1-bad1-bad1-badbadbadbad", product_ids)
+
+    def test_sending_only_one_bogus_id_still_resolves_both_from_institution_defaults(self):
+        # Under the OLD contract this was a "half-specified" hard error.
+        # Under the new one, product_1_id/product_2_id do not exist as a
+        # concept at all -- addon_quantity alone is authoritative.
+        bookings = bookings_of(flat_payload(addon_quantity="1", product_1_id=PRODUCT_1))
+
+        self.assertEqual(
+            {b["productId"] for b in bookings}, {PRODUCT_1, PRODUCT_2}
+        )
+        self.assertEqual(errors_of(flat_payload(addon_quantity="1", product_1_id=PRODUCT_1)), [])
 
 
 class FractionalQuantityTests(unittest.TestCase):
@@ -253,8 +290,6 @@ class FractionalQuantityTests(unittest.TestCase):
     def days_with_products(self, quantity, booked):
         payload = flat_payload(
             days={day.lower(): SLOT for day in booked},
-            product_1_id=PRODUCT_1,
-            product_2_id=PRODUCT_2,
             addon_quantity=quantity,
         )
         bookings = bookings_of(payload)
@@ -326,8 +361,6 @@ class FractionalQuantityTests(unittest.TestCase):
                 "wednesday": SLOT,
                 "thursday": SLOT,
             },
-            product_1_id=PRODUCT_1,
-            product_2_id=PRODUCT_2,
             addon_quantity="2.5",
         )
         bookings = bookings_of(payload)
@@ -348,8 +381,6 @@ class ProductHardErrorTests(unittest.TestCase):
         errors = errors_of(
             flat_payload(
                 days={"monday": SLOT, "wednesday": SLOT},
-                product_1_id=PRODUCT_1,
-                product_2_id=PRODUCT_2,
                 addon_quantity="3",
             )
         )
@@ -365,8 +396,6 @@ class ProductHardErrorTests(unittest.TestCase):
         errors = errors_of(
             flat_payload(
                 days={"monday": SLOT, "wednesday": SLOT},
-                product_1_id=PRODUCT_1,
-                product_2_id=PRODUCT_2,
                 addon_quantity="4.5",
             )
         )
@@ -379,7 +408,7 @@ class ProductHardErrorTests(unittest.TestCase):
     def test_a_large_quantity_is_fine_when_enough_days_are_booked(self):
         # The cap means 5 no longer exceeds four booked days -- it books three.
         payload = flat_payload(
-            product_1_id=PRODUCT_1, product_2_id=PRODUCT_2, addon_quantity="5"
+            addon_quantity="5"
         )
 
         self.assertEqual(errors_of(payload), [])
@@ -389,39 +418,16 @@ class ProductHardErrorTests(unittest.TestCase):
         bookings = bookings_of(
             flat_payload(
                 days={"monday": SLOT, "wednesday": SLOT},
-                product_1_id=PRODUCT_1,
-                product_2_id=PRODUCT_2,
                 addon_quantity="3",
             )
         )
         # Not trimmed to the two available days -- nothing at all.
         self.assertEqual(bookings, [])
 
-    def test_only_product_1_sent_is_an_error(self):
-        errors = errors_of(flat_payload(product_1_id=PRODUCT_1))
-
-        self.assertEqual(len(errors), 1)
-        self.assertIn("half-specified", errors[0])
-        self.assertIn("product_2_id", errors[0])
-        self.assertIn("addon_quantity", errors[0])
-
-    def test_only_product_2_sent_is_an_error(self):
-        errors = errors_of(flat_payload(product_2_id=PRODUCT_2))
-
-        self.assertIn("half-specified", errors[0])
-        self.assertIn("product_1_id", errors[0])
-
-    def test_quantity_without_products_is_an_error(self):
-        errors = errors_of(flat_payload(addon_quantity="2"))
-
-        self.assertIn("half-specified", errors[0])
-        self.assertIn("product_1_id", errors[0])
-        self.assertIn("product_2_id", errors[0])
-
     def test_a_non_numeric_quantity_is_an_error(self):
         errors = errors_of(
             flat_payload(
-                product_1_id=PRODUCT_1, product_2_id=PRODUCT_2, addon_quantity="three"
+                addon_quantity="three"
             )
         )
         self.assertIn("not a number", errors[0])
@@ -429,7 +435,7 @@ class ProductHardErrorTests(unittest.TestCase):
     def test_a_negative_quantity_is_an_error(self):
         errors = errors_of(
             flat_payload(
-                product_1_id=PRODUCT_1, product_2_id=PRODUCT_2, addon_quantity="-1"
+                addon_quantity="-1"
             )
         )
         self.assertIn("cannot be negative", errors[0])
@@ -438,8 +444,6 @@ class ProductHardErrorTests(unittest.TestCase):
         nested = flatten.flatten_to_nested(
             flat_payload(
                 days={"monday": SLOT, "wednesday": SLOT},
-                product_1_id=PRODUCT_1,
-                product_2_id=PRODUCT_2,
                 addon_quantity="3",
             )
         )
@@ -452,8 +456,6 @@ class ProductHardErrorTests(unittest.TestCase):
         nested = flatten.flatten_to_nested(
             flat_payload(
                 days={"monday": SLOT, "wednesday": SLOT},
-                product_1_id=PRODUCT_1,
-                product_2_id=PRODUCT_2,
                 addon_quantity="3",
             )
         )
@@ -495,8 +497,6 @@ class ProductPreviewTests(unittest.TestCase):
     def test_quantity_exceeding_booked_days_blocks_with_no_famly_call(self):
         result = self.intake(
             days={"monday": SLOT, "wednesday": SLOT},
-            product_1_id=PRODUCT_1,
-            product_2_id=PRODUCT_2,
             addon_quantity="4.5",
         )
 
@@ -506,15 +506,16 @@ class ProductPreviewTests(unittest.TestCase):
             any("exceeds the number of booked days" in e for e in result.errors)
         )
 
-    def test_a_half_specified_setup_blocks_with_no_famly_call(self):
-        result = self.intake(product_1_id=PRODUCT_1)
+    def test_an_addon_resolution_failure_blocks_with_no_famly_call(self):
+        result = self.intake(days={}, institution="HDNODEFAULTS", addon_quantity="2")
 
         self.assertFalse(result.ok)
         self.assertEqual(self.calls, [])
+        self.assertTrue(any("HDNODEFAULTS" in e for e in result.errors))
 
     def test_a_valid_setup_previews_and_sends_the_bookings(self):
         result = self.intake(
-            product_1_id=PRODUCT_1, product_2_id=PRODUCT_2, addon_quantity="2"
+            addon_quantity="2"
         )
 
         self.assertTrue(result.ok)

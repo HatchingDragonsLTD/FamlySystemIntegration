@@ -276,11 +276,13 @@ carry child data — only the sample is committed.
 
 #### From HubSpot
 
-`ruleGroupId`, `planParts[].billingProfileId`, `planParts[].attendanceScheduleId`
-and `planParts[].billing.*` are no longer read from the HubSpot payload at all
--- `actions/plan_write/hubspot_flatten.py` resolves them from
+`ruleGroupId`, `planParts[].billingProfileId`, `planParts[].attendanceScheduleId`,
+`planParts[].billing.*` and (for a non-funded deal's add-ons) `product_1_id`/
+`product_2_id` are no longer read from the HubSpot payload at all --
+`actions/plan_write/hubspot_flatten.py` resolves them from
 `reference/institution_defaults.json` (see "Reference-data pulls" above) using
-the deal's `institution` and `termTimeOnly`. HubSpot sending them is a no-op.
+the deal's `institution` and `termTimeOnly`. HubSpot sending any of them is a
+no-op.
 
 `actions/plan_write/hubspot_intake.py` accepts the same payload, nested under
 `properties` or `data` or neither:
@@ -492,7 +494,7 @@ actions read, replacing manual copy-paste from Famly:
 | --- | --- | --- |
 | `python main.py pull-sessions` | `reference/session_catalogue.json` | live -- functionally load-bearing (booking logic reads it) |
 | `python main.py pull-groups` | `reference/groups_catalogue.json` | live -- informational only today, nothing reads it yet |
-| `python main.py pull-products` | `reference/products_catalogue.json` | **stubbed** -- Famly's public API has no products/billing-profile query; every institution reports "not yet implemented" until a real query is confirmed and wired into `actions/pull_products/` |
+| `python main.py pull-products` | `reference/products_catalogue.json` **and** `reference/institution_defaults.json`'s `addonProducts` | live -- the flat map is informational; `addonProducts` is functionally load-bearing for non-funded add-on bookings (see below) |
 | `python main.py pull-institution-defaults` | `reference/institution_defaults.json` | live -- functionally load-bearing (`hubspot_flatten` reads it for every plan part; see below) |
 
 Each is independently runnable, and all four share the same conventions:
@@ -512,9 +514,15 @@ Each is independently runnable, and all four share the same conventions:
 
 `python main.py pull-references [--institution CODE] [--dry-run]` runs all
 four together under one command, for a single weekly cron entry. One pull
-failing entirely (a bad `--institution` filter, a connection error, or
-`pull-products`' stubbed state) is reported for that pull only and does not
-stop the others from running and writing.
+failing entirely (a bad `--institution` filter or a connection error) is
+reported for that pull only and does not stop the others from running and
+writing.
+
+**`institution_defaults.json` is written by TWO pulls, each owning a different
+key:** `pull-institution-defaults` owns `ruleGroupId`/`schedules`, `pull-products`
+owns `addonProducts`. Each merges onto an institution's existing entry rather
+than replacing it wholesale, so running one never wipes out what the other
+already wrote.
 
 ### `pull-institution-defaults`: pricing rule group + billing-profile defaults
 
@@ -543,6 +551,29 @@ bucket, a profile with no attendance schedule to bucket it by, or mismatched
 billing schemes across buckets are all hard, reportable anomalies for that
 institution. An institution either gets a **complete** fresh entry (rule group
 + both schedule buckets) or none at all; there is no partial write.
+
+### `pull-products`' `addonProducts`: the two fixed non-funded add-on products
+
+HubSpot used to send `product_1_id` and `product_2_id` on a non-funded deal
+alongside `addon_quantity`. **It no longer sends either.** `addon_quantity`
+alone now signals "book the two fixed add-on products", and
+`actions/plan_write/hubspot_flatten.py` resolves both product ids from
+`reference/institution_defaults.json`'s `addonProducts` (via
+`integrations/institution_defaults.py`'s `resolve_addon_products`), keyed by
+the deal's `institution`. Sending `product_1_id`/`product_2_id` anyway is a
+no-op, same as the seven fields above.
+
+`pull-products` resolves `addonProducts` for each institution by an **exact,
+case-sensitive** title match against Famly's product list -- `"Meals & Snacks"`
+-> `mealsProductId`, `"Educational Activities & Extras"` -> `activitiesProductId`.
+Deliberately no normalization: these are fixed, known titles, and normalizing
+could mask a real naming drift in Famly (which is exactly what happened during
+this feature's build-out -- titles were briefly inconsistent across
+institutions while being corrected by hand). Zero or 2+ products matching
+either title is a hard, reportable anomaly for that institution and blocks
+only the `addonProducts` write -- the flat `products_catalogue.json` entry for
+that institution is written regardless, since it is a separate, unconditional
+concern.
 
 ### Scheduling it weekly
 

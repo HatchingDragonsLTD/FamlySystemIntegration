@@ -40,6 +40,10 @@
           "billingTitle": "Annualised",
           "billingInvoices": 12.0
         }
+      },
+      "addonProducts": {
+        "mealsProductId": "3b128632-ef11-4f8b-8b44-93ea00e00dd6",
+        "activitiesProductId": "e485a0fc-b659-4be9-92e6-4e824d588193"
       }
     },
     "HDCW": {
@@ -61,6 +65,10 @@
           "billingTitle": "Annualised",
           "billingInvoices": 12.0
         }
+      },
+      "addonProducts": {
+        "mealsProductId": "8a95de4f-f080-4063-8d49-3b03fe95644c",
+        "activitiesProductId": "7de23b4b-699a-4847-9ca6-6928d70886fb"
       }
     },
     "HDWEST": {
@@ -82,6 +90,10 @@
           "billingTitle": "Annualised",
           "billingInvoices": 12.0
         }
+      },
+      "addonProducts": {
+        "mealsProductId": "2ac668e6-2de1-4fa6-8f92-24aed2ce0d6b",
+        "activitiesProductId": "5284ce7c-927c-413f-a175-c2c410072ba5"
       }
     }
   }

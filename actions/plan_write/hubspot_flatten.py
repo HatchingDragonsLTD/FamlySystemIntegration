@@ -15,7 +15,7 @@ cannot hold arrays), and the native webhook forwards them as a flat JSON body:
     discount_1_name/discount_1_amount ... discount_3_name/discount_3_amount,
     half_day_adjustment ("yes"/"no") + half_day_amount (2.94 or 3.53),
     site_code                            (e.g. "HDCITY" -- metadata only),
-    product_1_id, product_2_id, addon_quantity   (non-funded deals only)
+    addon_quantity                       (non-funded deals only -- see below)
 
 This is the NEW contract: HubSpot sends a raw slot string per day plus
 institution/funded/meals/activities, and this module resolves each booked
@@ -40,6 +40,18 @@ still sends any of these seven fields, they are simply ignored -- a no-op, not
 an override -- since the resolved values are now the only authoritative
 source. `billingProfileId` gets a real, institution-correct value for the
 first time as a result, rather than always being null.
+
+THIRD GENERATION: HubSpot ALSO no longer sends `product_1_id`/`product_2_id`.
+`addon_quantity` alone now signals "book the two fixed add-on products" on a
+non-funded deal; both product ids are resolved from
+`reference/institution_defaults.json`'s `addonProducts` (via
+`integrations.institution_defaults.resolve_addon_products`), which
+`actions/pull_products` populates by an EXACT, case-sensitive title match
+against Famly's product list ("Meals & Snacks" / "Educational Activities &
+Extras") -- never normalized, so a real naming drift is caught as a hard
+failure rather than silently papered over. If HubSpot still sends
+`product_1_id`/`product_2_id`, they are ignored -- a no-op, same as the seven
+fields above.
 
 This module reshapes the payload into the single-plan-part nested structure.
 It does NOT validate -- it only restructures; `input_schema.validate` still
@@ -303,9 +315,15 @@ def _half_day_discount(data: dict) -> tuple[dict | None, str | None]:
 def build_product_bookings(data: Any, booked_days: list[str]) -> tuple[list, list[str]]:
     """Build product bookings for the first `addon_quantity` booked days.
 
-    Non-funded deals send two product UUIDs and a quantity; a funded deal sends
-    none of them, and gets no product bookings. Both products are booked on
-    each selected day, one unit each.
+    HubSpot no longer sends `product_1_id`/`product_2_id` at all -- see the
+    module docstring. `addon_quantity` alone is the only signal: when it is
+    set (non-funded deals only; a funded deal sends nothing and gets no
+    product bookings), both product ids are resolved from
+    `reference/institution_defaults.json` via the deal's `institution`, by
+    `integrations.institution_defaults.resolve_addon_products` (itself an
+    exact, case-sensitive title match against Famly's product list -- see
+    `actions/pull_products/runner.py`). Both products are booked on each
+    selected day, one unit each.
 
     Days are taken in week order (the order `_DAYS` already produced the
     session bookings in), so "the first 3 of Mon/Wed/Thu/Fri" is Mon, Wed, Thu.
@@ -315,10 +333,11 @@ def build_product_bookings(data: Any, booked_days: list[str]) -> tuple[list, lis
     day count is checked against, so 4.5 against two booked days is still an
     error (3 > 2), while 4.5 against five booked days books the first three.
 
-    UNLIKE the discount slots, a malformed product setup is a HARD error, not a
-    warning. There is no safe partial behaviour: capping the quantity, or
-    guessing which of the two products to drop, would silently bill the family
-    for something nobody chose. Blocking the preview is the correct outcome.
+    UNLIKE the discount slots, a malformed product setup -- including an
+    addon-product resolution failure -- is a HARD error, not a warning. There
+    is no safe partial behaviour: capping the quantity, or guessing which of
+    the two products to drop, would silently bill the family for something
+    nobody chose. Blocking the preview is the correct outcome.
 
     Args:
         data: the flat HubSpot payload.
@@ -331,30 +350,24 @@ def build_product_bookings(data: Any, booked_days: list[str]) -> tuple[list, lis
     if not isinstance(data, dict):
         return [], []
 
-    product_1 = _s(data.get("product_1_id"))
-    product_2 = _s(data.get("product_2_id"))
     raw_quantity = _s(data.get("addon_quantity"))
 
-    supplied = [bool(product_1), bool(product_2), bool(raw_quantity)]
-
-    # The funded path: nothing sent, nothing booked, nothing wrong.
-    if not any(supplied):
+    # The funded path (or a non-funded deal with no add-ons): nothing sent,
+    # nothing booked, nothing wrong.
+    if raw_quantity == "":
         return [], []
 
-    # Half-specified. Naming what is missing beats a generic complaint.
-    if not all(supplied):
-        missing = []
-        if not product_1:
-            missing.append("product_1_id")
-        if not product_2:
-            missing.append("product_2_id")
-        if not raw_quantity:
-            missing.append("addon_quantity")
-        return [], [
-            f"product booking is half-specified: missing {', '.join(missing)}. "
-            f"Send product_1_id, product_2_id and addon_quantity together, or "
-            f"none of them."
-        ]
+    institution = _s(data.get("institution"))
+    if institution == "":
+        return [], ["institution: required, but missing or empty"]
+
+    try:
+        addon_products = institution_defaults.resolve_addon_products(institution)
+    except institution_defaults.InstitutionDefaultsError as exc:
+        return [], [str(exc)]
+
+    product_1 = addon_products["mealsProductId"]
+    product_2 = addon_products["activitiesProductId"]
 
     try:
         raw_value = float(raw_quantity)

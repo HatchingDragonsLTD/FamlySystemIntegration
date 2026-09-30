@@ -1,1 +1,1 @@
-"""Pull-products maintenance action (STUBBED -- see runner.py's module docstring)."""
+"""Pull-products maintenance action -- see runner.py's module docstring."""
