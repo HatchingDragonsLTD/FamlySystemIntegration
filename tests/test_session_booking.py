@@ -67,16 +67,39 @@ CATALOGUE = {
     }
 }
 
+BILLING_PROFILE = "cccccccc-0000-0000-0000-000000000099"
 
-def flat_payload(**overrides) -> dict:
-    payload = {
-        "childId": CHILD,
-        "from": "2026-09-01",
+
+def _institution_defaults(institution) -> dict:
+    """A complete institution_defaults.json fixture for one institution.
+
+    Every test here leaves `termTimeOnly` unset (-> all_year_round), so only
+    that bucket needs real values; term_only is filled in identically so a
+    stray resolution against it would fail loudly rather than silently reuse
+    the wrong numbers.
+    """
+    bucket = {
+        "billingProfileId": BILLING_PROFILE,
         "attendanceScheduleId": SCHEDULE,
         "weeksOfCare": 51,
         "billingId": "ANNUALIZED_V2",
         "billingTitle": "Monthly",
         "billingInvoices": "ADVANCE",
+    }
+    return {
+        "institutions": {
+            institution: {
+                "ruleGroupId": "01RULEGROUP0000000000000000",
+                "schedules": {"all_year_round": bucket, "term_only": bucket},
+            }
+        }
+    }
+
+
+def flat_payload(**overrides) -> dict:
+    payload = {
+        "childId": CHILD,
+        "from": "2026-09-01",
         "institution": INSTITUTION,
         "monday": "morning",
         "funded": "false",
@@ -93,7 +116,18 @@ class SessionBookingTestCase(unittest.TestCase):
         path = Path(self._tmp.name) / "session_catalogue.json"
         path.write_text(json.dumps(CATALOGUE), encoding="utf-8")
 
-        env = mock.patch.dict("os.environ", {"SESSION_CATALOGUE_FILE": str(path)})
+        defaults_path = Path(self._tmp.name) / "institution_defaults.json"
+        defaults_path.write_text(
+            json.dumps(_institution_defaults(INSTITUTION)), encoding="utf-8"
+        )
+
+        env = mock.patch.dict(
+            "os.environ",
+            {
+                "SESSION_CATALOGUE_FILE": str(path),
+                "INSTITUTION_DEFAULTS_FILE": str(defaults_path),
+            },
+        )
         env.start()
         self.addCleanup(env.stop)
 
@@ -213,6 +247,72 @@ class CatalogueGapHardErrorTests(SessionBookingTestCase):
         self.assertEqual(len(self.calls), 1)
         sent = self.calls[0]["plan"]["planParts"][0]["sessionBookings"]
         self.assertEqual(sent[0]["sessionId"], NON_FUNDED)
+
+
+# --------------------------------------------------------------------------- #
+# ruleGroupId/billingProfileId/attendanceScheduleId/billing.* are resolved via
+# institution_defaults, not read from the flat HubSpot payload -- see
+# hubspot_flatten's module docstring.
+# --------------------------------------------------------------------------- #
+class InstitutionDefaultsResolutionTests(SessionBookingTestCase):
+    def test_the_resolved_defaults_land_on_the_plan_part(self):
+        nested = flatten.flatten_to_nested(flat_payload())
+        part = nested["planParts"][0]
+
+        self.assertEqual(part["billingProfileId"], BILLING_PROFILE)
+        self.assertEqual(part["attendanceScheduleId"], SCHEDULE)
+        self.assertEqual(part["billing"]["id"], "ANNUALIZED_V2")
+        self.assertEqual(part["billing"]["title"], "Monthly")
+        self.assertEqual(part["billing"]["weeksOfCare"], 51)
+        self.assertEqual(part["billing"]["invoices"], "ADVANCE")
+        self.assertEqual(nested["ruleGroupId"], "01RULEGROUP0000000000000000")
+
+    def test_hubspot_sending_the_removed_fields_is_a_no_op_not_an_override(self):
+        # Every one of these used to be read straight from the flat payload.
+        # Sending them now must change NOTHING: the resolved values from
+        # institution_defaults are the only authoritative source.
+        nested = flatten.flatten_to_nested(
+            flat_payload(
+                ruleGroupId="bogus-rule-group",
+                billingProfileId="00000000-bad0-bad0-bad0-badbadbadbad",
+                attendanceScheduleId="00000000-bad1-bad1-bad1-badbadbadbad",
+                weeksOfCare=999,
+                billingId="NOT_A_REAL_SCHEME",
+                billingTitle="Wrong Title",
+                billingInvoices="WRONG",
+            )
+        )
+        part = nested["planParts"][0]
+
+        self.assertEqual(part["billingProfileId"], BILLING_PROFILE)
+        self.assertEqual(part["attendanceScheduleId"], SCHEDULE)
+        self.assertEqual(part["billing"]["id"], "ANNUALIZED_V2")
+        self.assertEqual(part["billing"]["title"], "Monthly")
+        self.assertEqual(part["billing"]["weeksOfCare"], 51)
+        self.assertEqual(part["billing"]["invoices"], "ADVANCE")
+        self.assertEqual(nested["ruleGroupId"], "01RULEGROUP0000000000000000")
+        self.assertNotIn("bogus-rule-group", json.dumps(nested))
+
+    def test_an_institution_absent_from_institution_defaults_is_a_hard_error(self):
+        # HDEMPTY is a real institution in the session catalogue (used by
+        # CatalogueGapHardErrorTests) but was never added to the
+        # institution_defaults fixture -- resolution for it must fail loudly,
+        # not fall back to another institution's values.
+        nested = flatten.flatten_to_nested(flat_payload(institution="HDEMPTY", monday=""))
+
+        self.assertIn(flatten.ERRORS_KEY, nested)
+        self.assertTrue(any("HDEMPTY" in e for e in nested[flatten.ERRORS_KEY]))
+        self.assertIsNone(nested["planParts"][0]["billingProfileId"])
+        self.assertIsNone(nested["ruleGroupId"])
+
+    def test_resolution_runs_even_with_no_booked_day(self):
+        # Unlike session-booking resolution, institution_defaults resolution
+        # is not gated on there being a booked day -- every plan part needs a
+        # billing profile regardless of what (if anything) is booked.
+        nested = flatten.flatten_to_nested(flat_payload(monday=""))
+
+        self.assertNotIn(flatten.ERRORS_KEY, nested)
+        self.assertEqual(nested["planParts"][0]["billingProfileId"], BILLING_PROFILE)
 
 
 if __name__ == "__main__":

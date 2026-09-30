@@ -58,19 +58,49 @@ def _full_session_catalogue(uuid_value):
     }
 
 
+BILLING_PROFILE = "cccccccc-0000-0000-0000-000000000099"
+
+
+def _institution_defaults(institution) -> dict:
+    bucket = {
+        "billingProfileId": BILLING_PROFILE,
+        "attendanceScheduleId": SCHEDULE,
+        "weeksOfCare": 51,
+        "billingId": "ANNUALIZED_V2",
+        "billingTitle": "Monthly",
+        "billingInvoices": "ADVANCE",
+    }
+    return {
+        "institutions": {
+            institution: {
+                "ruleGroupId": "01RULEGROUP0000000000000000",
+                "schedules": {"all_year_round": bucket, "term_only": bucket},
+            }
+        }
+    }
+
+
 _catalogue_dir = None
 
 
 def setUpModule():
     global _catalogue_dir
     _catalogue_dir = tempfile.TemporaryDirectory()
+
     path = Path(_catalogue_dir.name) / "session_catalogue.json"
     path.write_text(json.dumps(_full_session_catalogue(SESSION)), encoding="utf-8")
     os.environ["SESSION_CATALOGUE_FILE"] = str(path)
 
+    defaults_path = Path(_catalogue_dir.name) / "institution_defaults.json"
+    defaults_path.write_text(
+        json.dumps(_institution_defaults(INSTITUTION)), encoding="utf-8"
+    )
+    os.environ["INSTITUTION_DEFAULTS_FILE"] = str(defaults_path)
+
 
 def tearDownModule():
     os.environ.pop("SESSION_CATALOGUE_FILE", None)
+    os.environ.pop("INSTITUTION_DEFAULTS_FILE", None)
     _catalogue_dir.cleanup()
 
 
@@ -79,11 +109,6 @@ def flat_payload(**overrides) -> dict:
     payload = {
         "childId": CHILD,
         "from": "2026-09-01",
-        "attendanceScheduleId": SCHEDULE,
-        "weeksOfCare": 51,
-        "billingId": "ANNUALIZED_V2",
-        "billingTitle": "Monthly",
-        "billingInvoices": "ADVANCE",
         "institution": INSTITUTION,
         "monday": "full_day",
         "funded": "false",

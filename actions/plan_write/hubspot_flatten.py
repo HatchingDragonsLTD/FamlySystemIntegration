@@ -4,8 +4,7 @@ plan shape `input_schema.from_dict` expects.
 The HubSpot custom code action emits flat scalar fields (HubSpot output fields
 cannot hold arrays), and the native webhook forwards them as a flat JSON body:
 
-    childId, from, to, ruleGroupId, note,
-    attendanceScheduleId, weeksOfCare, billingId, billingTitle, billingInvoices,
+    childId, from, to, note,
     termTimeOnly,
     institution, has_meals, has_activities  (meals/activities only matter when
                                               funded is true),
@@ -27,6 +26,21 @@ institution and no slot, and fails validation accordingly. Both shapes are
 deliberately NOT supported side by side, so there is no ambiguity about which
 contract is live.
 
+SECOND GENERATION OF THAT SAME CHANGE: HubSpot ALSO no longer sends
+`ruleGroupId`, `billingProfileId`, `attendanceScheduleId`, `weeksOfCare`,
+`billingId`, `billingTitle` or `billingInvoices`. Those used to arrive as flat,
+institution-wide constants -- values that never actually varied per deal, only
+per institution (and, for the billing-profile fields, per term-time-only vs
+full-year schedule) -- with `billingProfileId` not sent at all, reaching Famly
+as a bare `null`. All seven are now resolved here, from
+`reference/institution_defaults.json`, via `build_institution_defaults` /
+`integrations.institution_defaults.resolve_defaults`, keyed by the deal's
+`institution` and a schedule derived from its `termTimeOnly` flag. If HubSpot
+still sends any of these seven fields, they are simply ignored -- a no-op, not
+an override -- since the resolved values are now the only authoritative
+source. `billingProfileId` gets a real, institution-correct value for the
+first time as a result, rather than always being null.
+
 This module reshapes the payload into the single-plan-part nested structure.
 It does NOT validate -- it only restructures; `input_schema.validate` still
 runs after. Two kinds of problems a producer can find here ride separate
@@ -35,18 +49,17 @@ channels:
   * discount slots (pairing a name with an amount is only possible here,
     before the slots are flattened away) are ADVISORY: PROBLEMS_KEY, turned
     into warnings by hubspot_intake -- the plan still previews.
-  * a session catalogue gap for a booked day is a HARD failure: ERRORS_KEY,
-    same channel as a malformed product booking -- blocks the preview with
-    zero Famly calls, because there is no safe partial plan to fall back to.
-
-billingProfileId is intentionally absent (the server resolves it separately).
+  * a session catalogue gap for a booked day, or an institution_defaults
+    resolution failure, is a HARD failure: ERRORS_KEY, same channel as a
+    malformed product booking -- blocks the preview with zero Famly calls,
+    because there is no safe partial plan to fall back to.
 """
 
 import math
 from datetime import datetime, timezone
 from typing import Any
 
-from integrations import catalogue, session_catalogue
+from integrations import catalogue, institution_defaults, session_catalogue
 
 # HubSpot field -> Famly day enum. Order fixed for stable output. Each field
 # carries a raw slot string ("morning"/"afternoon"/"full day"), resolved to a
@@ -438,6 +451,42 @@ def build_session_bookings(data: Any) -> tuple[list, list[str]]:
     return bookings, []
 
 
+def build_institution_defaults(data: Any) -> tuple[dict, list[str]]:
+    """Resolve ruleGroupId + this plan part's billing/pricing defaults.
+
+    HubSpot no longer sends ruleGroupId, billingProfileId,
+    attendanceScheduleId, weeksOfCare, billingId, billingTitle or
+    billingInvoices -- see the module docstring. They are resolved here from
+    reference/institution_defaults.json, keyed by the deal's institution and
+    its termTimeOnly flag (see institution_defaults.schedule_key). Unlike
+    build_session_bookings, this runs regardless of whether any day is
+    booked: every plan part needs a billing profile.
+
+    A resolution failure is a HARD failure -- there is no safe partial plan
+    without a billing profile, same reasoning as a session catalogue gap.
+
+    Args:
+        data: the flat HubSpot payload.
+
+    Returns:
+        (defaults, errors). A non-empty `errors` means `defaults` is {}; the
+        caller must not build a plan part from it.
+    """
+    if not isinstance(data, dict):
+        return {}, []
+
+    institution = _s(data.get("institution"))
+    if institution == "":
+        return {}, ["institution: required, but missing or empty"]
+
+    schedule = institution_defaults.schedule_key(_as_bool(data.get("termTimeOnly")))
+
+    try:
+        return institution_defaults.resolve_defaults(institution, schedule), []
+    except institution_defaults.InstitutionDefaultsError as exc:
+        return {}, [str(exc)]
+
+
 def build_site_metadata(data: Any) -> dict:
     """Resolve `site_code` into sibling metadata for the plan.
 
@@ -502,7 +551,9 @@ def flatten_to_nested(data: Any) -> dict:
     Skips any day whose slot value is empty (not booked). A booked day's
     session UUID is resolved via the session catalogue (see
     `build_session_bookings`); a gap there rides ERRORS_KEY as a hard failure,
-    same channel as a malformed product booking. Attaches
+    same channel as a malformed product booking. ruleGroupId and the plan
+    part's billing/pricing defaults are resolved via
+    `build_institution_defaults`, same channel again. Attaches
     publicFundingSettings only when `funded` is truthy. Passes identity fields
     through unchanged. Never raises; missing fields simply come through empty so
     validate() can report them.
@@ -517,6 +568,12 @@ def flatten_to_nested(data: Any) -> dict:
     funded = _as_bool(data.get("funded"))
     session_bookings, session_errors = build_session_bookings(data)
 
+    # ruleGroupId + billingProfileId/attendanceScheduleId/billing.* -- resolved
+    # from reference/institution_defaults.json, not read from `data` (see the
+    # module docstring). Runs regardless of booked days: every plan part needs
+    # a billing profile.
+    defaults, defaults_errors = build_institution_defaults(data)
+
     # Up to three custom discounts. A half-filled or out-of-range slot yields a
     # problem instead of a discount, and the problems ride along so validate()
     # reports them at PREVIEW time rather than after a commit.
@@ -528,16 +585,20 @@ def flatten_to_nested(data: Any) -> dict:
     # a session catalogue gap does not also masquerade as "nothing booked" here.
     booked_days = [day_enum for day_key, day_enum in _DAYS if _s(data.get(day_key))]
     product_bookings, product_errors = build_product_bookings(data, booked_days)
-    errors = session_errors + product_errors
+
+    # De-duplicated, preserving order: a missing institution can surface the
+    # SAME message from both session-booking resolution and defaults
+    # resolution, and there is no reason to show it twice.
+    errors = list(dict.fromkeys(session_errors + product_errors + defaults_errors))
 
     plan_part = {
-        "billingProfileId": _s(data.get("billingProfileId")) or None,
-        "attendanceScheduleId": _s(data.get("attendanceScheduleId")) or None,
+        "billingProfileId": defaults.get("billingProfileId"),
+        "attendanceScheduleId": defaults.get("attendanceScheduleId"),
         "billing": {
-            "id": _s(data.get("billingId")) or None,
-            "title": _s(data.get("billingTitle")) or None,
-            "weeksOfCare": data.get("weeksOfCare"),
-            "invoices": data.get("billingInvoices"),
+            "id": defaults.get("billingId"),
+            "title": defaults.get("billingTitle"),
+            "weeksOfCare": defaults.get("weeksOfCare"),
+            "invoices": defaults.get("billingInvoices"),
         },
         "sessionBookings": session_bookings,
         "productBookings": product_bookings,
@@ -550,7 +611,7 @@ def flatten_to_nested(data: Any) -> dict:
         "childId": _s(data.get("childId")) or None,
         "from": _to_iso_date(data.get("from")),
         "to": _to_iso_date(data.get("to")),
-        "ruleGroupId": _s(data.get("ruleGroupId")) or None,
+        "ruleGroupId": defaults.get("ruleGroupId"),
         "note": _s(data.get("note")),
         "planParts": [plan_part],
     }

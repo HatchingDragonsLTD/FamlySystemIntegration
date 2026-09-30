@@ -3,15 +3,17 @@
 # name.fullName): the caller matches on externalId and shows fullName as a
 # sanity-check label, nothing else.
 #
-# PAGINATION ARGUMENT UNCONFIRMED AGAINST THE LIVE SCHEMA: `next` on `list` is
-# the cursor field's own name, re-supplied as the query variable -- the
-# obvious minimal convention, not independently verified here. If Famly
-# returns a GraphQL error naming a different or missing argument (on this or
-# the very first, cursor-less call), that must be diagnosed against the real
-# API and this file corrected -- never guessed around further.
-query Children($next: String) {
+# CONFIRMED AGAINST THE LIVE PUBLIC API (2026-09-30). This does NOT hit
+# FAMLY_GRAPHQL_URL (the internal API every other action here uses) -- that
+# schema has no bulk way to list a child's externalId at all. It hits Famly's
+# separate PUBLIC API (see runner.py's `_public_client`), whose
+# `children.listBySiteIds` does have it, paginated via `nextToken`/
+# `ChildCursor`. `siteIds` is REQUIRED and accepts every institutionId this
+# backfill should cover in one call -- confirmed live that passing several at
+# once returns every matching child across all of them, not just the first.
+query UrnLookupChildren($siteIds: [SiteId!]!, $next: ChildCursor) {
   children {
-    list(next: $next) {
+    listBySiteIds(siteIds: $siteIds, nextToken: $next) {
       result {
         id
         externalId

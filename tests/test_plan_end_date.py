@@ -51,15 +51,32 @@ def _full_session_catalogue(uuid_value):
     }
 
 
-def flat_payload(**overrides) -> dict:
-    payload = {
-        "childId": CHILD,
-        "from": "2026-09-01",
+BILLING_PROFILE = "cccccccc-0000-0000-0000-000000000099"
+
+
+def _institution_defaults(institution) -> dict:
+    bucket = {
+        "billingProfileId": BILLING_PROFILE,
         "attendanceScheduleId": SCHEDULE,
         "weeksOfCare": 51,
         "billingId": "ANNUALIZED_V2",
         "billingTitle": "Monthly",
         "billingInvoices": "ADVANCE",
+    }
+    return {
+        "institutions": {
+            institution: {
+                "ruleGroupId": "01RULEGROUP0000000000000000",
+                "schedules": {"all_year_round": bucket, "term_only": bucket},
+            }
+        }
+    }
+
+
+def flat_payload(**overrides) -> dict:
+    payload = {
+        "childId": CHILD,
+        "from": "2026-09-01",
         "institution": INSTITUTION,
         "monday": "full_day",
         "funded": "false",
@@ -194,7 +211,18 @@ class EndToEndTests(unittest.TestCase):
             json.dumps(_full_session_catalogue(SESSION)), encoding="utf-8"
         )
 
-        env = mock.patch.dict("os.environ", {"SESSION_CATALOGUE_FILE": str(path)})
+        defaults_path = Path(self._tmp.name) / "institution_defaults.json"
+        defaults_path.write_text(
+            json.dumps(_institution_defaults(INSTITUTION)), encoding="utf-8"
+        )
+
+        env = mock.patch.dict(
+            "os.environ",
+            {
+                "SESSION_CATALOGUE_FILE": str(path),
+                "INSTITUTION_DEFAULTS_FILE": str(defaults_path),
+            },
+        )
         env.start()
         self.addCleanup(env.stop)
 

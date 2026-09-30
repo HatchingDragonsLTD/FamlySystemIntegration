@@ -1,23 +1,25 @@
-"""Runs the sessions + groups + products reference-data pulls together, for a
-single weekly cron entry.
+"""Runs the sessions + groups + products + institution-defaults reference-data
+pulls together, for a single weekly cron entry.
 
 Each pull -- `actions/pull_sessions`, `actions/pull_groups`,
-`actions/pull_products` -- is still individually runnable via its own
-`pull-sessions` / `pull-groups` / `pull-products` CLI command; this module
-just sequences all three under one command (`pull-references`).
+`actions/pull_products`, `actions/pull_institution_defaults` -- is still
+individually runnable via its own `pull-sessions` / `pull-groups` /
+`pull-products` / `pull-institution-defaults` CLI command; this module just
+sequences all four under one command (`pull-references`).
 
 ISOLATION: one pull's total failure (an `UnknownInstitutionError` from a bad
 `--institution` filter, a connection error, or -- for pull_products today --
-its stubbed "not implemented" state) is recorded and does NOT stop the other
-two from running. This generalises the SAME principle each individual pull
-already applies to its own institutions: one bad institution/source must
-never take down the rest of the run.
+its stubbed "not implemented" state) is recorded and does NOT stop the others
+from running. This generalises the SAME principle each individual pull already
+applies to its own institutions: one bad institution/source must never take
+down the rest of the run.
 """
 
 from dataclasses import dataclass, field
 from typing import Any
 
 from actions.pull_groups import runner as pull_groups
+from actions.pull_institution_defaults import runner as pull_institution_defaults
 from actions.pull_products import runner as pull_products
 from actions.pull_sessions import runner as pull_sessions
 
@@ -29,6 +31,7 @@ PULLS = {
     "sessions": pull_sessions,
     "groups": pull_groups,
     "products": pull_products,
+    "institutionDefaults": pull_institution_defaults,
 }
 
 

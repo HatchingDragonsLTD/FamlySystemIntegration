@@ -1,0 +1,35 @@
+# CONFIRMED AGAINST THE LIVE INTERNAL API (2026-09-30). `finance.billingProfiles
+# .list` takes `institutionSetId` -- a SINGLE id, not a list, despite what its
+# sibling queries (e.g. the rule-group one) accept -- so, unlike that one, this
+# pull makes ONE call PER institution. Confirmed live that passing the plain
+# institutionId UUID here (the same one reference/catalogue.json already
+# stores) works: the response's own `siteSetId` echoes exactly that id back.
+# There is no pagination cursor.
+#
+# Bucketed afterwards by `attendanceSchedule.fullYear` (see runner.py):
+# true -> all_year_round, false -> term_only. `isDeleted` is fetched
+# deliberately so a deleted profile can be filtered OUT before bucketing --
+# left in, a deleted duplicate would trigger a false "two profiles in one
+# bucket" anomaly for an institution that is actually fine.
+query GetBillingProfiles($institutionSetId: InstitutionSetId!) {
+  finance {
+    billingProfiles {
+      list(institutionSetId: $institutionSetId) {
+        billingProfileId
+        isDeleted
+        billingScheme {
+          id
+          title
+        }
+        annualization {
+          weeksOfCare
+          invoices
+        }
+        attendanceSchedule {
+          id
+          fullYear
+        }
+      }
+    }
+  }
+}

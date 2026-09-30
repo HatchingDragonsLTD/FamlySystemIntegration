@@ -16,6 +16,7 @@ from dataclasses import asdict, is_dataclass
 
 from actions.plan_write import cli as plan_write
 from actions.pull_groups import cli as pull_groups
+from actions.pull_institution_defaults import cli as pull_institution_defaults
 from actions.pull_products import cli as pull_products
 from actions.pull_references import cli as pull_references
 from actions.pull_roster import cli as pull_roster
@@ -36,6 +37,7 @@ ACTIONS = [
     pull_sessions,
     pull_groups,
     pull_products,
+    pull_institution_defaults,
     pull_references,
     pull_roster,
 ]
