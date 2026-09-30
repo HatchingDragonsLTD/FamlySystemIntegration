@@ -39,6 +39,11 @@ TERM_ONLY = {
     "billingInvoices": 12,
 }
 
+ADDON_PRODUCTS = {
+    "mealsProductId": "55555555-0000-0000-0000-000000000005",
+    "activitiesProductId": "66666666-0000-0000-0000-000000000006",
+}
+
 CATALOGUE = {
     "institutions": {
         INSTITUTION: {
@@ -47,6 +52,7 @@ CATALOGUE = {
                 "all_year_round": ALL_YEAR_ROUND,
                 "term_only": TERM_ONLY,
             },
+            "addonProducts": ADDON_PRODUCTS,
         },
         # An institution with a rule group but only ONE schedule captured --
         # e.g. a fresh pull that failed on the other bucket's anomaly.
@@ -179,6 +185,56 @@ class MissingFileTests(unittest.TestCase):
         ):
             with self.assertRaises(idf.InstitutionDefaultsError):
                 idf.resolve_defaults(INSTITUTION, idf.SCHEDULE_ALL_YEAR_ROUND)
+
+
+# --------------------------------------------------------------------------- #
+# resolve_addon_products -- separate accessor, written by actions/pull_products
+# via exact product-title match (see that module's docstring).
+# --------------------------------------------------------------------------- #
+class ResolveAddonProductsTests(InstitutionDefaultsTestCase):
+    def test_a_known_institution_returns_both_ids(self):
+        result = idf.resolve_addon_products(INSTITUTION)
+        self.assertEqual(result, ADDON_PRODUCTS)
+
+    def test_matching_is_case_insensitive_and_trimmed(self):
+        for variant in ("hdcity", "HdCity", "  HDCITY  "):
+            result = idf.resolve_addon_products(variant)
+            self.assertEqual(result, ADDON_PRODUCTS)
+
+    def test_an_unknown_institution_raises_naming_it(self):
+        with self.assertRaises(idf.InstitutionDefaultsError) as ctx:
+            idf.resolve_addon_products("HDXYZ")
+        self.assertIn("HDXYZ", str(ctx.exception))
+
+    def test_an_institution_with_no_addon_products_configured_raises(self):
+        # HDPARTIAL has a ruleGroupId/schedules but no addonProducts -- this
+        # accessor must not require the other one's fields at all.
+        with self.assertRaises(idf.InstitutionDefaultsError) as ctx:
+            idf.resolve_addon_products("HDPARTIAL")
+
+        message = str(ctx.exception)
+        self.assertIn("HDPARTIAL", message)
+        self.assertIn("addonProducts", message)
+
+    def test_a_missing_id_in_addon_products_raises_naming_it(self):
+        broken = {
+            "institutions": {
+                INSTITUTION: {
+                    "addonProducts": {
+                        "mealsProductId": ADDON_PRODUCTS["mealsProductId"],
+                        "activitiesProductId": "",
+                    }
+                }
+            }
+        }
+        path = Path(self._tmp.name) / "broken_addons.json"
+        path.write_text(json.dumps(broken), encoding="utf-8")
+
+        with mock.patch.dict("os.environ", {"INSTITUTION_DEFAULTS_FILE": str(path)}):
+            with self.assertRaises(idf.InstitutionDefaultsError) as ctx:
+                idf.resolve_addon_products(INSTITUTION)
+
+        self.assertIn("activitiesProductId", str(ctx.exception))
 
 
 if __name__ == "__main__":

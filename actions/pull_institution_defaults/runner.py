@@ -23,13 +23,20 @@ endpoint every OTHER action but pull_roster/urn_lookup uses):
         see `_billing_schemes_match`.
 
 MONEY-RELEVANT, NO GUESSING: an institution either passes every one of these
-checks and gets a COMPLETE, freshly-written entry (ruleGroupId + both schedule
-buckets), or it fails entirely and its previous entry (if any) is left
-untouched -- there is no partial write for one institution. This differs from
-pull_sessions/pull_groups, which merge at a finer grain (slot/group), because a
-partial institution_defaults entry here (say, a fresh term_only bucket sitting
-next to a stale all_year_round one) would be actively misleading rather than
-just incomplete.
+checks and gets a COMPLETE, freshly-written `ruleGroupId` + BOTH schedule
+buckets, or it fails entirely and whatever it had before (if anything) is left
+untouched -- there is no partial write for this pull's own two keys. This
+differs from pull_sessions/pull_groups, which merge at a finer grain (slot/
+group), because a partial ruleGroupId/schedules pair here (say, a fresh
+term_only bucket sitting next to a stale all_year_round one) would be actively
+misleading rather than just incomplete.
+
+SHARED FILE, SEPARATE OWNERSHIP: `institution_defaults.json` is also written
+by `actions/pull_products` (the `addonProducts` key, resolved by exact product
+title match -- see that module's docstring). This pull only ever touches
+`ruleGroupId` and `schedules` on an institution's entry; any `addonProducts`
+already there is read back and carried through UNCHANGED (see `pull_all`'s
+merge below), never wiped by a fresh rule-group/billing-profile pull.
 
 Institutions come from reference/catalogue.json's `sites` section, same as
 every other pull. Same conventions otherwise: --institution filter, --dry-run,
@@ -397,7 +404,14 @@ def pull_all(
         entry = InstitutionDefaultsEntry(
             rule_group_id=rule_group_by_id[institution_id], schedules=schedules
         )
-        merged_institutions[code] = entry.to_json()
+        # Merge onto whatever is already there (never replace the whole
+        # institution entry): an `addonProducts` key written by pull_products
+        # must survive a fresh ruleGroupId/schedules pull -- see the module
+        # docstring's "shared file, separate ownership" note.
+        existing_entry = merged_institutions.get(code)
+        existing_entry = dict(existing_entry) if isinstance(existing_entry, dict) else {}
+        existing_entry.update(entry.to_json())
+        merged_institutions[code] = existing_entry
         pulled.append(code)
 
     return PullResult(

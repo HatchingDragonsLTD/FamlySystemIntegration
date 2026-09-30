@@ -18,5 +18,30 @@
     "",
     "Point PRODUCTS_CATALOGUE_FILE elsewhere to override the path."
   ],
-  "institutions": {}
+  "institutions": {
+    "HDCITY": {
+      "products": {
+        "68ecac92-9745-4c5f-a2e1-fdcb10adc27b": "(F) Educational Activities & Extras",
+        "3b128632-ef11-4f8b-8b44-93ea00e00dd6": "Meals & Snacks",
+        "c324a1c5-5514-4aaa-8bd1-90e95587cc9c": "(F) Meals & Snacks",
+        "e485a0fc-b659-4be9-92e6-4e824d588193": "Educational Activities & Extras"
+      }
+    },
+    "HDCW": {
+      "products": {
+        "7de23b4b-699a-4847-9ca6-6928d70886fb": "Educational Activities & Extras",
+        "efc8f065-7342-4e4f-8ab0-c9d81ec587d1": "(F) Educational Activities & Extras",
+        "8a95de4f-f080-4063-8d49-3b03fe95644c": "Meals & Snacks",
+        "69ff7b03-2743-4fdb-98fb-dda081e42784": "(F) Meals & Snacks"
+      }
+    },
+    "HDWEST": {
+      "products": {
+        "2ac668e6-2de1-4fa6-8f92-24aed2ce0d6b": "Meals & Snacks",
+        "5864230e-9177-4aa7-bb24-7ab76cff2042": "(F) Educational Activities & Extras",
+        "5284ce7c-927c-413f-a175-c2c410072ba5": "Educational Activities & Extras",
+        "01e3f36c-216f-44e7-805f-13b154082a47": "(F) Meals & Snacks"
+      }
+    }
+  }
 }
