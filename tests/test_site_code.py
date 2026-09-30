@@ -70,15 +70,32 @@ SESSION_CATALOGUE = {
 }
 
 
+BILLING_PROFILE = "cccccccc-0000-0000-0000-000000000099"
+
+INSTITUTION_DEFAULTS = {
+    "institutions": {
+        BOOKING_INSTITUTION: {
+            "ruleGroupId": "01RULEGROUP0000000000000000",
+            "schedules": {
+                bucket: {
+                    "billingProfileId": BILLING_PROFILE,
+                    "attendanceScheduleId": SCHEDULE,
+                    "weeksOfCare": 51,
+                    "billingId": "ANNUALIZED_V2",
+                    "billingTitle": "Monthly",
+                    "billingInvoices": "ADVANCE",
+                }
+                for bucket in ("all_year_round", "term_only")
+            },
+        }
+    }
+}
+
+
 def flat_payload(**overrides) -> dict:
     payload = {
         "childId": CHILD,
         "from": "2026-09-01",
-        "attendanceScheduleId": SCHEDULE,
-        "weeksOfCare": 51,
-        "billingId": "ANNUALIZED_V2",
-        "billingTitle": "Monthly",
-        "billingInvoices": "ADVANCE",
         "institution": BOOKING_INSTITUTION,
         "monday": "full_day",
         "funded": "false",
@@ -103,11 +120,17 @@ class SiteTestCase(unittest.TestCase):
             json.dumps(SESSION_CATALOGUE), encoding="utf-8"
         )
 
+        institution_defaults_file = tmp / "institution_defaults.json"
+        institution_defaults_file.write_text(
+            json.dumps(INSTITUTION_DEFAULTS), encoding="utf-8"
+        )
+
         env = mock.patch.dict(
             "os.environ",
             {
                 "FAMLY_CATALOGUE_FILE": str(catalogue_file),
                 "SESSION_CATALOGUE_FILE": str(session_catalogue_file),
+                "INSTITUTION_DEFAULTS_FILE": str(institution_defaults_file),
                 "PREVIEW_STORE_PATH": str(tmp / "store.sqlite3"),
                 "FAMLY_ACCESS_TOKEN": "test-token",
             },

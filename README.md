@@ -276,6 +276,12 @@ carry child data — only the sample is committed.
 
 #### From HubSpot
 
+`ruleGroupId`, `planParts[].billingProfileId`, `planParts[].attendanceScheduleId`
+and `planParts[].billing.*` are no longer read from the HubSpot payload at all
+-- `actions/plan_write/hubspot_flatten.py` resolves them from
+`reference/institution_defaults.json` (see "Reference-data pulls" above) using
+the deal's `institution` and `termTimeOnly`. HubSpot sending them is a no-op.
+
 `actions/plan_write/hubspot_intake.py` accepts the same payload, nested under
 `properties` or `data` or neither:
 
@@ -477,9 +483,9 @@ Create `actions/<name>/web.py` exposing `ACTION_NAME` and
 `web_registry.ACTIONS`. `server.py` does not change. Handlers are plain
 functions — unit-testable without Flask or a running server.
 
-## Reference-data pulls (sessions, groups, products)
+## Reference-data pulls (sessions, groups, products, institution defaults)
 
-Three maintenance commands refresh the local JSON reference files that other
+Four maintenance commands refresh the local JSON reference files that other
 actions read, replacing manual copy-paste from Famly:
 
 | Command | Writes | Status |
@@ -487,8 +493,9 @@ actions read, replacing manual copy-paste from Famly:
 | `python main.py pull-sessions` | `reference/session_catalogue.json` | live -- functionally load-bearing (booking logic reads it) |
 | `python main.py pull-groups` | `reference/groups_catalogue.json` | live -- informational only today, nothing reads it yet |
 | `python main.py pull-products` | `reference/products_catalogue.json` | **stubbed** -- Famly's public API has no products/billing-profile query; every institution reports "not yet implemented" until a real query is confirmed and wired into `actions/pull_products/` |
+| `python main.py pull-institution-defaults` | `reference/institution_defaults.json` | live -- functionally load-bearing (`hubspot_flatten` reads it for every plan part; see below) |
 
-Each is independently runnable, and all three share the same conventions:
+Each is independently runnable, and all four share the same conventions:
 
 - `--institution CODE` (repeatable) restricts the pull to one or more sites
   from `reference/catalogue.json`'s `sites` section; an unrecognised code is a
@@ -504,10 +511,38 @@ Each is independently runnable, and all three share the same conventions:
   institution is reported (not guessed at) and written nowhere.
 
 `python main.py pull-references [--institution CODE] [--dry-run]` runs all
-three together under one command, for a single weekly cron entry. One pull
+four together under one command, for a single weekly cron entry. One pull
 failing entirely (a bad `--institution` filter, a connection error, or
 `pull-products`' stubbed state) is reported for that pull only and does not
-stop the other two from running and writing.
+stop the others from running and writing.
+
+### `pull-institution-defaults`: pricing rule group + billing-profile defaults
+
+HubSpot used to send `ruleGroupId`, `attendanceScheduleId`, `weeksOfCare`,
+`billingId`, `billingTitle` and `billingInvoices` as flat, institution-wide
+constants on every webhook -- values that never actually varied per deal, only
+per institution (and, for the billing-profile fields, per term-time-only vs
+full-year schedule). `billingProfileId` was never sent at all and reached
+Famly as a bare `null`.
+
+**HubSpot no longer sends any of those seven fields.** `pull-institution-defaults`
+pulls them from Famly instead (two internal-API queries per institution --
+`GetInstitutionSingleRuleGroupQuery` and `GetBillingProfiles`, see
+`actions/pull_institution_defaults/runner.py`'s module docstring for the exact
+shapes), and `actions/plan_write/hubspot_flatten.py` resolves them via
+`integrations/institution_defaults.py`, keyed by the deal's `institution` and
+a schedule bucket (`all_year_round` / `term_only`) derived from its
+`termTimeOnly` flag. If HubSpot still sends any of the seven fields, they are
+silently ignored -- a no-op, not an override.
+
+This is **money-relevant, so the pull never guesses**: an institution's billing
+profiles must bucket into exactly one `all_year_round` and exactly one
+`term_only` profile (after filtering out deleted ones), and the two buckets'
+billing schemes must agree with each other -- zero/multiple profiles in a
+bucket, a profile with no attendance schedule to bucket it by, or mismatched
+billing schemes across buckets are all hard, reportable anomalies for that
+institution. An institution either gets a **complete** fresh entry (rule group
++ both schedule buckets) or none at all; there is no partial write.
 
 ### Scheduling it weekly
 
@@ -520,9 +555,9 @@ Python interpreter, for example (Sundays at 03:00, adjust the paths):
 
 Make sure the environment the cron job runs in has `FAMLY_ACCESS_TOKEN` (and
 any of `FAMLY_CATALOGUE_FILE` / `SESSION_CATALOGUE_FILE` / `GROUPS_CATALOGUE_FILE`
-/ `PRODUCTS_CATALOGUE_FILE`, if overridden) available -- crontab does not load
-`.env` on its own, so either source it in the command or configure the
-variables in the crontab/systemd unit itself.
+/ `PRODUCTS_CATALOGUE_FILE` / `INSTITUTION_DEFAULTS_FILE`, if overridden)
+available -- crontab does not load `.env` on its own, so either source it in
+the command or configure the variables in the crontab/systemd unit itself.
 
 ## The daily people-roster cache (`pull-roster`)
 

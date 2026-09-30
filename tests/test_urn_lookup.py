@@ -12,9 +12,12 @@ every test resets it in setUp -- otherwise one test's fetch would leak into
 the next and make results order-dependent.
 """
 
+import json
 import logging
 import os
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from actions.urn_lookup import runner, web
@@ -35,7 +38,7 @@ def page_body(children, next_cursor=None):
     return {
         "data": {
             "children": {
-                "list": {
+                "listBySiteIds": {
                     "result": children,
                     "next": next_cursor,
                 }
@@ -62,9 +65,26 @@ class FakeGraphQLClient:
 
 
 class UrnLookupTestCase(unittest.TestCase):
+    """Every test gets a temp catalogue with one site (so `fetch_roster`'s
+    required `siteIds` always has something to send), plus the usual
+    module-level cache reset."""
+
     def setUp(self):
         runner._reset_cache_for_tests()
         self.addCleanup(runner._reset_cache_for_tests)
+
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        catalogue_path = Path(tmpdir.name) / "catalogue.json"
+        catalogue_path.write_text(
+            json.dumps({"sites": {"TESTSITE": {"institutionId": "site-1"}}}),
+            encoding="utf-8",
+        )
+        patcher = mock.patch.dict(
+            os.environ, {"FAMLY_CATALOGUE_FILE": str(catalogue_path)}
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
 
 # --------------------------------------------------------------------------- #
@@ -116,6 +136,43 @@ class FetchRosterTests(UrnLookupTestCase):
         self.assertEqual(len(client.calls), 1)
         self.assertEqual([r.id for r in rows], ["c-1"])
 
+    def test_every_configured_institution_id_is_sent_in_one_call(self):
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        catalogue_path = Path(tmpdir.name) / "catalogue.json"
+        catalogue_path.write_text(
+            json.dumps(
+                {
+                    "sites": {
+                        "A": {"institutionId": "site-a"},
+                        "B": {"institutionId": "site-b"},
+                        "C": {},  # no institutionId -- must be skipped, not sent as null
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        client = FakeGraphQLClient(pages=[page_body([])])
+
+        with mock.patch.dict(os.environ, {"FAMLY_CATALOGUE_FILE": str(catalogue_path)}):
+            runner.fetch_roster(client=client)
+
+        self.assertEqual(sorted(client.calls[0]["siteIds"]), ["site-a", "site-b"])
+
+    def test_no_configured_institution_ids_raises_a_clear_error(self):
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        catalogue_path = Path(tmpdir.name) / "catalogue.json"
+        catalogue_path.write_text(json.dumps({"sites": {"A": {}}}), encoding="utf-8")
+        client = FakeGraphQLClient(pages=[page_body([])])
+
+        with mock.patch.dict(os.environ, {"FAMLY_CATALOGUE_FILE": str(catalogue_path)}):
+            with self.assertRaises(ValueError) as ctx:
+                runner.fetch_roster(client=client)
+
+        self.assertIn("institutionId", str(ctx.exception))
+        self.assertEqual(client.calls, [])  # never even attempted the call
+
     def test_pagination_across_multiple_pages_is_followed_correctly(self):
         client = FakeGraphQLClient(
             pages=[
@@ -147,7 +204,7 @@ class FetchRosterTests(UrnLookupTestCase):
 
     def test_a_graphql_error_is_surfaced_not_swallowed(self):
         error = GraphQLError(
-            "GraphQL request 'Children' returned errors: "
+            "GraphQL request 'UrnLookupChildren' returned errors: "
             "Variable '$something' of required type ... was not provided",
             errors=[{"message": "required variable missing"}],
         )

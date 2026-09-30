@@ -1,9 +1,10 @@
 """CLI wiring for the pull-references maintenance command.
 
 Exposes the standard interface main.py discovers: NAME, HELP, add_args, handle.
-Runs actions/pull_sessions + actions/pull_groups + actions/pull_products
-together -- see runner.py's module docstring. Each is still individually
-runnable via its own `pull-sessions` / `pull-groups` / `pull-products` command.
+Runs actions/pull_sessions + actions/pull_groups + actions/pull_products +
+actions/pull_institution_defaults together -- see runner.py's module
+docstring. Each is still individually runnable via its own `pull-sessions` /
+`pull-groups` / `pull-products` / `pull-institution-defaults` command.
 """
 
 import argparse
@@ -11,7 +12,10 @@ import argparse
 from . import runner
 
 NAME = "pull-references"
-HELP = "Run the sessions + groups + products reference-data pulls together (weekly cron)"
+HELP = (
+    "Run the sessions + groups + products + institution-defaults reference-data "
+    "pulls together (weekly cron)"
+)
 
 
 def add_args(parser: argparse.ArgumentParser) -> None:

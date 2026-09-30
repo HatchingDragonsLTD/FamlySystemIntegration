@@ -1,0 +1,22 @@
+# CONFIRMED AGAINST THE LIVE INTERNAL API (2026-09-30) -- this hits
+# FAMLY_GRAPHQL_URL like every other action here EXCEPT pull_roster/urn_lookup
+# (those two need Famly's separate public API; this pull does not).
+#
+# `Site.ruleGroups(namespace)` returns `[RuleSet!]!` -- there is no
+# "single rule group" field on the schema; "Single" in this operation's name
+# describes what THIS PULL expects back for namespace "pricing": exactly one
+# entry. Zero or more than one is a hard, reportable anomaly for that
+# institution (see runner.py's fetch_rule_groups) -- never guessed at, since a
+# wrong ruleGroupId decides how a family is priced.
+#
+# One call covers every requested institution at once (`institutionIds` takes
+# a list) -- confirmed live that passing several ids in one call returns each
+# institution's own rule groups, not just the first's.
+query GetInstitutionSingleRuleGroupQuery($institutionIds: [InstitutionId!]) {
+  institutions(institutionIds: $institutionIds) {
+    institutionId
+    ruleGroups(namespace: "pricing") {
+      ruleGroupId
+    }
+  }
+}
