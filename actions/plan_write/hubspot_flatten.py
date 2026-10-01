@@ -12,7 +12,10 @@ cannot hold arrays), and the native webhook forwards them as a flat JSON body:
                                           "afternoon" / "full day", "" = not
                                           booked -- NOT a pre-resolved UUID)
     funded, fundingMethod, fundingHours, maxFundedMinutes,
-    discount_1_name/discount_1_amount ... discount_3_name/discount_3_amount,
+    discount_1_name/discount_1_amount/discount_1_flag ... discount_10_name/
+                                          discount_10_amount/discount_10_flag
+                                          (flag is "percent"/"fixed", optional
+                                          -- see build_discounts),
     half_day_adjustment ("yes"/"no") + half_day_amount (2.94 or 3.53),
     site_code                            (e.g. "HDCITY" -- metadata only),
     addon_quantity                       (non-funded deals only -- see below)
@@ -87,18 +90,26 @@ _DAYS = [
 # Values HubSpot may send for a boolean field.
 _TRUE_VALUES = {"true", "yes", "1"}
 
-# Up to three custom discount slots: discount_1_name / discount_1_amount, etc.
-_DISCOUNT_SLOTS = (1, 2, 3)
+# Up to ten custom discount slots: discount_1_name / discount_1_amount /
+# discount_1_flag, etc.
+_DISCOUNT_SLOTS = tuple(range(1, 11))
 
-# Fixed fields on every custom discount we build. Only title, amount and
-# ordering vary per slot.
+# Fixed fields on every custom discount we build. title, amount, ordering and
+# isPercent vary per slot.
 _DISCOUNT_DEFAULTS = {
     "fePriceModifierType": "discount",
-    "isPercent": True,
     "origin": "custom",
     "period": "WEEKLY",
     "showOnInvoice": True,
 }
+
+# A slot's `flag` selects which kind of discount it is. Absent/empty defaults
+# to "percent" -- the backward-compatible path, since every HubSpot branch
+# before this generalisation only ever sent percentage discounts and never a
+# flag at all.
+DISCOUNT_FLAG_PERCENT = "percent"
+DISCOUNT_FLAG_FIXED = "fixed"
+VALID_DISCOUNT_FLAGS = (DISCOUNT_FLAG_PERCENT, DISCOUNT_FLAG_FIXED)
 
 # The most days products can be booked on, however large addon_quantity is.
 # A fractional quantity rounds UP (2.5 -> 3, since a part-day of add-ons is
@@ -108,16 +119,30 @@ MAX_ADDON_DAYS = 3
 # The half-day adjustment is a FIXED amount, not a percentage, and HubSpot
 # precomputes it -- the server does not work out the child's age. Only these
 # two values are legitimate; anything else means the upstream calculation went
-# wrong, so the discount is excluded rather than applied on trust.
+# wrong, so the discount is excluded rather than applied on trust. Its
+# ordering sits right after the LAST POSSIBLE discount slot (not the last
+# FILLED one -- it is a fixed position, same as before this generalisation),
+# so it is always derived from _DISCOUNT_SLOTS rather than hardcoded.
 HALF_DAY_TITLE = "Half Day Adjustment"
-HALF_DAY_ORDERING = 3
+HALF_DAY_ORDERING = len(_DISCOUNT_SLOTS)
 VALID_HALF_DAY_AMOUNTS = (2.94, 3.53)
 
-# Amounts arrive as a FRACTION (5% is 0.05), so anything above 1.0 is a
-# fat-fingered percentage rather than a fraction. Rejecting it here stops a
-# typed "5" becoming a 500% discount on a real invoice.
-_MIN_DISCOUNT_AMOUNT = 0.0
-_MAX_DISCOUNT_AMOUNT = 1.0
+# Each flag's valid amount range, both ends exclusive-min/inclusive-max
+# (0 < amount <= max). Percent amounts arrive as a FRACTION (5% is 0.05), so
+# anything above 1.0 is a fat-fingered percentage rather than a fraction --
+# rejecting it stops a typed "5" becoming a 500% discount on a real invoice.
+# Fixed amounts arrive in pounds; 5000 is a generous but real ceiling -- a
+# weekly custom charge above that is far more likely a mistake than a genuine
+# discount/surcharge.
+_MIN_PERCENT_AMOUNT = 0.0
+_MAX_PERCENT_AMOUNT = 1.0
+_MIN_FIXED_AMOUNT = 0.0
+_MAX_FIXED_AMOUNT = 5000.0
+
+_DISCOUNT_RANGES = {
+    DISCOUNT_FLAG_PERCENT: (_MIN_PERCENT_AMOUNT, _MAX_PERCENT_AMOUNT),
+    DISCOUNT_FLAG_FIXED: (_MIN_FIXED_AMOUNT, _MAX_FIXED_AMOUNT),
+}
 
 # Key the problems are carried under, for input_schema to pick up. Stripped
 # before the plan body is built -- it never reaches Famly.
@@ -173,20 +198,36 @@ def _to_iso_date(value: Any) -> str | None:
 
 
 def build_discounts(data: Any) -> tuple[list, list[str]]:
-    """Build the plan part's custom discounts from the three flat slots.
+    """Build the plan part's custom discounts from the ten flat slots.
 
-    A slot is `discount_N_name` plus `discount_N_amount`. An empty slot is
-    skipped entirely; a half-filled or out-of-range one is reported as a
-    problem and excluded, never guessed at.
+    A slot is `discount_N_name` plus `discount_N_amount`, plus an OPTIONAL
+    `discount_N_flag` ("percent" or "fixed"). An empty slot (name AND amount
+    both empty) is skipped entirely regardless of flag -- the normal "unused
+    slot" case. A half-filled, badly-flagged, or out-of-range one is reported
+    as a problem and excluded, never guessed at.
 
-    A fourth, FIXED-amount discount is appended when `half_day_adjustment` is
-    yes: see `_half_day_discount`. It carries `isPercent: False`, so the two
-    kinds coexist in the list and anything reading them must check that flag
-    rather than assume a percentage.
+    `flag` absent or empty DEFAULTS TO "percent" -- the backward-compatible
+    path: every HubSpot branch built before this generalisation never sent a
+    flag at all and only ever meant a percentage discount, so that continues
+    to work with no warning. A flag that IS present but is not exactly
+    "percent"/"fixed" (e.g. a typo) is a malformed slot, not a default.
 
-    `ordering` is tied to the SLOT NUMBER (slot 1 -> 0, slot 3 -> 2) and is not
-    compacted when a middle slot is empty, so a discount keeps its position
-    regardless of what else is filled in.
+    Each flag has its own valid amount range (see _DISCOUNT_RANGES):
+    percent is a FRACTION, 0 < amount <= 1.0 (5% = 0.05); fixed is POUNDS,
+    0 < amount <= 5000.
+
+    An eleventh (or further) `discount_N_*` field is never read -- only slots
+    1 through 10 exist.
+
+    A further, FIXED-amount discount is appended when `half_day_adjustment` is
+    yes: see `_half_day_discount`. It is a SEPARATE mechanism from the ten
+    generalised slots, with its own fixed 2.94/3.53 validation, and carries
+    `isPercent: False`, so the two kinds coexist in the list and anything
+    reading them must check that flag rather than assume a percentage.
+
+    `ordering` is tied to the SLOT NUMBER (slot 1 -> 0, slot 10 -> 9) and is
+    not compacted when a middle slot is empty, so a discount keeps its
+    position regardless of what else is filled in.
 
     Args:
         data: the flat HubSpot payload.
@@ -206,8 +247,9 @@ def build_discounts(data: Any) -> tuple[list, list[str]]:
     for slot in _DISCOUNT_SLOTS:
         name = _s(data.get(f"discount_{slot}_name"))
         raw_amount = _s(data.get(f"discount_{slot}_amount"))
+        raw_flag = _s(data.get(f"discount_{slot}_flag"))
 
-        # Both empty: the slot simply is not in use.
+        # Both empty: the slot simply is not in use -- regardless of flag.
         if name == "" and raw_amount == "":
             continue
 
@@ -219,6 +261,18 @@ def build_discounts(data: Any) -> tuple[list, list[str]]:
             problems.append(f"Discount {slot} excluded: amount given but name missing")
             continue
 
+        if raw_flag == "":
+            # Backward-compatible default -- not a problem, not a warning.
+            flag = DISCOUNT_FLAG_PERCENT
+        elif raw_flag in VALID_DISCOUNT_FLAGS:
+            flag = raw_flag
+        else:
+            problems.append(
+                f"Discount {slot} excluded: flag {raw_flag!r} is not one of "
+                f"{', '.join(VALID_DISCOUNT_FLAGS)}"
+            )
+            continue
+
         try:
             amount = float(raw_amount)
         except (TypeError, ValueError):
@@ -227,11 +281,16 @@ def build_discounts(data: Any) -> tuple[list, list[str]]:
             )
             continue
 
-        # The amount is a fraction already (5% = 0.05), so it is never > 1.0.
-        if amount <= _MIN_DISCOUNT_AMOUNT or amount > _MAX_DISCOUNT_AMOUNT:
+        minimum, maximum = _DISCOUNT_RANGES[flag]
+        if amount <= minimum or amount > maximum:
+            range_description = (
+                "0-1 (fraction, so 5% = 0.05)"
+                if flag == DISCOUNT_FLAG_PERCENT
+                else f"0-{maximum:g} (pounds)"
+            )
             problems.append(
-                f"Discount {slot} excluded: amount {amount} is out of range 0-1 "
-                f"(fraction, so 5% = 0.05)"
+                f"Discount {slot} excluded: {flag} amount {amount} is out of "
+                f"range {range_description}"
             )
             continue
 
@@ -240,6 +299,7 @@ def build_discounts(data: Any) -> tuple[list, list[str]]:
                 "title": name,
                 "amount": amount,
                 "ordering": slot - 1,
+                "isPercent": flag == DISCOUNT_FLAG_PERCENT,
                 **_DISCOUNT_DEFAULTS,
             }
         )

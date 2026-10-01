@@ -81,9 +81,11 @@ KNOWN_WARNINGS: tuple[KnownWarning, ...] = (
         key="discount_excluded",
         description=(
             "A discount slot in the HubSpot payload was malformed -- a missing "
-            "name/amount pair, an unparseable amount, or an amount outside the "
-            "0-1 fraction range. The discount was excluded from the plan; "
-            "everything else was previewed as normal."
+            "name/amount pair, an invalid flag value, or an amount outside its "
+            "flag's valid range (0-1 as a fraction for a percent discount, "
+            "0-5000 pounds for a fixed one; a slot with no flag defaults to "
+            "percent and is not itself a problem). The discount was excluded "
+            "from the plan; everything else was previewed as normal."
         ),
         error_codes=(ERROR_DISCOUNT_EXCLUDED,),
     ),
