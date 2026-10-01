@@ -266,6 +266,198 @@ class BuildDiscountsTests(unittest.TestCase):
         self.assertEqual(len(problems), 1)
 
 
+# --------------------------------------------------------------------------- #
+# The generalisation: 10 slots (not 3), each optionally flagged "percent" or
+# "fixed". Flag absent/empty defaults to "percent" -- the backward-compatible
+# path every pre-existing HubSpot branch relies on.
+# --------------------------------------------------------------------------- #
+class GeneralizedDiscountSlotTests(unittest.TestCase):
+    def test_all_ten_slots_filled_with_a_mix_of_types_resolve_correctly(self):
+        overrides = {}
+        for slot in range(1, 11):
+            overrides[f"discount_{slot}_name"] = f"Slot {slot}"
+            if slot % 3 == 0:
+                # Every third slot is an explicit fixed-amount discount.
+                overrides[f"discount_{slot}_amount"] = "10.00"
+                overrides[f"discount_{slot}_flag"] = "fixed"
+            elif slot % 3 == 1:
+                # Explicit percent.
+                overrides[f"discount_{slot}_amount"] = "0.05"
+                overrides[f"discount_{slot}_flag"] = "percent"
+            else:
+                # Flag omitted entirely -- defaults to percent.
+                overrides[f"discount_{slot}_amount"] = "0.10"
+
+        discounts, problems = flatten.build_discounts(flat_payload(**overrides))
+
+        self.assertEqual(problems, [])
+        self.assertEqual(len(discounts), 10)
+        self.assertEqual([d["ordering"] for d in discounts], list(range(10)))
+        self.assertEqual(
+            [d["title"] for d in discounts], [f"Slot {n}" for n in range(1, 11)]
+        )
+        # slot%3==0 (3,6,9) are fixed; everything else is percent (explicit
+        # or defaulted).
+        expected_is_percent = [(n % 3) != 0 for n in range(1, 11)]
+        self.assertEqual([d["isPercent"] for d in discounts], expected_is_percent)
+
+    def test_a_gap_in_the_middle_keeps_slot_based_ordering_with_no_warnings(self):
+        discounts, problems = flatten.build_discounts(
+            flat_payload(
+                discount_1_name="First",
+                discount_1_amount="0.05",
+                # slots 2-8 left entirely empty
+                discount_9_name="Near The End",
+                discount_9_amount="0.10",
+                discount_10_name="Last",
+                discount_10_amount="15.00",
+                discount_10_flag="fixed",
+            )
+        )
+
+        self.assertEqual(problems, [])
+        self.assertEqual([d["ordering"] for d in discounts], [0, 8, 9])
+        self.assertEqual(
+            [d["title"] for d in discounts], ["First", "Near The End", "Last"]
+        )
+
+    def test_a_flag_absent_slot_defaults_to_percent_with_no_warning(self):
+        """THE key backward-compatibility case: every HubSpot branch built
+        before this generalisation never sent a flag at all.
+        """
+        discounts, problems = flatten.build_discounts(
+            flat_payload(discount_5_name="Legacy Branch", discount_5_amount="0.075")
+        )
+
+        self.assertEqual(problems, [])
+        self.assertEqual(len(discounts), 1)
+        self.assertIs(discounts[0]["isPercent"], True)
+        self.assertEqual(discounts[0]["amount"], 0.075)
+
+    def test_an_explicit_percent_flag_behaves_identically_to_absent(self):
+        with_flag, problems_with = flatten.build_discounts(
+            flat_payload(
+                discount_1_name="X", discount_1_amount="0.075", discount_1_flag="percent"
+            )
+        )
+        without_flag, problems_without = flatten.build_discounts(
+            flat_payload(discount_1_name="X", discount_1_amount="0.075")
+        )
+
+        self.assertEqual(problems_with, [])
+        self.assertEqual(problems_without, [])
+        self.assertEqual(with_flag, without_flag)
+
+    def test_a_fixed_flag_discount_resolves_with_isPercent_false(self):
+        discounts, problems = flatten.build_discounts(
+            flat_payload(
+                discount_1_name="Equipment Fee",
+                discount_1_amount="25.50",
+                discount_1_flag="fixed",
+            )
+        )
+
+        self.assertEqual(problems, [])
+        self.assertEqual(len(discounts), 1)
+        self.assertIs(discounts[0]["isPercent"], False)
+        self.assertEqual(discounts[0]["amount"], 25.50)
+
+    def test_an_invalid_flag_value_is_excluded_and_warned_about(self):
+        discounts, problems = flatten.build_discounts(
+            flat_payload(
+                discount_1_name="Typo",
+                discount_1_amount="0.05",
+                discount_1_flag="percentage",  # not "percent"
+            )
+        )
+
+        self.assertEqual(discounts, [])
+        self.assertEqual(len(problems), 1)
+        self.assertIn("Discount 1", problems[0])
+        self.assertIn("percentage", problems[0])
+        self.assertIn("percent", problems[0])
+        self.assertIn("fixed", problems[0])
+
+    def test_a_percent_amount_above_one_is_excluded_and_warned_about(self):
+        discounts, problems = flatten.build_discounts(
+            flat_payload(
+                discount_1_name="Oops",
+                discount_1_amount="1.5",
+                discount_1_flag="percent",
+            )
+        )
+
+        self.assertEqual(discounts, [])
+        self.assertEqual(len(problems), 1)
+        self.assertIn("Discount 1", problems[0])
+        self.assertIn("out of range", problems[0])
+        self.assertIn("1.5", problems[0])
+
+    def test_a_fixed_amount_above_5000_is_excluded_and_warned_about(self):
+        discounts, problems = flatten.build_discounts(
+            flat_payload(
+                discount_1_name="Too Much",
+                discount_1_amount="5000.01",
+                discount_1_flag="fixed",
+            )
+        )
+
+        self.assertEqual(discounts, [])
+        self.assertEqual(len(problems), 1)
+        self.assertIn("Discount 1", problems[0])
+        self.assertIn("out of range", problems[0])
+        self.assertIn("5000.01", problems[0])
+
+    def test_a_fixed_amount_of_exactly_5000_is_allowed(self):
+        discounts, problems = flatten.build_discounts(
+            flat_payload(
+                discount_1_name="Max Fee", discount_1_amount="5000", discount_1_flag="fixed"
+            )
+        )
+
+        self.assertEqual(problems, [])
+        self.assertEqual(discounts[0]["amount"], 5000.0)
+        self.assertIs(discounts[0]["isPercent"], False)
+
+    def test_a_fixed_amount_of_zero_is_rejected(self):
+        discounts, problems = flatten.build_discounts(
+            flat_payload(
+                discount_1_name="Zero", discount_1_amount="0", discount_1_flag="fixed"
+            )
+        )
+
+        self.assertEqual(discounts, [])
+        self.assertIn("out of range", problems[0])
+
+    def test_half_filled_name_only_is_excluded_and_warned_regardless_of_flag(self):
+        discounts, problems = flatten.build_discounts(
+            flat_payload(discount_4_name="Orphan Name", discount_4_flag="fixed")
+        )
+
+        self.assertEqual(discounts, [])
+        self.assertEqual(len(problems), 1)
+        self.assertIn("Discount 4", problems[0])
+        self.assertIn("amount missing", problems[0])
+
+    def test_half_filled_amount_only_is_excluded_and_warned_regardless_of_flag(self):
+        discounts, problems = flatten.build_discounts(
+            flat_payload(discount_4_amount="0.05", discount_4_flag="percent")
+        )
+
+        self.assertEqual(discounts, [])
+        self.assertEqual(len(problems), 1)
+        self.assertIn("Discount 4", problems[0])
+        self.assertIn("name missing", problems[0])
+
+    def test_an_eleventh_slot_is_ignored_entirely(self):
+        discounts, problems = flatten.build_discounts(
+            flat_payload(discount_11_name="Ghost", discount_11_amount="0.05")
+        )
+
+        self.assertEqual(discounts, [])
+        self.assertEqual(problems, [])
+
+
 class FlattenIntegrationTests(unittest.TestCase):
     def test_discounts_land_on_the_plan_part(self):
         nested = flatten.flatten_to_nested(
@@ -389,7 +581,7 @@ class HalfDayAdjustmentTests(unittest.TestCase):
             {
                 "title": "Half Day Adjustment",
                 "amount": 2.94,
-                "ordering": 3,
+                "ordering": flatten.HALF_DAY_ORDERING,
                 "fePriceModifierType": "discount",
                 "isPercent": False,
                 "origin": "custom",
@@ -446,7 +638,7 @@ class HalfDayAdjustmentTests(unittest.TestCase):
         self.assertEqual(discounts, [])
         self.assertEqual(problems, [])
 
-    def test_it_sits_at_ordering_three_after_the_percentage_slots(self):
+    def test_it_sits_at_ordering_ten_after_the_percentage_slots(self):
         discounts, problems = self.build(
             discount_1_name="Sibling",
             discount_1_amount="0.05",
@@ -459,15 +651,19 @@ class HalfDayAdjustmentTests(unittest.TestCase):
         )
 
         self.assertEqual(problems, [])
-        self.assertEqual([d["ordering"] for d in discounts], [0, 1, 2, 3])
+        self.assertEqual(
+            [d["ordering"] for d in discounts], [0, 1, 2, flatten.HALF_DAY_ORDERING]
+        )
         self.assertEqual([d["isPercent"] for d in discounts], [True, True, True, False])
         self.assertEqual(discounts[3]["title"], "Half Day Adjustment")
 
     def test_its_ordering_is_fixed_even_with_no_percentage_slots(self):
         discounts, _ = self.build(half_day_adjustment="yes", half_day_amount="2.94")
 
-        # Ordering 3 regardless of what else is present -- not compacted to 0.
-        self.assertEqual(discounts[0]["ordering"], 3)
+        # Fixed regardless of what else is present -- not compacted to 0, and
+        # always right after the LAST POSSIBLE slot (10), not the last filled
+        # one.
+        self.assertEqual(discounts[0]["ordering"], flatten.HALF_DAY_ORDERING)
 
     def test_a_bad_percentage_slot_does_not_lose_the_half_day_one(self):
         discounts, problems = self.build(
@@ -564,6 +760,43 @@ class MixedDiscountRenderingTests(unittest.TestCase):
 
         self.assertIn("\u2022 Legacy \u2014 5%", text)
 
+    def test_ten_slots_plus_half_day_all_render_correctly_in_order(self):
+        # Full pipeline: hubspot_flatten's builder -> Slack summary, with a
+        # mix of explicit percent, explicit fixed, and defaulted (flag-
+        # absent) percent slots across all 10 positions plus the half-day
+        # adjustment at ordering 10.
+        overrides = {
+            "discount_1_name": "Explicit Percent",
+            "discount_1_amount": "0.05",
+            "discount_1_flag": "percent",
+            "discount_2_name": "Defaulted Percent",
+            "discount_2_amount": "0.10",
+            # no flag on slot 2 -- defaults to percent
+            "discount_10_name": "Explicit Fixed",
+            "discount_10_amount": "12.50",
+            "discount_10_flag": "fixed",
+            "half_day_adjustment": "yes",
+            "half_day_amount": "2.94",
+        }
+        discounts, problems = flatten.build_discounts(flat_payload(**overrides))
+        self.assertEqual(problems, [])
+
+        text = self._summary(discounts)
+
+        self.assertIn("*Discounts* (4)", text)
+        # A defaulted percent slot must display IDENTICALLY to an explicit one.
+        self.assertIn("\u2022 Explicit Percent \u2014 5%", text)
+        self.assertIn("\u2022 Defaulted Percent \u2014 10%", text)
+        self.assertIn("\u2022 Explicit Fixed \u2014 \u00a312.50", text)
+        self.assertIn("\u2022 Half Day Adjustment \u2014 \u00a32.94", text)
+        # Ordering: slot 1, slot 2, slot 10, then half-day last.
+        for earlier, later in (
+            ("Explicit Percent", "Defaulted Percent"),
+            ("Defaulted Percent", "Explicit Fixed"),
+            ("Explicit Fixed", "Half Day Adjustment"),
+        ):
+            self.assertLess(text.index(earlier), text.index(later))
+
     def test_a_fixed_amount_that_is_not_a_number_reads_as_unknown(self):
         text = self._summary(
             [{"title": "Broken", "amount": None, "isPercent": False, "ordering": 3}]
@@ -637,6 +870,26 @@ class MalformedSlotWarningTests(unittest.TestCase):
 
         discounts = result.plan_body["plan"]["planParts"][0]["discounts"]
         self.assertEqual([d["title"] for d in discounts], ["Sibling"])
+
+    def test_every_kind_of_malformed_slot_warns_without_blocking(self):
+        """All four malformed-slot cases are WARNINGS, never a hard block --
+        including the new flag-typed ones."""
+        result = self.intake(
+            discount_1_name="Typo Flag",
+            discount_1_amount="0.05",
+            discount_1_flag="bogus",
+            discount_2_name="Too Big Percent",
+            discount_2_amount="1.5",
+            discount_3_name="Too Big Fixed",
+            discount_3_amount="5001",
+            discount_3_flag="fixed",
+            discount_4_name="No Amount",
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.errors, [])
+        keys = [w.key for w in result.warnings]
+        self.assertEqual(keys.count("discount_excluded"), 4)
 
     def test_the_problem_appears_as_a_warning(self):
         result = self.intake(discount_1_name="Oops", discount_1_amount="5.0")
