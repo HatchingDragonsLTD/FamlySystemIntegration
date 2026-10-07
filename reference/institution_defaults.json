@@ -68,7 +68,9 @@
       },
       "addonProducts": {
         "mealsProductId": "8a95de4f-f080-4063-8d49-3b03fe95644c",
-        "activitiesProductId": "7de23b4b-699a-4847-9ca6-6928d70886fb"
+        "activitiesProductId": "7de23b4b-699a-4847-9ca6-6928d70886fb",
+        "halfMealsProductId": "7561cc9e-e0cb-41b5-8a83-2ce56715f600",
+        "halfActivitiesProductId": "da99c7be-7f4b-475d-b650-27a363a03fd3"
       }
     },
     "HDWEST": {

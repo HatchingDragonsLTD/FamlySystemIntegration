@@ -25,7 +25,7 @@ from unittest import mock
 from actions.plan_write import hubspot_flatten as flatten
 from actions.plan_write import hubspot_intake, input_schema, runner
 from actions.read_child_plans.runner import parse_plan
-from integrations import slack
+from integrations import catalogue, slack
 
 logging.disable(logging.CRITICAL)
 
@@ -34,12 +34,17 @@ SESSION = "00000000-0000-0000-0000-000000000005"
 SCHEDULE = "00000000-0000-0000-0000-000000000003"
 PRODUCT_1 = "aaaaaaaa-0000-0000-0000-000000000001"
 PRODUCT_2 = "bbbbbbbb-0000-0000-0000-000000000002"
+HALF_1 = "cccccccc-1111-0000-0000-000000000001"  # "(1/2) Meals & Snacks"
+HALF_2 = "dddddddd-2222-0000-0000-000000000002"  # "(1/2) Educational ... Extras"
 
 # Session-booking resolution is not what this file is about (see
 # test_session_catalogue.py and test_session_booking.py for that), so every
 # slot for this institution resolves to the same SESSION UUID regardless of
 # funded/meals/activities -- these tests only care about day distribution.
 INSTITUTION = "HDCITY"
+# A second institution whose addonProducts has the full pair but NO half pair
+# (e.g. no "(1/2)" products exist in Famly for it yet).
+NO_HALF_INSTITUTION = "HDNOHALF"
 SLOT = "full_day"
 
 
@@ -48,19 +53,16 @@ def _slot_map(uuid_value):
 
 
 def _full_session_catalogue(uuid_value):
-    return {
-        "institutions": {
-            INSTITUTION: {
-                "funded": {
-                    "with_meals_and_activities": _slot_map(uuid_value),
-                    "no_meals": _slot_map(uuid_value),
-                    "no_activities": _slot_map(uuid_value),
-                    "neither": _slot_map(uuid_value),
-                },
-                "non_funded": _slot_map(uuid_value),
-            }
-        }
+    entry = {
+        "funded": {
+            "with_meals_and_activities": _slot_map(uuid_value),
+            "no_meals": _slot_map(uuid_value),
+            "no_activities": _slot_map(uuid_value),
+            "neither": _slot_map(uuid_value),
+        },
+        "non_funded": _slot_map(uuid_value),
     }
+    return {"institutions": {INSTITUTION: entry, NO_HALF_INSTITUTION: entry}}
 
 
 BILLING_PROFILE = "cccccccc-0000-0000-0000-000000000099"
@@ -75,21 +77,25 @@ def _institution_defaults(institution) -> dict:
         "billingTitle": "Monthly",
         "billingInvoices": "ADVANCE",
     }
+
+    def entry(addon_products):
+        return {
+            "ruleGroupId": "01RULEGROUP0000000000000000",
+            "schedules": {"all_year_round": bucket, "term_only": bucket},
+            "addonProducts": addon_products,
+        }
+
+    # Reuses the same PRODUCT_1/PRODUCT_2 constants every test below already
+    # asserts against, so resolving via institution_defaults (instead of
+    # reading product_1_id/product_2_id straight from the payload) needs no
+    # other change to this file's expectations.
+    full_pair = {"mealsProductId": PRODUCT_1, "activitiesProductId": PRODUCT_2}
+    half_pair = {"halfMealsProductId": HALF_1, "halfActivitiesProductId": HALF_2}
+
     return {
         "institutions": {
-            institution: {
-                "ruleGroupId": "01RULEGROUP0000000000000000",
-                "schedules": {"all_year_round": bucket, "term_only": bucket},
-                # Reuses the same PRODUCT_1/PRODUCT_2 constants every test
-                # below already asserts against, so resolving via
-                # institution_defaults (instead of reading product_1_id/
-                # product_2_id straight from the payload) needs no other
-                # change to this file's expectations.
-                "addonProducts": {
-                    "mealsProductId": PRODUCT_1,
-                    "activitiesProductId": PRODUCT_2,
-                },
-            }
+            institution: entry({**full_pair, **half_pair}),
+            NO_HALF_INSTITUTION: entry(full_pair),
         }
     }
 
@@ -279,98 +285,219 @@ class HubspotProductIdsAreIgnoredTests(unittest.TestCase):
         self.assertEqual(errors_of(flat_payload(addon_quantity="1", product_1_id=PRODUCT_1)), [])
 
 
-class FractionalQuantityTests(unittest.TestCase):
-    """addon_quantity may be fractional: round UP, then cap at three days.
+FULL = frozenset({PRODUCT_1, PRODUCT_2})
+HALF = frozenset({HALF_1, HALF_2})
 
-    A half day of add-ons still means the family receives them that day, so
-    2.5 covers three days rather than two. The cap exists because no plan
-    books products on more than three days however large the figure entered.
+MON_WED_THU_FRI = ["MONDAY", "WEDNESDAY", "THURSDAY", "FRIDAY"]
+ALL_FIVE = ["MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY"]
+
+
+class HalfDayAddonTests(unittest.TestCase):
+    """addon_quantity is days in halves: `full = min(floor(q), 3)` whole days
+    of both full products, then -- if q ends in .5 and floor(q) < 3 -- ONE
+    more day of both HALF products ("(1/2) Meals & Snacks", "(1/2)
+    Educational Activities & Extras"). Replaces the old round-up-and-cap rule,
+    under which 2.5 booked three FULL days.
     """
 
-    def days_with_products(self, quantity, booked):
+    def plan(self, quantity, booked=None, **overrides):
+        """[(day, product-id set)] in booking order, plus the errors."""
         payload = flat_payload(
-            days={day.lower(): SLOT for day in booked},
+            days={day.lower(): SLOT for day in (booked or MON_WED_THU_FRI)},
             addon_quantity=quantity,
+            **overrides,
         )
-        bookings = bookings_of(payload)
         ordered = []
-        for booking in bookings:
-            if booking["day"] not in ordered:
-                ordered.append(booking["day"])
-        return ordered, errors_of(payload)
+        for booking in bookings_of(payload):
+            if not ordered or ordered[-1][0] != booking["day"]:
+                ordered.append((booking["day"], set()))
+            ordered[-1][1].add(booking["productId"])
+        return [(day, frozenset(ids)) for day, ids in ordered], errors_of(payload)
 
-    def test_two_point_five_over_three_days_rounds_up_to_three(self):
-        days, errors = self.days_with_products(
-            "2.5", ["MONDAY", "WEDNESDAY", "THURSDAY"]
+    # --- each row of the rule --------------------------------------------- #
+    def test_zero_books_nothing(self):
+        days, errors = self.plan("0")
+        self.assertEqual((days, errors), ([], []))
+
+    def test_half_a_day_books_only_half_products_on_the_first_day(self):
+        days, errors = self.plan("0.5")
+        self.assertEqual(errors, [])
+        self.assertEqual(days, [("MONDAY", HALF)])
+
+    def test_one_day_books_the_full_pair_on_the_first_day(self):
+        days, errors = self.plan("1")
+        self.assertEqual(errors, [])
+        self.assertEqual(days, [("MONDAY", FULL)])
+
+    def test_one_and_a_half_is_one_full_day_then_a_half_day(self):
+        days, errors = self.plan("1.5")
+        self.assertEqual(errors, [])
+        self.assertEqual(days, [("MONDAY", FULL), ("WEDNESDAY", HALF)])
+
+    def test_two_days_books_the_full_pair_on_the_first_two_days(self):
+        days, errors = self.plan("2")
+        self.assertEqual(errors, [])
+        self.assertEqual(days, [("MONDAY", FULL), ("WEDNESDAY", FULL)])
+
+    def test_two_and_a_half_is_two_full_days_then_a_half_day(self):
+        days, errors = self.plan("2.5")
+        self.assertEqual(errors, [])
+        # Booked days are Mon/Wed/Thu/Fri, so the half lands on Thursday.
+        self.assertEqual(
+            days, [("MONDAY", FULL), ("WEDNESDAY", FULL), ("THURSDAY", HALF)]
         )
 
+    def test_three_days_books_three_full_days(self):
+        days, errors = self.plan("3")
         self.assertEqual(errors, [])
-        self.assertEqual(days, ["MONDAY", "WEDNESDAY", "THURSDAY"])
-
-    def test_three_point_five_over_four_days_caps_at_three(self):
-        days, errors = self.days_with_products(
-            "3.5", ["MONDAY", "WEDNESDAY", "THURSDAY", "FRIDAY"]
+        self.assertEqual(
+            days, [("MONDAY", FULL), ("WEDNESDAY", FULL), ("THURSDAY", FULL)]
         )
 
+    def test_three_and_a_half_is_capped_to_three_full_days_with_no_half(self):
+        days, errors = self.plan("3.5")
         self.assertEqual(errors, [])
-        # Rounds to 4, capped to 3: Friday misses out though it was available.
-        self.assertEqual(days, ["MONDAY", "WEDNESDAY", "THURSDAY"])
-
-    def test_four_point_five_over_five_days_caps_at_three(self):
-        days, errors = self.days_with_products(
-            "4.5", ["MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY"]
+        self.assertEqual(
+            days, [("MONDAY", FULL), ("WEDNESDAY", FULL), ("THURSDAY", FULL)]
         )
 
-        self.assertEqual(errors, [])
-        self.assertEqual(days, ["MONDAY", "TUESDAY", "WEDNESDAY"])
+    def test_anything_above_three_is_capped_to_three_full_days(self):
+        for quantity in ("4", "4.5", "5"):
+            days, errors = self.plan(quantity, ALL_FIVE)
+            self.assertEqual(errors, [], quantity)
+            self.assertEqual(
+                days,
+                [("MONDAY", FULL), ("TUESDAY", FULL), ("WEDNESDAY", FULL)],
+                quantity,
+            )
 
-    def test_a_whole_number_is_unaffected(self):
-        days, errors = self.days_with_products(
-            "2.0", ["MONDAY", "WEDNESDAY", "THURSDAY"]
+    def test_a_non_half_fraction_floors_with_no_half_day(self):
+        # Only a trailing .5 means a half day; 2.3 is two full days.
+        days, errors = self.plan("2.3")
+        self.assertEqual(errors, [])
+        self.assertEqual(days, [("MONDAY", FULL), ("WEDNESDAY", FULL)])
+
+    def test_quantity_fits_exactly_when_full_plus_half_equals_the_booked_days(self):
+        days, errors = self.plan("1.5", ["MONDAY", "FRIDAY"])
+        self.assertEqual(errors, [])
+        self.assertEqual(days, [("MONDAY", FULL), ("FRIDAY", HALF)])
+
+    def test_every_booking_is_one_unit(self):
+        payload = flat_payload(addon_quantity="2.5")
+        bookings = bookings_of(payload)
+
+        self.assertEqual(len(bookings), 6)  # (2 full + 1 half) days x 2 products
+        self.assertEqual({b["amount"] for b in bookings}, {1})
+
+    def test_full_products_come_before_the_half_ones(self):
+        bookings = bookings_of(flat_payload(addon_quantity="1.5"))
+
+        self.assertEqual(
+            [b["productId"] for b in bookings], [PRODUCT_1, PRODUCT_2, HALF_1, HALF_2]
         )
 
-        self.assertEqual(errors, [])
-        self.assertEqual(days, ["MONDAY", "WEDNESDAY"])
-
-    def test_exactly_three_needs_no_rounding_or_capping(self):
-        days, errors = self.days_with_products(
-            "3.0", ["MONDAY", "WEDNESDAY", "THURSDAY"]
-        )
-
-        self.assertEqual(errors, [])
-        self.assertEqual(days, ["MONDAY", "WEDNESDAY", "THURSDAY"])
-
-    def test_four_point_five_over_two_days_is_an_error(self):
-        # Capped to three, which is still more than the two days booked.
-        days, errors = self.days_with_products("4.5", ["MONDAY", "WEDNESDAY"])
+    # --- exceeds the booked days ------------------------------------------ #
+    def test_a_half_day_that_does_not_fit_is_a_hard_error(self):
+        # 2.5 = 2 full + 1 half = 3 days, but only 2 are booked.
+        days, errors = self.plan("2.5", ["MONDAY", "WEDNESDAY"])
 
         self.assertEqual(days, [])
         self.assertEqual(len(errors), 1)
+        self.assertIn("2.5 -> 2 full + 1 half", errors[0])
         self.assertIn("exceeds the number of booked days (2)", errors[0])
 
-    def test_a_bare_fraction_rounds_up_to_one(self):
-        days, errors = self.days_with_products("0.5", ["MONDAY", "WEDNESDAY"])
+    def test_half_a_day_with_no_booked_days_is_a_hard_error(self):
+        payload = flat_payload(days={}, addon_quantity="0.5")
 
-        self.assertEqual(errors, [])
-        self.assertEqual(days, ["MONDAY"])
+        self.assertEqual(bookings_of(payload), [])
+        errors = errors_of(payload)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("exceeds the number of booked days (0)", errors[0])
 
-    def test_each_selected_day_still_gets_both_products_at_one(self):
+    def test_nothing_is_booked_when_it_does_not_fit(self):
         payload = flat_payload(
-            days={
-                "monday": SLOT,
-                "wednesday": SLOT,
-                "thursday": SLOT,
-            },
-            addon_quantity="2.5",
+            days={"monday": SLOT, "wednesday": SLOT}, addon_quantity="2.5"
         )
-        bookings = bookings_of(payload)
+        # Not trimmed to the days that would fit -- nothing at all.
+        self.assertEqual(bookings_of(payload), [])
 
-        self.assertEqual(len(bookings), 6)
-        for booking in bookings:
-            self.assertEqual(booking["amount"], 1)
-        self.assertEqual(
-            {b["productId"] for b in bookings}, {PRODUCT_1, PRODUCT_2}
+    def test_a_capped_quantity_that_still_does_not_fit_is_a_hard_error(self):
+        _, errors = self.plan("3.5", ["MONDAY", "WEDNESDAY"])
+
+        self.assertEqual(len(errors), 1)
+        self.assertIn("3.5 -> 3 after capping at 3", errors[0])
+        self.assertIn("booked days (2)", errors[0])
+
+    # --- missing half products: only a problem when a half is needed ------ #
+    def test_a_missing_half_pair_is_an_error_only_when_a_half_is_needed(self):
+        days, errors = self.plan("2.5", institution=NO_HALF_INSTITUTION)
+
+        self.assertEqual(days, [])
+        self.assertEqual(len(errors), 1)
+        self.assertIn("needs a half day of add-ons", errors[0])
+        self.assertIn(NO_HALF_INSTITUTION, errors[0])
+        # Names BOTH missing products, exactly as they must be titled in Famly.
+        self.assertIn("(1/2) Meals & Snacks", errors[0])
+        self.assertIn("(1/2) Educational Activities & Extras", errors[0])
+
+    def test_half_a_day_alone_also_needs_the_half_pair(self):
+        _, errors = self.plan("0.5", institution=NO_HALF_INSTITUTION)
+
+        self.assertEqual(len(errors), 1)
+        self.assertIn("needs a half day of add-ons", errors[0])
+
+    def test_whole_days_are_unaffected_by_missing_half_products(self):
+        for quantity in ("0", "1", "2", "3", "3.5", "4.5", "2.3"):
+            days, errors = self.plan(quantity, institution=NO_HALF_INSTITUTION)
+            self.assertEqual(errors, [], quantity)
+            self.assertTrue(all(ids == FULL for _, ids in days), quantity)
+
+    def test_only_the_missing_half_is_named_when_one_of_the_pair_resolved(self):
+        resolved = {
+            "mealsProductId": PRODUCT_1,
+            "activitiesProductId": PRODUCT_2,
+            "halfMealsProductId": HALF_1,
+            "halfActivitiesProductId": None,
+        }
+        with mock.patch.object(
+            flatten.institution_defaults, "resolve_addon_products", return_value=resolved
+        ):
+            _, errors = self.plan("1.5")
+
+        self.assertEqual(len(errors), 1)
+        self.assertIn("(1/2) Educational Activities & Extras", errors[0])
+        self.assertNotIn("(1/2) Meals & Snacks", errors[0])
+
+    def test_a_missing_half_product_is_a_hard_error_not_a_warning(self):
+        nested = flatten.flatten_to_nested(
+            flat_payload(addon_quantity="1.5", institution=NO_HALF_INSTITUTION)
         )
+
+        self.assertIn(flatten.ERRORS_KEY, nested)
+        self.assertNotIn(flatten.PROBLEMS_KEY, nested)
+
+    # --- the removed half-day DISCOUNT's fields --------------------------- #
+    def test_half_day_discount_fields_never_turn_a_whole_quantity_into_a_half(self):
+        plain, plain_errors = self.plan("2")
+        noisy, noisy_errors = self.plan(
+            "2", half_day_adjustment="yes", half_day_amount="2.94"
+        )
+
+        self.assertEqual(noisy, plain)
+        self.assertEqual(noisy_errors, plain_errors)
+
+    def test_half_day_discount_fields_alone_book_nothing(self):
+        payload = flat_payload(half_day_adjustment="yes", half_day_amount="3.53")
+
+        self.assertEqual(bookings_of(payload), [])
+        self.assertEqual(errors_of(payload), [])
+
+    # --- bad input -------------------------------------------------------- #
+    def test_non_finite_quantities_are_not_numbers(self):
+        for quantity in ("nan", "inf", "-inf"):
+            _, errors = self.plan(quantity)
+            self.assertEqual(len(errors), 1, quantity)
+            self.assertIn("not a number", errors[0])
 
 
 class ProductHardErrorTests(unittest.TestCase):
@@ -525,6 +652,46 @@ class ProductPreviewTests(unittest.TestCase):
         self.assertEqual(len(sent), 4)
         self.assertEqual(sorted({b["day"] for b in sent}), ["MONDAY", "WEDNESDAY"])
 
+    def test_a_half_day_previews_and_sends_the_half_products(self):
+        result = self.intake(addon_quantity="2.5")
+
+        self.assertTrue(result.ok)
+        self.assertEqual(len(self.calls), 1)
+
+        sent = self.calls[0]["plan"]["planParts"][0]["productBookings"]
+        self.assertEqual(
+            [(b["day"], b["productId"], b["amount"]) for b in sent],
+            [
+                ("MONDAY", PRODUCT_1, 1),
+                ("MONDAY", PRODUCT_2, 1),
+                ("WEDNESDAY", PRODUCT_1, 1),
+                ("WEDNESDAY", PRODUCT_2, 1),
+                ("THURSDAY", HALF_1, 1),
+                ("THURSDAY", HALF_2, 1),
+            ],
+        )
+
+    def test_a_half_day_that_does_not_fit_blocks_with_no_famly_call(self):
+        result = self.intake(
+            days={"monday": SLOT, "wednesday": SLOT}, addon_quantity="2.5"
+        )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(self.calls, [])
+        self.assertTrue(any("2.5 -> 2 full + 1 half" in e for e in result.errors))
+
+    def test_a_missing_half_product_blocks_only_a_half_day_request(self):
+        blocked = self.intake(addon_quantity="2.5", institution=NO_HALF_INSTITUTION)
+
+        self.assertFalse(blocked.ok)
+        self.assertEqual(self.calls, [])
+        self.assertTrue(any("(1/2) Meals & Snacks" in e for e in blocked.errors))
+
+        allowed = self.intake(addon_quantity="2", institution=NO_HALF_INSTITUTION)
+
+        self.assertTrue(allowed.ok)
+        self.assertEqual(len(self.calls), 1)
+
     def test_a_funded_deal_previews_with_no_product_bookings(self):
         result = self.intake(funded="true")
 
@@ -574,6 +741,81 @@ class ProductSummaryTests(unittest.TestCase):
     def test_an_unresolved_product_falls_back_to_its_uuid(self):
         text = self._summary({})
         self.assertIn(f"• Monday — 1× {PRODUCT_1}", text)
+
+    # --- half-day products ------------------------------------------------ #
+    PRODUCT_NAMES = {
+        PRODUCT_1: "Meals & Snacks",
+        PRODUCT_2: "Educational Activities & Extras",
+        HALF_1: "(1/2) Meals & Snacks",
+        HALF_2: "(1/2) Educational Activities & Extras",
+    }
+
+    def _two_and_a_half_day_plan(self):
+        """A plan built from what hubspot_flatten ACTUALLY emits for 2.5."""
+        nested = flatten.flatten_to_nested(flat_payload(addon_quantity="2.5"))
+        part = nested["planParts"][0]
+        return parse_plan(
+            {
+                "childId": CHILD,
+                "from": "2026-09-01",
+                "planParts": [
+                    {
+                        "planPartId": "pp-1",
+                        "sessionBookings": [
+                            {"sessionId": SESSION, "day": b["day"]}
+                            for b in part["sessionBookings"]
+                        ],
+                        "productBookings": part["productBookings"],
+                    }
+                ],
+            }
+        )
+
+    def test_a_two_and_a_half_day_plan_shows_two_full_days_and_one_half_day(self):
+        text = slack.build_summary(
+            self._two_and_a_half_day_plan(), [], product_titles=self.PRODUCT_NAMES
+        )
+
+        self.assertIn("*Products* (6)", text)
+        for day in ("Monday", "Wednesday"):
+            self.assertIn(f"• {day} — 1× Meals & Snacks", text)
+            self.assertIn(f"• {day} — 1× Educational Activities & Extras", text)
+        self.assertIn("• Thursday — 1× (1/2) Meals & Snacks", text)
+        self.assertIn("• Thursday — 1× (1/2) Educational Activities & Extras", text)
+        # The half day carries ONLY the half products -- no full-price lines.
+        self.assertNotIn("• Thursday — 1× Meals & Snacks", text)
+        self.assertNotIn("• Thursday — 1× Educational Activities & Extras", text)
+
+    def test_half_products_show_in_week_order_after_the_full_days(self):
+        text = slack.build_summary(
+            self._two_and_a_half_day_plan(), [], product_titles=self.PRODUCT_NAMES
+        )
+
+        self.assertLess(text.index("• Wednesday — 1× Meals"), text.index("• Thursday — 1× (1/2)"))
+
+    def test_half_products_use_catalogue_names_from_the_real_loader(self):
+        # The names come from reference/catalogue.json's `products` map via
+        # catalogue.load_titles() -- exactly what web.py hands the summary.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "catalogue.json"
+            path.write_text(
+                json.dumps({"products": self.PRODUCT_NAMES}), encoding="utf-8"
+            )
+            with mock.patch.dict("os.environ", {"FAMLY_CATALOGUE_FILE": str(path)}):
+                _, product_titles = catalogue.load_titles()
+
+        text = slack.build_summary(
+            self._two_and_a_half_day_plan(), [], product_titles=product_titles
+        )
+        self.assertIn("• Thursday — 1× (1/2) Meals & Snacks", text)
+
+    def test_a_half_product_missing_from_the_catalogue_falls_back_to_its_uuid(self):
+        names = {k: v for k, v in self.PRODUCT_NAMES.items() if k not in (HALF_1, HALF_2)}
+        text = slack.build_summary(
+            self._two_and_a_half_day_plan(), [], product_titles=names
+        )
+
+        self.assertIn(f"• Thursday — 1× {HALF_1}", text)
 
 
 if __name__ == "__main__":

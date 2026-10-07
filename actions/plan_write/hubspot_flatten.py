@@ -16,9 +16,10 @@ cannot hold arrays), and the native webhook forwards them as a flat JSON body:
                                           discount_10_amount/discount_10_flag
                                           (flag is "percent"/"fixed", optional
                                           -- see build_discounts),
-    half_day_adjustment ("yes"/"no") + half_day_amount (2.94 or 3.53),
     site_code                            (e.g. "HDCITY" -- metadata only),
-    addon_quantity                       (non-funded deals only -- see below)
+    addon_quantity                       (non-funded deals only -- whole days
+                                          plus an optional trailing half day,
+                                          e.g. 2.5; see build_product_bookings)
 
 This is the NEW contract: HubSpot sends a raw slot string per day plus
 institution/funded/meals/activities, and this module resolves each booked
@@ -112,20 +113,9 @@ DISCOUNT_FLAG_FIXED = "fixed"
 VALID_DISCOUNT_FLAGS = (DISCOUNT_FLAG_PERCENT, DISCOUNT_FLAG_FIXED)
 
 # The most days products can be booked on, however large addon_quantity is.
-# A fractional quantity rounds UP (2.5 -> 3, since a part-day of add-ons is
-# still a day the family receives them) and is then capped here.
+# `full` whole days are capped here, and a trailing half day is only ever
+# added BELOW the cap (3.5 books the same as 3) -- see build_product_bookings.
 MAX_ADDON_DAYS = 3
-
-# The half-day adjustment is a FIXED amount, not a percentage, and HubSpot
-# precomputes it -- the server does not work out the child's age. Only these
-# two values are legitimate; anything else means the upstream calculation went
-# wrong, so the discount is excluded rather than applied on trust. Its
-# ordering sits right after the LAST POSSIBLE discount slot (not the last
-# FILLED one -- it is a fixed position, same as before this generalisation),
-# so it is always derived from _DISCOUNT_SLOTS rather than hardcoded.
-HALF_DAY_TITLE = "Half Day Adjustment"
-HALF_DAY_ORDERING = len(_DISCOUNT_SLOTS)
-VALID_HALF_DAY_AMOUNTS = (2.94, 3.53)
 
 # Each flag's valid amount range, both ends exclusive-min/inclusive-max
 # (0 < amount <= max). Percent amounts arrive as a FRACTION (5% is 0.05), so
@@ -219,11 +209,11 @@ def build_discounts(data: Any) -> tuple[list, list[str]]:
     An eleventh (or further) `discount_N_*` field is never read -- only slots
     1 through 10 exist.
 
-    A further, FIXED-amount discount is appended when `half_day_adjustment` is
-    yes: see `_half_day_discount`. It is a SEPARATE mechanism from the ten
-    generalised slots, with its own fixed 2.94/3.53 validation, and carries
-    `isPercent: False`, so the two kinds coexist in the list and anything
-    reading them must check that flag rather than assume a percentage.
+    Percent and fixed discounts coexist in the list, so anything reading them
+    must check `isPercent` rather than assume a percentage. (There used to be
+    a further half-day-adjustment discount here; it was replaced by half-day
+    add-on PRODUCTS -- see `build_product_bookings`. `half_day_adjustment`/
+    `half_day_amount` are no longer read.)
 
     `ordering` is tied to the SLOT NUMBER (slot 1 -> 0, slot 10 -> 9) and is
     not compacted when a middle slot is empty, so a discount keeps its
@@ -304,100 +294,49 @@ def build_discounts(data: Any) -> tuple[list, list[str]]:
             }
         )
 
-    # The fixed-amount half-day adjustment sits after the three slots, at its
-    # own fixed ordering, whether or not any of them were filled.
-    half_day, half_day_problem = _half_day_discount(data)
-    if half_day is not None:
-        discounts.append(half_day)
-    if half_day_problem is not None:
-        problems.append(half_day_problem)
-
     return discounts, problems
 
 
-def _half_day_discount(data: dict) -> tuple[dict | None, str | None]:
-    """The fixed-amount half-day adjustment, when the deal has one.
-
-    Returns (discount, problem); at most one is ever set. Like the percentage
-    slots, a bad value is EXCLUDED and warned about rather than blocking the
-    preview -- an omitted discount is visible to the approver, whereas a wrong
-    one would quietly alter a family's bill.
-
-    `isPercent` is False here: this is pounds, not a fraction, so it must not
-    be read or displayed as a percentage.
-    """
-    if not _as_bool(data.get("half_day_adjustment")):
-        return None, None
-
-    raw_amount = _s(data.get("half_day_amount"))
-    expected = " or ".join(f"{amount:.2f}" for amount in VALID_HALF_DAY_AMOUNTS)
-
-    if raw_amount == "":
-        return None, (
-            f"Half day adjustment excluded: half_day_adjustment is yes but "
-            f"half_day_amount is missing (expected {expected})"
-        )
-
-    try:
-        amount = float(raw_amount)
-    except (TypeError, ValueError):
-        return None, (
-            f"Half day adjustment excluded: amount {raw_amount!r} is not a "
-            f"number (expected {expected})"
-        )
-
-    # Compared to the penny: these are exact figures HubSpot computed, and a
-    # near miss means the upstream calculation is wrong, not that it rounded.
-    if round(amount, 2) not in VALID_HALF_DAY_AMOUNTS:
-        # Echo what was sent, not a reformatted version of it: "3.00" reported
-        # back as "3" makes it harder to spot what was actually entered.
-        return None, (
-            f"Half day adjustment excluded: amount {raw_amount} is not a "
-            f"recognised value (expected {expected})"
-        )
-
-    return (
-        {
-            "title": HALF_DAY_TITLE,
-            "amount": amount,
-            "ordering": HALF_DAY_ORDERING,
-            "fePriceModifierType": "discount",
-            # NOT a percentage -- a fixed number of pounds.
-            "isPercent": False,
-            "origin": "custom",
-            "period": "WEEKLY",
-            "showOnInvoice": True,
-        },
-        None,
-    )
-
-
 def build_product_bookings(data: Any, booked_days: list[str]) -> tuple[list, list[str]]:
-    """Build product bookings for the first `addon_quantity` booked days.
+    """Build add-on product bookings from `addon_quantity` (days, in halves).
 
     HubSpot no longer sends `product_1_id`/`product_2_id` at all -- see the
     module docstring. `addon_quantity` alone is the only signal: when it is
     set (non-funded deals only; a funded deal sends nothing and gets no
-    product bookings), both product ids are resolved from
+    product bookings), the add-on product ids are resolved from
     `reference/institution_defaults.json` via the deal's `institution`, by
-    `integrations.institution_defaults.resolve_addon_products` (itself an
+    `integrations.institution_defaults.resolve_addon_products` (each one an
     exact, case-sensitive title match against Famly's product list -- see
-    `actions/pull_products/runner.py`). Both products are booked on each
-    selected day, one unit each.
+    `actions/pull_products/runner.py`).
 
-    Days are taken in week order (the order `_DAYS` already produced the
-    session bookings in), so "the first 3 of Mon/Wed/Thu/Fri" is Mon, Wed, Thu.
+    With `q = addon_quantity`:
 
-    `addon_quantity` may be fractional. It is rounded UP and then capped at
-    MAX_ADDON_DAYS: 2.5 -> 3, and 4.5 -> 5 -> 3. The capped figure is what the
-    day count is checked against, so 4.5 against two booked days is still an
-    error (3 > 2), while 4.5 against five booked days books the first three.
+        full = min(floor(q), MAX_ADDON_DAYS)
+        half = 1 if (q % 1 == 0.5 and floor(q) < MAX_ADDON_DAYS) else 0
 
-    UNLIKE the discount slots, a malformed product setup -- including an
-    addon-product resolution failure -- is a HARD error, not a warning. There
-    is no safe partial behaviour: capping the quantity, or guessing which of
-    the two products to drop, would silently bill the family for something
-    nobody chose. Blocking the preview is the correct outcome.
+    BOTH full products (meals, activities) are booked, `amount: 1` each, on
+    the first `full` booked days; if `half` is 1, BOTH half products
+    ("(1/2) Meals & Snacks", "(1/2) Educational Activities & Extras") are
+    booked, `amount: 1` each, on the next booked day. Days are taken in week
+    order (the order `_DAYS` already produced the session bookings in), so
+    for Mon/Wed/Thu/Fri booked, 2.5 is full products Mon+Wed and half
+    products Thu.
+
+    So 0.5 -> one half day; 2.5 -> two full + one half; 3 and 3.5 -> three
+    full (a half is never added on top of the cap); 4.5 -> three full. Any
+    other fraction (2.3) floors: only a trailing .5 means a half day.
+
+    UNLIKE the discount slots, a malformed product setup is a HARD error, not
+    a warning. There is no safe partial behaviour -- dropping a day, or
+    guessing a product, would silently bill the family for something nobody
+    chose. Blocking the preview is the correct outcome. That covers:
+
+      * an addon-product resolution failure (institution or a FULL product
+        missing);
+      * `full + half` exceeding the number of booked days;
+      * a half day being requested when the institution has no resolved half
+        products -- and ONLY then: an institution without half products
+        books whole days exactly as before.
 
     Args:
         data: the flat HubSpot payload.
@@ -426,40 +365,64 @@ def build_product_bookings(data: Any, booked_days: list[str]) -> tuple[list, lis
     except institution_defaults.InstitutionDefaultsError as exc:
         return [], [str(exc)]
 
-    product_1 = addon_products["mealsProductId"]
-    product_2 = addon_products["activitiesProductId"]
-
     try:
         raw_value = float(raw_quantity)
     except (TypeError, ValueError):
         return [], [f"addon_quantity: {raw_quantity!r} is not a number"]
 
+    # float() accepts "nan"/"inf", which have no day count to floor.
+    if not math.isfinite(raw_value):
+        return [], [f"addon_quantity: {raw_quantity!r} is not a number"]
+
     if raw_value < 0:
         return [], [f"addon_quantity ({raw_value:g}) cannot be negative"]
 
-    # Round up, then cap. A half day of add-ons still means the family gets
-    # them that day, so 2.5 covers three days; and no plan books products on
-    # more than MAX_ADDON_DAYS days whatever was entered.
-    quantity = min(math.ceil(raw_value), MAX_ADDON_DAYS)
+    whole_days = math.floor(raw_value)
+    full = min(whole_days, MAX_ADDON_DAYS)
+    half = 1 if (raw_value % 1 == 0.5 and whole_days < MAX_ADDON_DAYS) else 0
 
-    if quantity > len(booked_days):
+    if full + half > len(booked_days):
         # Report the effective figure, and how it was reached when that is not
         # simply what was typed.
-        if quantity != raw_value:
-            entered = (
-                f"addon_quantity ({raw_value:g} -> {quantity} after rounding up"
-                f"{' and capping at ' + str(MAX_ADDON_DAYS) if math.ceil(raw_value) > MAX_ADDON_DAYS else ''})"
-            )
+        if half:
+            entered = f"{raw_value:g} -> {full} full + 1 half"
+        elif raw_value != full:
+            capped = f" after capping at {MAX_ADDON_DAYS}" if raw_value > MAX_ADDON_DAYS else ""
+            entered = f"{raw_value:g} -> {full}{capped}"
         else:
-            entered = f"addon_quantity ({quantity})"
+            entered = f"{raw_value:g}"
         return [], [
-            f"{entered} exceeds the number of booked days ({len(booked_days)})"
+            f"addon_quantity ({entered}) exceeds the number of booked days "
+            f"({len(booked_days)})"
+        ]
+
+    half_meals = addon_products.get("halfMealsProductId")
+    half_activities = addon_products.get("halfActivitiesProductId")
+    if half and not (half_meals and half_activities):
+        titles = institution_defaults.ADDON_PRODUCT_TITLES
+        missing = [
+            repr(titles[field_name])
+            for field_name, value in (
+                ("halfMealsProductId", half_meals),
+                ("halfActivitiesProductId", half_activities),
+            )
+            if not value
+        ]
+        return [], [
+            f"addon_quantity ({raw_value:g}) needs a half day of add-ons, but "
+            f"institution {institution!r} has no resolved half-day product "
+            f"titled {' or '.join(missing)} (check the product exists in Famly "
+            f"with exactly that title, then run pull-products)"
         ]
 
     bookings = []
-    for day in booked_days[:quantity]:
-        for product_id in (product_1, product_2):
+    for day in booked_days[:full]:
+        for product_id in (addon_products["mealsProductId"], addon_products["activitiesProductId"]):
             bookings.append({"productId": product_id, "day": day, "amount": 1})
+
+    if half:
+        for product_id in (half_meals, half_activities):
+            bookings.append({"productId": product_id, "day": booked_days[full], "amount": 1})
 
     return bookings, []
 

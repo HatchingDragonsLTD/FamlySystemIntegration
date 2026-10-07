@@ -28,6 +28,10 @@ Structure (see reference/institution_defaults.json):
     institutions.<code>.schedules.<schedule>.billingInvoices       -> number
     institutions.<code>.addonProducts.mealsProductId               -> UUID
     institutions.<code>.addonProducts.activitiesProductId          -> UUID
+    institutions.<code>.addonProducts.halfMealsProductId           -> UUID
+                                               (optional)
+    institutions.<code>.addonProducts.halfActivitiesProductId      -> UUID
+                                               (optional)
 
 `schedule` is one of SCHEDULE_ALL_YEAR_ROUND / SCHEDULE_TERM_ONLY -- see
 `schedule_key`. `ruleGroupId` and `addonProducts` sit at the institution
@@ -219,17 +223,33 @@ def resolve_defaults(institution: str, schedule: str) -> dict:
     return result
 
 
-# The two addon-product fields resolve_addon_products checks for.
+# The addon-product fields resolve_addon_products REQUIRES (the full pair).
 _ADDON_PRODUCT_FIELDS = ("mealsProductId", "activitiesProductId")
+
+# The exact, case-sensitive Famly product title behind each addon-product
+# field -- the single source of truth, shared by `actions/pull_products` (which
+# matches on them) and `hubspot_flatten` (which names a missing one in its
+# error).
+ADDON_PRODUCT_TITLES = {
+    "mealsProductId": "Meals & Snacks",
+    "activitiesProductId": "Educational Activities & Extras",
+    "halfMealsProductId": "(1/2) Meals & Snacks",
+    "halfActivitiesProductId": "(1/2) Educational Activities & Extras",
+}
+
+# The half-day pair. OPTIONAL in the file: an institution may have no "(1/2)"
+# products in Famly (yet), and that must not stop its full pair resolving.
+# A caller that actually needs a half checks for None itself.
+_HALF_ADDON_PRODUCT_FIELDS = ("halfMealsProductId", "halfActivitiesProductId")
 
 
 def resolve_addon_products(institution: str) -> dict:
-    """The institution's two fixed add-on product ids.
+    """The institution's add-on product ids: the full pair, plus the half pair.
 
-    Written by `actions/pull_products` via an exact (case-sensitive) title
-    match against "Meals & Snacks" and "Educational Activities & Extras" --
-    see that module's docstring. Kept separate from `resolve_defaults` (see
-    the module docstring) since not every plan needs these.
+    Written by `actions/pull_products` via exact (case-sensitive) title
+    matches -- see `ADDON_PRODUCT_TITLES` and that module's docstring. Kept
+    separate from `resolve_defaults` (see the module docstring) since not
+    every plan needs these.
 
     Args:
         institution: the institution code HubSpot sends, e.g. "HDCITY".
@@ -237,12 +257,18 @@ def resolve_addon_products(institution: str) -> dict:
             `resolve_defaults`.
 
     Returns:
-        {"mealsProductId": ..., "activitiesProductId": ...}.
+        {"mealsProductId", "activitiesProductId", "halfMealsProductId",
+        "halfActivitiesProductId"}. The first two are always real ids. The
+        half pair are None when the institution has no resolved half
+        products -- NOT an error here, since only a half-day booking needs
+        them (see `hubspot_flatten.build_product_bookings`, which raises its
+        own error, naming the missing title, at that point).
 
     Raises:
         InstitutionDefaultsError: naming exactly what was missing -- the
-            institution, or which of the two ids. There is no safe fallback:
-            a wrong or guessed product id would book/bill the wrong item.
+            institution, or which of the two FULL ids. There is no safe
+            fallback: a wrong or guessed product id would book/bill the
+            wrong item.
     """
     raw = _read()
 
@@ -274,6 +300,12 @@ def resolve_addon_products(institution: str) -> dict:
         raise InstitutionDefaultsError(
             f"institution_defaults: institution {institution!r} > addonProducts "
             f"is missing {', '.join(missing)}"
+        )
+
+    for field_name in _HALF_ADDON_PRODUCT_FIELDS:
+        value = addon_products.get(field_name)
+        result[field_name] = (
+            value.strip() if isinstance(value, str) and value.strip() else None
         )
 
     return result
