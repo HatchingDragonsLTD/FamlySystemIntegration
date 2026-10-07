@@ -1,7 +1,9 @@
 """Pull Famly's live product ids for every institution into
-`reference/products_catalogue.json` (the flat id -> title display map, used
-only for Slack summaries), AND resolve each institution's two fixed add-on
-product ids into `reference/institution_defaults.json` as `addonProducts`.
+`reference/products_catalogue.json` (the flat id -> title display map --
+informational only: nothing reads it today; the Slack summary's product names
+come from the hand-maintained `products` section of `reference/catalogue.json`
+instead), AND resolve each institution's fixed add-on product ids into
+`reference/institution_defaults.json` as `addonProducts`.
 
 REST ENDPOINT CONFIRMED LIVE (2026-09-30), replacing an earlier GraphQL
 workaround (`finance.overview(...).filtersContext.products`): the FIRST build
@@ -44,6 +46,17 @@ TWO SEPARATE CONCERNS, not to be confused:
      `reference/institution_defaults.json` under `addonProducts`, NOT into
      products_catalogue.json.
 
+     The same exact match is made for the HALF-day pair, "(1/2) Meals &
+     Snacks" -> halfMealsProductId and "(1/2) Educational Activities &
+     Extras" -> halfActivitiesProductId (see `resolve_half_products`), with
+     one deliberate difference: a missing or duplicated half title is
+     reported (`half_products_failed`) but does NOT block the full pair --
+     an institution with no half products still needs its full pair
+     resolved, and a half-day booking only fails (in hubspot_flatten, naming
+     the missing title) if one is actually requested. A failed half pull also
+     leaves the halves out of what is written, so a stale half id is never
+     kept alive next to a fresh full pair.
+
 SHARED FILE, SEPARATE OWNERSHIP: `institution_defaults.json` is also written
 by `actions/pull_institution_defaults` (ruleGroupId + schedules). Each pull
 merges only ITS OWN top-level key(s) into an institution's existing entry,
@@ -80,8 +93,10 @@ DEFAULT_CATALOGUE_PATH = (
 # The two fixed, known titles this pull resolves into addonProducts. EXACT,
 # case-sensitive match only -- see the module docstring for why normalizing
 # these would be actively wrong.
-MEALS_TITLE = "Meals & Snacks"
-ACTIVITIES_TITLE = "Educational Activities & Extras"
+MEALS_TITLE = institution_defaults.ADDON_PRODUCT_TITLES["mealsProductId"]
+ACTIVITIES_TITLE = institution_defaults.ADDON_PRODUCT_TITLES["activitiesProductId"]
+HALF_MEALS_TITLE = institution_defaults.ADDON_PRODUCT_TITLES["halfMealsProductId"]
+HALF_ACTIVITIES_TITLE = institution_defaults.ADDON_PRODUCT_TITLES["halfActivitiesProductId"]
 
 
 def catalogue_path() -> Path:
@@ -122,14 +137,20 @@ class PullResult:
     institutions_pulled: list[str] = field(default_factory=list)
     institutions_skipped: dict[str, str] = field(default_factory=dict)
     institutions_failed: dict[str, str] = field(default_factory=dict)
-    # code -> {"mealsProductId", "activitiesProductId"}, for institutions
-    # whose product list resolved both fixed titles cleanly.
+    # code -> {"mealsProductId", "activitiesProductId"} (plus
+    # "halfMealsProductId"/"halfActivitiesProductId" when BOTH half titles
+    # resolved cleanly), for institutions whose product list resolved both
+    # full titles cleanly.
     addon_products: dict[str, dict] = field(default_factory=dict)
     # code -> reason, for institutions where the flat product list was
-    # fetched fine but the addon-title resolution failed (see
+    # fetched fine but the FULL-pair title resolution failed (see
     # AddonProductAnomaly). Independent of institutions_failed: a fetch
     # failure lands there instead, and skips addon resolution entirely.
     addon_products_failed: dict[str, str] = field(default_factory=dict)
+    # code -> reason, for institutions where the HALF pair did not resolve
+    # (missing or duplicated title). Reported only -- never blocks that
+    # institution's full pair; see the module docstring.
+    half_products_failed: dict[str, str] = field(default_factory=dict)
 
 
 def _normalise_institution_code(code: str) -> str:
@@ -191,8 +212,26 @@ def fetch_institution_products(
     return [row for row in (_parse_product(node) for node in products) if row is not None]
 
 
+def _match_title(products: list[ProductRow], title: str) -> str:
+    """The id of the ONE product whose title is exactly `title`.
+
+    Raises:
+        AddonProductAnomaly: zero matches, or 2+ (naming every duplicate id).
+    """
+    matches = [p for p in products if p.id and p.title == title]
+    if not matches:
+        raise AddonProductAnomaly(f"no product titled {title!r} was found")
+    if len(matches) > 1:
+        ids = ", ".join(p.id for p in matches)
+        raise AddonProductAnomaly(
+            f"{len(matches)} products are titled {title!r} (ids: {ids}) -- "
+            f"a duplicate title, not guessed at"
+        )
+    return matches[0].id
+
+
 def resolve_addon_products(products: list[ProductRow]) -> dict:
-    """Find the two fixed add-on products by EXACT title match.
+    """Find the two fixed FULL add-on products by EXACT title match.
 
     Args:
         products: one institution's full product list (as fetched by
@@ -206,23 +245,43 @@ def resolve_addon_products(products: list[ProductRow]) -> dict:
             named explicitly, including every duplicate id when there is
             more than one match. Never guessed at: see the module docstring.
     """
-
-    def _match(title: str) -> str:
-        matches = [p for p in products if p.id and p.title == title]
-        if not matches:
-            raise AddonProductAnomaly(f"no product titled {title!r} was found")
-        if len(matches) > 1:
-            ids = ", ".join(p.id for p in matches)
-            raise AddonProductAnomaly(
-                f"{len(matches)} products are titled {title!r} (ids: {ids}) -- "
-                f"a duplicate title, not guessed at"
-            )
-        return matches[0].id
-
     return {
-        "mealsProductId": _match(MEALS_TITLE),
-        "activitiesProductId": _match(ACTIVITIES_TITLE),
+        "mealsProductId": _match_title(products, MEALS_TITLE),
+        "activitiesProductId": _match_title(products, ACTIVITIES_TITLE),
     }
+
+
+def resolve_half_products(products: list[ProductRow]) -> dict:
+    """Find the two HALF-day add-on products by EXACT title match.
+
+    Same matching rules as `resolve_addon_products`, but a separate function
+    because a failure here must never block the full pair -- see the module
+    docstring. Both halves resolve or neither does: a half-day booking needs
+    the meals and activities half together, so a lone half is useless and
+    keeping it would only hide that the other is missing.
+
+    Returns:
+        {"halfMealsProductId": ..., "halfActivitiesProductId": ...}.
+
+    Raises:
+        AddonProductAnomaly: either title matched zero or 2+ products. When
+            both are bad, the message names both, so one run shows the whole
+            problem.
+    """
+    problems = []
+    resolved = {}
+    for field_name, title in (
+        ("halfMealsProductId", HALF_MEALS_TITLE),
+        ("halfActivitiesProductId", HALF_ACTIVITIES_TITLE),
+    ):
+        try:
+            resolved[field_name] = _match_title(products, title)
+        except AddonProductAnomaly as exc:
+            problems.append(str(exc))
+
+    if problems:
+        raise AddonProductAnomaly("; ".join(problems))
+    return resolved
 
 
 def _read_existing_catalogue(path: Path) -> dict:
@@ -250,7 +309,9 @@ def pull_all(
     product resolution (see `resolve_addon_products`); that is an independent
     outcome from the flat catalogue write -- a title-matching anomaly lands
     in `addon_products_failed` and never blocks or rolls back the flat
-    catalogue entry, which is written exactly as before.
+    catalogue entry, which is written exactly as before. The half-day pair
+    (`resolve_half_products`) is resolved alongside; its failure lands in
+    `half_products_failed` and never blocks the full pair.
 
     Raises:
         UnknownInstitutionError: `institutions` named a code catalogue.json's
@@ -283,6 +344,7 @@ def pull_all(
     failed: dict[str, str] = {}
     addon_products: dict[str, dict] = {}
     addon_products_failed: dict[str, str] = {}
+    half_products_failed: dict[str, str] = {}
 
     for code, entry in sites.items():
         institution_id = entry.get("institutionId") if isinstance(entry, dict) else None
@@ -321,8 +383,17 @@ def pull_all(
         written_counts[code] = len(new_products)
         pulled.append(code)
 
+        # The half pair is resolved (and any anomaly reported) independently
+        # of the full pair, so one run shows every problem -- but only ever
+        # ADDED to a cleanly resolved full pair, never the other way round.
         try:
-            addon_products[code] = resolve_addon_products(products)
+            half_ids = resolve_half_products(products)
+        except AddonProductAnomaly as exc:
+            half_ids = {}
+            half_products_failed[code] = str(exc)
+
+        try:
+            addon_products[code] = {**resolve_addon_products(products), **half_ids}
         except AddonProductAnomaly as exc:
             addon_products_failed[code] = str(exc)
 
@@ -336,6 +407,7 @@ def pull_all(
         institutions_failed=failed,
         addon_products=addon_products,
         addon_products_failed=addon_products_failed,
+        half_products_failed=half_products_failed,
     )
 
 
@@ -448,5 +520,6 @@ def summary_payload(
         ],
         "addonProductsResolved": sorted(result.addon_products),
         "addonProductsFailed": result.addon_products_failed,
+        "halfProductsFailed": result.half_products_failed,
         "backupFile": str(backup) if backup else None,
     }

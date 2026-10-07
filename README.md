@@ -575,6 +575,19 @@ only the `addonProducts` write -- the flat `products_catalogue.json` entry for
 that institution is written regardless, since it is a separate, unconditional
 concern.
 
+**Half days.** `addon_quantity` is days, in halves. `full = min(floor(q), 3)`
+whole days book both full products on the first `full` booked days; if `q` ends
+in `.5` and `floor(q) < 3`, one more booked day gets both half products,
+`"(1/2) Meals & Snacks"` -> `halfMealsProductId` and `"(1/2) Educational
+Activities & Extras"` -> `halfActivitiesProductId` (same exact-title matching).
+So 2.5 is two full days plus one half day; 3.5 and above book three full days
+(the half is never added on top of the cap); any other fraction (2.3) floors.
+`full + half` exceeding the booked days is a hard error. A missing or
+duplicated half title is reported by the pull (`halfProductsFailed`) but never
+blocks the full pair; it only fails a booking that actually needs a half, with
+an error naming the missing title. The old `half_day_adjustment` /
+`half_day_amount` discount is gone and those fields are ignored.
+
 ### Scheduling it weekly
 
 Not installed by this repo -- add a cron entry pointing at the project's

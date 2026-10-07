@@ -39,10 +39,15 @@ TERM_ONLY = {
     "billingInvoices": 12,
 }
 
-ADDON_PRODUCTS = {
+FULL_ADDON_PRODUCTS = {
     "mealsProductId": "55555555-0000-0000-0000-000000000005",
     "activitiesProductId": "66666666-0000-0000-0000-000000000006",
 }
+HALF_ADDON_PRODUCTS = {
+    "halfMealsProductId": "77777777-0000-0000-0000-000000000007",
+    "halfActivitiesProductId": "88888888-0000-0000-0000-000000000008",
+}
+ADDON_PRODUCTS = {**FULL_ADDON_PRODUCTS, **HALF_ADDON_PRODUCTS}
 
 CATALOGUE = {
     "institutions": {
@@ -53,6 +58,12 @@ CATALOGUE = {
                 "term_only": TERM_ONLY,
             },
             "addonProducts": ADDON_PRODUCTS,
+        },
+        # Full pair only: no "(1/2)" products resolved (yet) for it.
+        "HDNOHALF": {
+            "ruleGroupId": "01RULEGROUP2222222222222222",
+            "schedules": {"all_year_round": ALL_YEAR_ROUND},
+            "addonProducts": FULL_ADDON_PRODUCTS,
         },
         # An institution with a rule group but only ONE schedule captured --
         # e.g. a fresh pull that failed on the other bucket's anomaly.
@@ -192,9 +203,67 @@ class MissingFileTests(unittest.TestCase):
 # via exact product-title match (see that module's docstring).
 # --------------------------------------------------------------------------- #
 class ResolveAddonProductsTests(InstitutionDefaultsTestCase):
-    def test_a_known_institution_returns_both_ids(self):
+    def test_a_known_institution_returns_the_full_and_half_ids(self):
         result = idf.resolve_addon_products(INSTITUTION)
         self.assertEqual(result, ADDON_PRODUCTS)
+
+    def test_no_half_products_is_not_an_error_and_reads_as_none(self):
+        result = idf.resolve_addon_products("HDNOHALF")
+
+        self.assertEqual(result["mealsProductId"], FULL_ADDON_PRODUCTS["mealsProductId"])
+        self.assertEqual(
+            result["activitiesProductId"], FULL_ADDON_PRODUCTS["activitiesProductId"]
+        )
+        self.assertIsNone(result["halfMealsProductId"])
+        self.assertIsNone(result["halfActivitiesProductId"])
+
+    def test_one_half_product_resolved_reads_the_other_as_none(self):
+        only_meals = {
+            "institutions": {
+                INSTITUTION: {
+                    "addonProducts": {
+                        **FULL_ADDON_PRODUCTS,
+                        "halfMealsProductId": HALF_ADDON_PRODUCTS["halfMealsProductId"],
+                        "halfActivitiesProductId": "",
+                    }
+                }
+            }
+        }
+        path = Path(self._tmp.name) / "one_half.json"
+        path.write_text(json.dumps(only_meals), encoding="utf-8")
+
+        with mock.patch.dict("os.environ", {"INSTITUTION_DEFAULTS_FILE": str(path)}):
+            result = idf.resolve_addon_products(INSTITUTION)
+
+        self.assertEqual(result["halfMealsProductId"], HALF_ADDON_PRODUCTS["halfMealsProductId"])
+        self.assertIsNone(result["halfActivitiesProductId"])
+
+    def test_a_missing_FULL_id_is_still_an_error_even_with_halves_present(self):
+        broken = {
+            "institutions": {
+                INSTITUTION: {"addonProducts": {**HALF_ADDON_PRODUCTS, "mealsProductId": ""}}
+            }
+        }
+        path = Path(self._tmp.name) / "no_full.json"
+        path.write_text(json.dumps(broken), encoding="utf-8")
+
+        with mock.patch.dict("os.environ", {"INSTITUTION_DEFAULTS_FILE": str(path)}):
+            with self.assertRaises(idf.InstitutionDefaultsError) as ctx:
+                idf.resolve_addon_products(INSTITUTION)
+
+        self.assertIn("mealsProductId", str(ctx.exception))
+        self.assertNotIn("half", str(ctx.exception).lower())
+
+    def test_the_titles_match_what_pull_products_looks_for(self):
+        self.assertEqual(
+            idf.ADDON_PRODUCT_TITLES,
+            {
+                "mealsProductId": "Meals & Snacks",
+                "activitiesProductId": "Educational Activities & Extras",
+                "halfMealsProductId": "(1/2) Meals & Snacks",
+                "halfActivitiesProductId": "(1/2) Educational Activities & Extras",
+            },
+        )
 
     def test_matching_is_case_insensitive_and_trimmed(self):
         for variant in ("hdcity", "HdCity", "  HDCITY  "):

@@ -409,6 +409,230 @@ class WriteAddonProductsTests(PullProductsTestCase):
         self.assertTrue(self.institution_defaults_file.exists())
 
 
+def half_product_nodes():
+    """Raw REST items for the two HALF-day products."""
+    return [
+        product_node("p-half-meals", pull_products.HALF_MEALS_TITLE),
+        product_node("p-half-activities", pull_products.HALF_ACTIVITIES_TITLE),
+    ]
+
+
+def with_halves():
+    return clean_product_nodes() + half_product_nodes()
+
+
+FULL_IDS = {"mealsProductId": "p-meals", "activitiesProductId": "p-activities"}
+HALF_IDS = {
+    "halfMealsProductId": "p-half-meals",
+    "halfActivitiesProductId": "p-half-activities",
+}
+
+
+class ResolveHalfProductsTests(unittest.TestCase):
+    def rows(self, nodes):
+        return [row(n["id"], n["title"]) for n in nodes]
+
+    def test_the_titles_are_exactly_these(self):
+        self.assertEqual(pull_products.HALF_MEALS_TITLE, "(1/2) Meals & Snacks")
+        self.assertEqual(
+            pull_products.HALF_ACTIVITIES_TITLE, "(1/2) Educational Activities & Extras"
+        )
+
+    def test_both_half_titles_resolve_to_their_ids(self):
+        result = pull_products.resolve_half_products(self.rows(with_halves()))
+        self.assertEqual(result, HALF_IDS)
+
+    def test_a_missing_half_meals_title_is_an_anomaly_naming_it(self):
+        nodes = [n for n in with_halves() if n["id"] != "p-half-meals"]
+
+        with self.assertRaises(pull_products.AddonProductAnomaly) as ctx:
+            pull_products.resolve_half_products(self.rows(nodes))
+
+        message = str(ctx.exception)
+        self.assertIn("(1/2) Meals & Snacks", message)
+        self.assertNotIn("(1/2) Educational", message)
+
+    def test_a_missing_half_activities_title_is_an_anomaly_naming_it(self):
+        nodes = [n for n in with_halves() if n["id"] != "p-half-activities"]
+
+        with self.assertRaises(pull_products.AddonProductAnomaly) as ctx:
+            pull_products.resolve_half_products(self.rows(nodes))
+
+        self.assertIn("(1/2) Educational Activities & Extras", str(ctx.exception))
+
+    def test_both_missing_names_both_in_one_message(self):
+        with self.assertRaises(pull_products.AddonProductAnomaly) as ctx:
+            pull_products.resolve_half_products(self.rows(clean_product_nodes()))
+
+        message = str(ctx.exception)
+        self.assertIn("(1/2) Meals & Snacks", message)
+        self.assertIn("(1/2) Educational Activities & Extras", message)
+
+    def test_a_duplicated_half_title_is_an_anomaly_naming_the_duplicate_ids(self):
+        nodes = with_halves() + [
+            product_node("p-half-meals-dup", pull_products.HALF_MEALS_TITLE)
+        ]
+
+        with self.assertRaises(pull_products.AddonProductAnomaly) as ctx:
+            pull_products.resolve_half_products(self.rows(nodes))
+
+        message = str(ctx.exception)
+        self.assertIn("p-half-meals", message)
+        self.assertIn("p-half-meals-dup", message)
+
+    def test_matching_is_exact_and_case_sensitive(self):
+        nodes = [
+            product_node("p-1", pull_products.HALF_MEALS_TITLE.lower()),
+            product_node("p-2", pull_products.HALF_ACTIVITIES_TITLE + " "),
+        ]
+
+        with self.assertRaises(pull_products.AddonProductAnomaly):
+            pull_products.resolve_half_products(self.rows(nodes))
+
+    def test_a_full_or_funded_title_never_matches_a_half(self):
+        # "Meals & Snacks" and "(F) Meals & Snacks" are NOT "(1/2) Meals & Snacks".
+        with self.assertRaises(pull_products.AddonProductAnomaly):
+            pull_products.resolve_half_products(self.rows(clean_product_nodes()))
+
+    def test_the_half_titles_never_satisfy_the_full_pair(self):
+        # And the reverse: a half-only institution has no full pair.
+        with self.assertRaises(pull_products.AddonProductAnomaly):
+            pull_products.resolve_addon_products(self.rows(half_product_nodes()))
+
+
+class PullAllHalfProductTests(PullProductsTestCase):
+    def client_for(self, city_nodes, cw_nodes=None):
+        return FakeRest(
+            bodies={
+                CITY_ID: products_body(city_nodes),
+                CW_ID: products_body(cw_nodes if cw_nodes is not None else clean_product_nodes()),
+            }
+        )
+
+    def test_resolved_halves_ride_along_with_the_full_pair(self):
+        result = pull_products.pull_all(client=self.client_for(with_halves()))
+
+        self.assertEqual(result.addon_products["HDCITY"], {**FULL_IDS, **HALF_IDS})
+        self.assertNotIn("HDCITY", result.half_products_failed)
+        self.assertEqual(result.addon_products_failed, {})
+
+    def test_missing_halves_are_reported_but_the_full_pair_is_unaffected(self):
+        result = pull_products.pull_all(client=self.client_for(clean_product_nodes()))
+
+        # Full pair resolved and will be written, exactly as before...
+        self.assertEqual(result.addon_products["HDCITY"], FULL_IDS)
+        self.assertEqual(result.addon_products_failed, {})
+        # ...and the half anomaly is reported, per institution, by name.
+        self.assertIn("HDCITY", result.half_products_failed)
+        self.assertIn("(1/2) Meals & Snacks", result.half_products_failed["HDCITY"])
+
+    def test_a_duplicated_half_does_not_block_the_full_pair(self):
+        nodes = with_halves() + [product_node("p-dup", pull_products.HALF_MEALS_TITLE)]
+        result = pull_products.pull_all(client=self.client_for(nodes))
+
+        self.assertEqual(result.addon_products["HDCITY"], FULL_IDS)
+        self.assertIn("p-dup", result.half_products_failed["HDCITY"])
+
+    def test_the_halves_are_all_or_nothing(self):
+        # Only half meals exists: neither half is written.
+        nodes = clean_product_nodes() + half_product_nodes()[:1]
+        result = pull_products.pull_all(client=self.client_for(nodes))
+
+        self.assertEqual(result.addon_products["HDCITY"], FULL_IDS)
+        self.assertIn("HDCITY", result.half_products_failed)
+
+    def test_institutions_are_isolated_from_each_others_half_anomalies(self):
+        result = pull_products.pull_all(
+            client=self.client_for(with_halves(), cw_nodes=clean_product_nodes())
+        )
+
+        self.assertEqual(result.addon_products["HDCITY"], {**FULL_IDS, **HALF_IDS})
+        self.assertEqual(result.addon_products["HDCW"], FULL_IDS)
+        self.assertEqual(sorted(result.half_products_failed), ["HDCW"])
+
+    def test_a_broken_full_pair_still_blocks_regardless_of_halves(self):
+        broken = [n for n in with_halves() if n["title"] != pull_products.MEALS_TITLE]
+        result = pull_products.pull_all(client=self.client_for(broken))
+
+        self.assertNotIn("HDCITY", result.addon_products)
+        self.assertIn("HDCITY", result.addon_products_failed)
+        self.assertNotIn("HDCITY", result.half_products_failed)
+
+    def test_the_flat_catalogue_includes_the_half_products(self):
+        result = pull_products.pull_all(client=self.client_for(with_halves()))
+
+        flat = result.catalogue["institutions"]["HDCITY"]["products"]
+        self.assertEqual(flat["p-half-meals"], pull_products.HALF_MEALS_TITLE)
+
+    def test_the_summary_reports_half_anomalies(self):
+        result = pull_products.pull_all(client=self.client_for(clean_product_nodes()))
+        summary = pull_products.summary_payload(result)
+
+        self.assertEqual(sorted(summary["halfProductsFailed"]), ["HDCITY", "HDCW"])
+        self.assertEqual(summary["addonProductsFailed"], {})
+        self.assertEqual(summary["addonProductsResolved"], ["HDCITY", "HDCW"])
+
+
+class WriteHalfProductsTests(PullProductsTestCase):
+    def written(self):
+        return json.loads(self.institution_defaults_file.read_text(encoding="utf-8"))
+
+    def test_halves_are_written_under_addon_products(self):
+        client = FakeRest(
+            bodies={CITY_ID: products_body(with_halves()), CW_ID: products_body(with_halves())}
+        )
+        result = pull_products.pull_all(client=client)
+        pull_products.write_addon_products(result, path=self.institution_defaults_file)
+
+        self.assertEqual(
+            self.written()["institutions"]["HDCITY"]["addonProducts"],
+            {**FULL_IDS, **HALF_IDS},
+        )
+
+    def test_a_pull_with_no_halves_drops_stale_half_ids(self):
+        # A previous pull stored halves; Famly no longer has them. They must
+        # not be kept alive next to the fresh full pair.
+        self.write_existing_institution_defaults(
+            {
+                "institutions": {
+                    "HDCITY": {
+                        "ruleGroupId": "rg-keep",
+                        "addonProducts": {
+                            "mealsProductId": "old-meals",
+                            "activitiesProductId": "old-activities",
+                            "halfMealsProductId": "stale-half-meals",
+                            "halfActivitiesProductId": "stale-half-activities",
+                        },
+                    }
+                }
+            }
+        )
+        result = pull_products.pull_all(client=self.clean_client())
+        pull_products.write_addon_products(result, path=self.institution_defaults_file)
+
+        entry = self.written()["institutions"]["HDCITY"]
+        self.assertEqual(entry["addonProducts"], FULL_IDS)
+        self.assertEqual(entry["ruleGroupId"], "rg-keep")
+
+    def test_a_broken_full_pair_leaves_existing_halves_untouched_too(self):
+        existing = {
+            "mealsProductId": "old-meals",
+            "activitiesProductId": "old-activities",
+            "halfMealsProductId": "old-half-meals",
+            "halfActivitiesProductId": "old-half-activities",
+        }
+        self.write_existing_institution_defaults(
+            {"institutions": {"HDCW": {"addonProducts": existing}}}
+        )
+        broken = [n for n in with_halves() if n["title"] != pull_products.MEALS_TITLE]
+        client = self.clean_client({CW_ID: products_body(broken)})
+
+        result = pull_products.pull_all(client=client)
+        pull_products.write_addon_products(result, path=self.institution_defaults_file)
+
+        self.assertEqual(self.written()["institutions"]["HDCW"]["addonProducts"], existing)
+
+
 class MergePreservationTests(PullProductsTestCase):
     def test_a_filtered_run_never_disturbs_other_institutions_flat_catalogue(self):
         self.write_existing_products_catalogue(
