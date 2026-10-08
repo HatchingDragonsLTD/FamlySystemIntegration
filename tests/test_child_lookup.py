@@ -22,6 +22,8 @@ import contextlib
 import json
 import logging
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -677,6 +679,272 @@ class NothingIsPersistedTests(MessageFlowTestCase):
         self.assertFalse(
             [n for n, v in public.items() if isinstance(v, (dict, list, set)) and n != "__all__"]
         )
+
+
+# --------------------------------------------------------------------------- #
+# The hard total deadline
+# --------------------------------------------------------------------------- #
+class BlockingClient:
+    """A client whose `execute` hangs until released, then answers (or raises).
+
+    Stands in for a Famly that accepts the connection and then goes quiet.
+    """
+
+    def __init__(self, outcome=None, raises=None, release_after=10.0):
+        self.outcome = outcome
+        self.raises = raises
+        self.release = threading.Event()
+        self.release_after = release_after
+        self.entered = threading.Event()
+        self.calls = 0
+
+    def execute(self, query_path, variables, operation_name):
+        self.calls += 1
+        self.entered.set()
+        self.release.wait(self.release_after)
+        if self.raises is not None:
+            raise self.raises
+        return self.outcome
+
+
+def lookup_workers():
+    return [t for t in threading.enumerate() if t.name == "child-name-lookup"]
+
+
+def finish_workers(timeout=5.0):
+    """Let every abandoned worker run to completion, and wait for it."""
+    for worker in lookup_workers():
+        worker.join(timeout)
+
+
+class HardDeadlineTests(unittest.TestCase):
+    def setUp(self):
+        # Never leave a blocked worker behind, whatever a test does.
+        self.addCleanup(finish_workers)
+
+    def blocking(self, **kwargs):
+        client = BlockingClient(**kwargs)
+        self.addCleanup(client.release.set)
+        return client
+
+    def short_deadline(self, seconds=0.3):
+        patcher = mock.patch.object(child_lookup, "LOOKUP_DEADLINE_SECONDS", seconds)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_the_deadline_is_three_seconds(self):
+        self.assertEqual(child_lookup.LOOKUP_DEADLINE_SECONDS, 3)
+
+    def test_a_slow_response_falls_back_to_the_id_within_about_three_seconds(self):
+        # The REAL deadline, the REAL client, only `requests.post` stubbed: a
+        # Famly that accepts the request and then never answers. `requests`'
+        # own timeout cannot fire here (post is faked), so only the hard
+        # deadline can end the wait.
+        release = threading.Event()
+        self.addCleanup(release.set)
+        response = SimpleNamespace(
+            status_code=200,
+            text="{}",
+            json=lambda: response_for((CHILD, SECRET_NAME)),
+        )
+
+        def slow_post(*args, **kwargs):
+            release.wait(30)
+            return response
+
+        env = mock.patch.dict(
+            "os.environ",
+            {"FAMLY_ACCESS_TOKEN": "test-token", "FAMLY_PUBLIC_GRAPHQL_URL": "https://public.example/g"},
+        )
+        env.start()
+        self.addCleanup(env.stop)
+
+        with mock.patch("core.client.requests.post", side_effect=slow_post):
+            started = time.monotonic()
+            name = child_lookup.lookup_child_name(CHILD)
+            elapsed = time.monotonic() - started
+
+        self.assertIsNone(name)  # the bare-id fallback
+        self.assertGreaterEqual(elapsed, 2.5, "gave up before the deadline")
+        self.assertLess(elapsed, 4.0, "waited past the deadline")
+        # ...and the rendered line is exactly the bare-id one.
+        self.assertEqual(slack.child_line(CHILD, name), f"• Child: `{CHILD}`")
+
+    def test_the_deadline_is_total_not_per_phase(self):
+        # Connect then read, each comfortably inside 0.3s, but 0.4s together.
+        # A per-phase timeout would let this through; a total deadline cannot.
+        self.short_deadline(0.3)
+
+        class TwoPhaseClient:
+            def execute(self, query_path, variables, operation_name):
+                time.sleep(0.2)  # "connect"
+                time.sleep(0.2)  # "read"
+                return response_for((CHILD, NAME))
+
+        started = time.monotonic()
+        name = child_lookup.lookup_child_name(CHILD, client=TwoPhaseClient())
+        elapsed = time.monotonic() - started
+
+        self.assertIsNone(name)
+        self.assertLess(elapsed, 0.38)  # returned at the deadline, not after both phases
+
+    def test_a_response_inside_the_deadline_is_still_used(self):
+        self.short_deadline(1.0)
+
+        class QuickishClient:
+            def execute(self, query_path, variables, operation_name):
+                time.sleep(0.05)
+                return response_for((CHILD, NAME))
+
+        self.assertEqual(
+            child_lookup.lookup_child_name(CHILD, client=QuickishClient()), NAME
+        )
+
+    def test_an_error_inside_the_deadline_still_falls_back_through_the_worker(self):
+        self.short_deadline(1.0)
+        error = GraphQLHTTPError("HTTP 500", status_code=500, body="{}")
+
+        self.assertIsNone(
+            child_lookup.lookup_child_name(CHILD, client=FakeClient(raises=error))
+        )
+
+    def test_the_abandoned_worker_is_a_daemon_thread(self):
+        # So it can never hold up interpreter shutdown.
+        self.short_deadline(0.2)
+        client = self.blocking(outcome=response_for((CHILD, NAME)))
+
+        self.assertIsNone(child_lookup.lookup_child_name(CHILD, client=client))
+
+        workers = lookup_workers()
+        self.assertEqual(len(workers), 1)
+        self.assertTrue(workers[0].is_alive())  # abandoned, still blocked...
+        self.assertTrue(workers[0].daemon)  # ...but cannot keep the process alive
+
+    def test_a_late_answer_is_dropped_not_cached(self):
+        self.short_deadline(0.2)
+        client = self.blocking(outcome=response_for((CHILD, SECRET_NAME)))
+
+        self.assertIsNone(child_lookup.lookup_child_name(CHILD, client=client))
+        client.release.set()  # the late answer now arrives...
+        finish_workers()
+
+        # ...and is remembered by nothing: the next lookup asks again.
+        fresh = FakeClient(response_for((CHILD, NAME)))
+        self.assertEqual(child_lookup.lookup_child_name(CHILD, client=fresh), NAME)
+        self.assertEqual(len(fresh.calls), 1)
+
+    def test_only_the_exception_type_is_logged_on_expiry(self):
+        self.short_deadline(0.2)
+        client = self.blocking(outcome=response_for((CHILD, SECRET_NAME)))
+
+        with captured_logs() as lines:
+            self.assertIsNone(child_lookup.lookup_child_name(CHILD, client=client))
+            logged_at_expiry = list(lines)
+
+            # Now the stalled response finally arrives -- carrying the name.
+            client.release.set()
+            finish_workers()
+
+        text = "\n".join(logged_at_expiry)
+        self.assertIn("LookupDeadlineExceeded", text)  # the TYPE...
+        self.assertNotIn("no answer within", text)  # ...never its text
+        self.assertNotIn("Traceback", text)
+        self.assertNotIn(SECRET_NAME, text)
+        self.assertEqual(len(logged_at_expiry), 1)  # one warning, nothing else
+        # The late completion logged NOTHING further.
+        self.assertEqual(list(lines), logged_at_expiry)
+        self.assertNotIn(SECRET_NAME, "\n".join(lines))
+
+    def test_a_late_failure_that_echoes_the_name_logs_nothing_either(self):
+        self.short_deadline(0.2)
+        client = self.blocking(
+            raises=GraphQLHTTPError(f"HTTP 500 {SECRET_NAME}", status_code=500, body=SECRET_NAME)
+        )
+
+        with captured_logs() as lines:
+            self.assertIsNone(child_lookup.lookup_child_name(CHILD, client=client))
+            logged_at_expiry = list(lines)
+            client.release.set()
+            finish_workers()
+
+        self.assertEqual(list(lines), logged_at_expiry)
+        self.assertNotIn(SECRET_NAME, "\n".join(lines))
+
+    def test_a_timeout_is_the_same_fallback_as_every_other_failure(self):
+        self.short_deadline(0.2)
+        slow = self.blocking(outcome=response_for((CHILD, NAME)))
+        failed = FakeClient(raises=GraphQLHTTPError("HTTP 500", status_code=500, body="{}"))
+
+        self.assertIsNone(child_lookup.lookup_child_name(CHILD, client=slow))
+        self.assertIsNone(child_lookup.lookup_child_name(CHILD, client=failed))
+        self.assertEqual(slack.child_line(CHILD, None), f"• Child: `{CHILD}`")
+
+
+class SlowLookupInTheMessagesTests(MessageFlowTestCase):
+    """A stalled Famly must not hold up, break or leak into either message."""
+
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch.object(child_lookup, "LOOKUP_DEADLINE_SECONDS", 0.3)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(finish_workers)
+
+        self.client = BlockingClient(outcome=response_for((CHILD, SECRET_NAME)))
+        self.addCleanup(self.client.release.set)
+
+    def everything_on_disk(self):
+        return b"".join(p.read_bytes() for p in sorted(self.tmp.rglob("*")) if p.is_file())
+
+    def test_the_preview_is_posted_with_the_bare_id_and_is_not_held_up(self):
+        started = time.monotonic()
+        data, status = self.run_preview()
+        elapsed = time.monotonic() - started
+
+        self.assertEqual(status, 200)
+        self.assertTrue(data["slack_posted"])
+        self.assertLess(elapsed, 2.0)
+        self.assertEqual(self.child_line_of(self.preview_posts[-1]), f"• Child: `{CHILD}`")
+        self.assertNotIn(SECRET_NAME, self.preview_posts[-1])
+
+    def test_the_adjusted_message_is_posted_with_the_bare_id(self):
+        # Preview first with the stall released (so it gets a name), then stall
+        # the adjustment's lookup.
+        self.client.release.set()
+        data, _ = self.run_preview()
+        self.client.release.clear()
+
+        started = time.monotonic()
+        self.assertIsNone(self.adjust(data["preview_id"]))
+        elapsed = time.monotonic() - started
+
+        text = self.adjusted_posts[-1]
+        self.assertLess(elapsed, 2.0)
+        self.assertEqual(self.child_line_of(text), f"• Child: `{CHILD}`")
+        self.assertIn("Total to be billed", text)
+
+    def test_nothing_is_persisted_or_logged_when_the_stalled_answer_finally_arrives(self):
+        with captured_logs() as lines:
+            data, _ = self.run_preview()
+            self.assertIsNone(self.adjust(data["preview_id"]))
+            logged_before_release = list(lines)
+
+            self.client.release.set()  # the stalled responses arrive, with the name
+            finish_workers()
+
+        self.assertEqual(list(lines), logged_before_release)  # the late arrivals logged nothing
+        self.assertNotIn(SECRET_NAME, "\n".join(lines))
+        self.assertNotIn(SECRET_NAME.encode(), self.everything_on_disk())
+        self.assertNotIn(
+            SECRET_NAME,
+            json.dumps(preview_store.get(data["preview_id"]).__dict__, default=str),
+        )
+        self.assertNotIn(SECRET_NAME, json.dumps(data, default=str))
+        # The only thing logged about the lookups is the exception TYPE.
+        lookup_lines = [l for l in lines if "child_lookup" in l]
+        self.assertTrue(lookup_lines)
+        for line in lookup_lines:
+            self.assertIn("LookupDeadlineExceeded", line)
 
 
 if __name__ == "__main__":
