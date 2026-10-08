@@ -289,7 +289,25 @@ class BuildSummaryTests(unittest.TestCase):
 
 
 class CatalogueTests(unittest.TestCase):
-    """The local UUID -> name map that labels the Slack summary."""
+    """The local UUID -> name map that labels the Slack summary.
+
+    These tests are about the MANUAL catalogue.json maps, so the two PULLED
+    files (see test_display_names.py for those) point at paths that do not
+    exist -- otherwise the repo's real products_catalogue.json would leak into
+    every expected value.
+    """
+
+    def setUp(self):
+        absent = pathlib.Path(tempfile.gettempdir()) / "famly-test-absent-no-such-dir"
+        patcher = mock.patch.dict(
+            "os.environ",
+            {
+                "SESSION_TITLES_FILE": str(absent / "session_titles.json"),
+                "PRODUCTS_CATALOGUE_FILE": str(absent / "products_catalogue.json"),
+            },
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def _write(self, tmpdir, payload):
         path = pathlib.Path(tmpdir) / "catalogue.json"

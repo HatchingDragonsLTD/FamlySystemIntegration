@@ -35,6 +35,19 @@ Writing merges into the existing file (institutions/variants/slots this run
 did not touch are left exactly as they were) and always backs the previous
 file up first, timestamped alongside it, so a bad pull can be reverted by
 hand.
+
+SECOND OUTPUT: `reference/session_titles.json`. The RAW Famly title of EVERY
+session returned is also recorded there, keyed by uuid --
+`{"institutions": {<code>: {"sessions": {<uuid>: <title>}}}}`, mirroring
+products_catalogue.json -- including sessions whose title failed
+classification above (those are still reported as unmatched and still write
+nothing to session_catalogue.json; this file is display-only). The readable
+Slack name is derived from these raw titles at read time by
+`integrations.display_names`; nothing derived is stored. Same conventions:
+merge-not-replace, timestamped backup, per-institution isolation. It is
+DISPLAY-ONLY and therefore fails independently of the load-bearing catalogue:
+a malformed existing titles file skips the titles write (reported as
+`titlesError`) and never stops session_catalogue.json from refreshing.
 """
 
 import json
@@ -47,7 +60,7 @@ from pathlib import Path
 from typing import Any
 
 from core.rest_client import RestClient, RestHTTPError
-from integrations import catalogue, session_catalogue
+from integrations import catalogue, display_names, session_catalogue
 from integrations.catalogue import UnknownInstitutionError  # re-exported; see there
 
 logger = logging.getLogger(__name__)
@@ -104,6 +117,16 @@ class PullResult:
     institutions_pulled: list[str] = field(default_factory=list)
     institutions_skipped: dict[str, str] = field(default_factory=dict)
     institutions_failed: dict[str, str] = field(default_factory=dict)
+    # {"institutions": {...}} in the session_titles.json shape: the existing
+    # file merged with this run's raw titles. None when the existing file could
+    # not be read (see titles_error) -- then nothing is written for it.
+    titles: dict | None = None
+    titles_comment: Any = None
+    # code -> how many raw titles this run recorded for it.
+    titles_counts: dict[str, int] = field(default_factory=dict)
+    titles_error: str | None = None
+    # label -> backup path, filled in by `write_extras`.
+    extra_backups: dict[str, Path | None] = field(default_factory=dict)
 
 
 def _split_title(title: str) -> tuple[str | None, str]:
@@ -233,6 +256,27 @@ def _merge_institution(existing: Any, new_entries: dict) -> dict:
     return merged
 
 
+def _read_existing_titles(path: Path) -> tuple[dict, str | None]:
+    """(contents, error) for the current session_titles.json.
+
+    Unlike the catalogue reader this does NOT raise on a malformed file: the
+    titles are display-only, so a bad one is reported and skipped rather than
+    allowed to stop the load-bearing catalogue refresh. A missing file is
+    fine -- nothing to merge with yet.
+    """
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}, None
+    except (OSError, ValueError) as exc:
+        return {}, (
+            f"{path} exists but could not be read as JSON ({exc}); the titles "
+            f"were not written -- fix or remove it by hand"
+        )
+
+    return (raw if isinstance(raw, dict) else {}), None
+
+
 def _normalise_institution_code(code: str) -> str:
     return (code or "").strip().upper()
 
@@ -285,6 +329,20 @@ def pull_all(
         existing_institutions = {}
 
     merged_institutions = json.loads(json.dumps(existing_institutions))
+
+    existing_titles_raw, titles_error = _read_existing_titles(
+        display_names.session_titles_path()
+    )
+    existing_titles = existing_titles_raw.get("institutions")
+    merged_titles: dict | None = (
+        None
+        if titles_error
+        else json.loads(
+            json.dumps(existing_titles if isinstance(existing_titles, dict) else {})
+        )
+    )
+    titles_counts: dict[str, int] = {}
+
     written_counts: dict[str, int] = {}
     unmatched: list[UnmatchedSession] = []
     pulled: list[str] = []
@@ -304,12 +362,19 @@ def pull_all(
             continue
 
         new_entries: dict = {"funded": {}, "non_funded": {}}
+        new_titles: dict[str, str] = {}
         count = 0
 
         for session in sessions:
             title = session.get("title")
             session_id = session.get("id")
             readable_title = title if isinstance(title, str) else repr(title)
+
+            # The RAW title of every session returned, BEFORE classification:
+            # one that fails below is still recorded here (and still reported
+            # as unmatched, writing nothing to the catalogue).
+            if session_id and isinstance(title, str) and title.strip():
+                new_titles[session_id] = title
 
             if not session_id:
                 unmatched.append(
@@ -349,6 +414,16 @@ def pull_all(
         written_counts[code] = count
         pulled.append(code)
 
+        if merged_titles is not None:
+            existing_entry = merged_titles.get(code)
+            entry = dict(existing_entry) if isinstance(existing_entry, dict) else {}
+            sessions_map = entry.get("sessions")
+            sessions_map = dict(sessions_map) if isinstance(sessions_map, dict) else {}
+            sessions_map.update(new_titles)
+            entry["sessions"] = sessions_map
+            merged_titles[code] = entry
+            titles_counts[code] = len(new_titles)
+
     return PullResult(
         catalogue={"institutions": merged_institutions},
         comment=existing_raw.get("_comment"),
@@ -357,6 +432,10 @@ def pull_all(
         institutions_pulled=pulled,
         institutions_skipped=skipped,
         institutions_failed=failed,
+        titles=None if merged_titles is None else {"institutions": merged_titles},
+        titles_comment=existing_titles_raw.get("_comment"),
+        titles_counts=titles_counts,
+        titles_error=titles_error,
     )
 
 
@@ -394,6 +473,69 @@ def write_catalogue(result: PullResult, path: Path | None = None) -> Path | None
     return backup
 
 
+TITLES_COMMENT = [
+    "RAW Famly session titles per institution, kept up to date by `python",
+    "main.py pull-sessions` (or the combined `pull-references` weekly run). Do",
+    "not edit by hand -- a manual edit is overwritten for any session the next",
+    "pull returns.",
+    "",
+    "Structure: institutions.<site_code>.sessions.<session_uuid> -> the title",
+    "exactly as Famly has it, for EVERY session returned, including ones whose",
+    "title the pull could not classify (those are not in session_catalogue.json).",
+    "",
+    "DISPLAY-ONLY: nothing here chooses a session to book. The readable names in",
+    "the Slack preview are derived from these raw titles at read time by",
+    "integrations/display_names.py and are never stored. A name written by hand",
+    "in reference/catalogue.json's `sessions` map overrides the derived one.",
+    "",
+    "Point SESSION_TITLES_FILE elsewhere to override the path.",
+]
+
+
+def write_titles(result: PullResult, path: Path | None = None) -> Path | None:
+    """Back up the existing session_titles.json, then write the merged titles.
+
+    Nothing is written (and None is returned) when the existing file could not
+    be read -- see `PullResult.titles_error` -- so a corrupt file is never
+    overwritten blind.
+
+    Returns:
+        The backup path, or None when there was no existing file to back up or
+        nothing was written.
+    """
+    if result.titles is None:
+        return None
+
+    path = path or display_names.session_titles_path()
+    backup = None
+
+    if path.exists():
+        backup = backup_path(path)
+        shutil.copy2(path, backup)
+
+    payload: dict = {
+        "_comment": result.titles_comment
+        if result.titles_comment is not None
+        else TITLES_COMMENT
+    }
+    payload.update(result.titles)
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+    return backup
+
+
+def write_extras(result: PullResult) -> None:
+    """Write this pull's SECONDARY outputs (beyond session_catalogue.json).
+
+    The hook every caller -- this module's CLI and `pull-references` -- uses,
+    so a second output can never be written by one and forgotten by the other.
+    Backups land in `result.extra_backups` for the summary.
+    """
+    result.extra_backups["sessionTitles"] = write_titles(result)
+
+
 def summary_payload(
     result: PullResult, *, backup: Path | None = None, dry_run: bool = False
 ) -> dict:
@@ -415,4 +557,11 @@ def summary_payload(
             for u in result.unmatched
         ],
         "backupFile": str(backup) if backup else None,
+        "titlesStoredPerInstitution": result.titles_counts,
+        "titlesError": result.titles_error,
+        "titlesBackupFile": (
+            str(result.extra_backups["sessionTitles"])
+            if result.extra_backups.get("sessionTitles")
+            else None
+        ),
     }

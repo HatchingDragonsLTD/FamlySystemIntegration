@@ -182,5 +182,57 @@ class SummaryPayloadTests(PullReferencesTestCase):
         self.assertTrue(summary["pulls"]["sessions"]["dryRun"])
 
 
+class FakePullWithExtras(FakePull):
+    """A pull that has a SECONDARY output, like sessions and products."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.write_extras_calls = []
+
+    def write_extras(self, result):
+        self.write_extras_calls.append(result)
+
+
+class WriteExtrasHookTests(unittest.TestCase):
+    def setUp(self):
+        self.with_extras = FakePullWithExtras(result="extras-result")
+        self.without = FakePull(result="plain-result")
+        patcher = mock.patch.object(
+            pull_references,
+            "PULLS",
+            {"sessions": self.with_extras, "groups": self.without},
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_the_hook_is_called_after_write_catalogue_when_a_pull_has_one(self):
+        pull_references.pull_all_references()
+
+        self.assertEqual(self.with_extras.write_catalogue_calls, ["extras-result"])
+        self.assertEqual(self.with_extras.write_extras_calls, ["extras-result"])
+
+    def test_a_pull_without_the_hook_is_unaffected(self):
+        outcome = pull_references.pull_all_references()
+
+        self.assertEqual(self.without.write_catalogue_calls, ["plain-result"])
+        self.assertEqual(outcome.errors, {})
+
+    def test_a_dry_run_calls_neither_writer(self):
+        pull_references.pull_all_references(dry_run=True)
+
+        self.assertEqual(self.with_extras.write_catalogue_calls, [])
+        self.assertEqual(self.with_extras.write_extras_calls, [])
+
+    def test_a_failed_pull_gets_no_extras_written(self):
+        self.with_extras._raises = RuntimeError("down")
+
+        outcome = pull_references.pull_all_references()
+
+        self.assertIn("sessions", outcome.errors)
+        self.assertEqual(self.with_extras.write_extras_calls, [])
+        # ...and the other pull still ran.
+        self.assertEqual(self.without.write_catalogue_calls, ["plain-result"])
+
+
 if __name__ == "__main__":
     unittest.main()

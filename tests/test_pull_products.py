@@ -633,6 +633,55 @@ class WriteHalfProductsTests(PullProductsTestCase):
         self.assertEqual(self.written()["institutions"]["HDCW"]["addonProducts"], existing)
 
 
+class WriteExtrasTests(PullProductsTestCase):
+    """The secondary-output hook: addonProducts in institution_defaults.json.
+
+    REGRESSION: `pull-references` (the weekly cron) only ever called each
+    pull's `write_catalogue`, so it refreshed the flat products map but never
+    `addonProducts`; only `pull-products` run by hand did.
+    """
+
+    def written(self):
+        return json.loads(self.institution_defaults_file.read_text(encoding="utf-8"))
+
+    def test_write_extras_writes_addon_products_and_records_the_backup(self):
+        self.write_existing_institution_defaults({"institutions": {"HDCITY": {"ruleGroupId": "rg"}}})
+        result = pull_products.pull_all(client=self.clean_client())
+
+        pull_products.write_extras(result)
+
+        entry = self.written()["institutions"]["HDCITY"]
+        self.assertEqual(entry["addonProducts"], FULL_IDS)
+        self.assertEqual(entry["ruleGroupId"], "rg")
+        self.assertIsNotNone(result.extra_backups["addonProducts"])
+        summary = pull_products.summary_payload(result)
+        self.assertEqual(summary["addonProductsBackupFile"], str(result.extra_backups["addonProducts"]))
+
+    def test_pull_references_now_writes_addon_products(self):
+        from actions.pull_references import runner as pull_references
+
+        with mock.patch.object(pull_products, "RestClient", lambda *a, **k: self.clean_client()),              mock.patch.object(pull_references, "PULLS", {"products": pull_products}):
+            pull_references.pull_all_references()
+
+        self.assertEqual(self.written()["institutions"]["HDCITY"]["addonProducts"], FULL_IDS)
+        self.assertTrue(self.products_catalogue_file.exists())
+
+    def test_pull_references_dry_run_writes_no_addon_products(self):
+        from actions.pull_references import runner as pull_references
+
+        with mock.patch.object(pull_products, "RestClient", lambda *a, **k: self.clean_client()),              mock.patch.object(pull_references, "PULLS", {"products": pull_products}):
+            pull_references.pull_all_references(dry_run=True)
+
+        self.assertFalse(self.institution_defaults_file.exists())
+        self.assertFalse(self.products_catalogue_file.exists())
+
+    def test_the_catalogue_path_is_the_shared_definition(self):
+        from integrations import display_names
+
+        self.assertEqual(pull_products.catalogue_path(), display_names.products_catalogue_path())
+        self.assertEqual(pull_products.catalogue_path(), self.products_catalogue_file)
+
+
 class MergePreservationTests(PullProductsTestCase):
     def test_a_filtered_run_never_disturbs_other_institutions_flat_catalogue(self):
         self.write_existing_products_catalogue(

@@ -30,6 +30,8 @@ import logging
 import os
 from pathlib import Path
 
+from . import display_names
+
 logger = logging.getLogger(__name__)
 
 # reference/catalogue.json, resolved relative to the project root (this file
@@ -174,13 +176,104 @@ def resolve_site(site_code: str) -> dict | None:
     }
 
 
+def _pulled_titles(path: Path, institution_key: str, label: str) -> dict:
+    """Raw Famly titles from one pulled file, flattened across institutions.
+
+    `{"institutions": {<code>: {<institution_key>: {<uuid>: <title>}}}}` ->
+    `{<uuid>: <title>}`. UUIDs are globally unique, so the institutions can be
+    flattened; if one ever did repeat, the first seen wins.
+
+    Never raises. A missing, unreadable or malformed file logs a warning and
+    yields {} -- the caller then falls through to the next source, and a
+    preview is unaffected. Individual entries that are not a string id with a
+    non-blank string title are skipped.
+    """
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        logger.warning(
+            "Pulled %s file %s not found; names fall back to the manual "
+            "catalogue and raw ids (run the pull to create it)",
+            label,
+            path,
+        )
+        return {}
+    except (OSError, ValueError) as exc:
+        logger.warning(
+            "Could not read the pulled %s file %s (%s); names fall back to the "
+            "manual catalogue and raw ids",
+            label,
+            path,
+            exc,
+        )
+        return {}
+
+    institutions = raw.get("institutions") if isinstance(raw, dict) else None
+    if not isinstance(institutions, dict):
+        logger.warning(
+            "Pulled %s file %s has no 'institutions' object; ignoring it",
+            label,
+            path,
+        )
+        return {}
+
+    titles: dict = {}
+    for entry in institutions.values():
+        node = entry.get(institution_key) if isinstance(entry, dict) else None
+        if not isinstance(node, dict):
+            continue
+        for item_id, title in node.items():
+            if (
+                isinstance(item_id, str)
+                and isinstance(title, str)
+                and title.strip()
+                and item_id not in titles
+            ):
+                titles[item_id] = title
+    return titles
+
+
 def load_titles() -> tuple[dict, dict]:
     """Read the session and product name maps.
 
+    Each id is named by the first of these that has it:
+
+      (a) the flat `sessions` / `products` maps in catalogue.json -- kept as
+          MANUAL OVERRIDES, so a hand-written name always wins;
+      (b) the readable name DERIVED (see `display_names`) from the raw Famly
+          title in the pulled `session_titles.json` / `products_catalogue.json`;
+      (c) the raw Famly title itself -- what (b) returns when a title does not
+          parse, so the two are one lookup;
+      (d) the raw UUID -- not in these maps at all: a consumer shows an id
+          this returns nothing for as the id.
+
+    The derived names are computed here, on every call, and never stored.
+
     Returns:
-        (session_titles, product_titles). Both empty when the file is missing,
-        unreadable or malformed -- never raises, because a cosmetic lookup must
-        not cost the approver the Slack message.
+        (session_titles, product_titles). Never raises, and a missing or
+        malformed pulled file can only cost names, never the preview: it logs
+        a warning and the lookup falls through to the next source. Everything
+        is empty when no file exists at all.
     """
     raw = _read()
-    return _titles(raw.get("sessions")), _titles(raw.get("products"))
+    session_overrides = _titles(raw.get("sessions"))
+    product_overrides = _titles(raw.get("products"))
+
+    derived_sessions = {
+        uuid: display_names.session_display_name(title)
+        for uuid, title in _pulled_titles(
+            display_names.session_titles_path(), "sessions", "session titles"
+        ).items()
+    }
+    derived_products = {
+        uuid: display_names.product_display_name(title)
+        for uuid, title in _pulled_titles(
+            display_names.products_catalogue_path(), "products", "products catalogue"
+        ).items()
+    }
+
+    # Overrides last, so they win.
+    return (
+        {**derived_sessions, **session_overrides},
+        {**derived_products, **product_overrides},
+    )

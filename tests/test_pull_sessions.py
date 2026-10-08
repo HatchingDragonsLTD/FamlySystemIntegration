@@ -65,12 +65,14 @@ class PullSessionsTestCase(unittest.TestCase):
         self.catalogue_file.write_text(json.dumps(CATALOGUE), encoding="utf-8")
 
         self.session_catalogue_file = self.tmp / "session_catalogue.json"
+        self.session_titles_file = self.tmp / "session_titles.json"
 
         env = mock.patch.dict(
             "os.environ",
             {
                 "FAMLY_CATALOGUE_FILE": str(self.catalogue_file),
                 "SESSION_CATALOGUE_FILE": str(self.session_catalogue_file),
+                "SESSION_TITLES_FILE": str(self.session_titles_file),
             },
         )
         env.start()
@@ -472,6 +474,293 @@ class InstitutionFilterTests(PullSessionsTestCase):
         self.assertEqual(
             without_filter.written_counts, explicit_all.written_counts
         )
+
+
+class SessionTitlesPullTests(PullSessionsTestCase):
+    """reference/session_titles.json: the RAW Famly title of every session.
+
+    Display-only. The readable Slack name is derived from these at read time
+    (see test_display_names.py); nothing derived is ever stored here.
+    """
+
+    def titles_of(self, result, code="HDCITY"):
+        return result.titles["institutions"][code]["sessions"]
+
+    def written(self):
+        return json.loads(self.session_titles_file.read_text(encoding="utf-8"))
+
+    def test_every_returned_session_gets_its_raw_title_stored(self):
+        client = FakeRest(
+            {
+                CITY_ID: [
+                    session("s-1", "(F) Morning"),
+                    session("s-2", "(FNM) Full Day"),
+                    session("s-3", "Afternoon"),
+                ]
+            }
+        )
+
+        result = pull_sessions.pull_all(client=client, institutions=["HDCITY"])
+
+        self.assertEqual(
+            self.titles_of(result),
+            {"s-1": "(F) Morning", "s-2": "(FNM) Full Day", "s-3": "Afternoon"},
+        )
+        self.assertEqual(result.titles_counts, {"HDCITY": 3})
+
+    def test_titles_are_stored_verbatim_not_in_readable_form(self):
+        client = FakeRest({CITY_ID: [session("s-1", "(FNE) Full Day")]})
+
+        result = pull_sessions.pull_all(client=client, institutions=["HDCITY"])
+
+        self.assertEqual(self.titles_of(result), {"s-1": "(FNE) Full Day"})
+
+    def test_an_unclassifiable_session_still_gets_a_stored_title(self):
+        client = FakeRest(
+            {
+                CITY_ID: [
+                    session("s-ok", "(F) Morning"),
+                    session("s-bad", "Weekend School"),  # no slot
+                    session("s-typo", "(FX) Morning"),  # unknown prefix
+                ]
+            }
+        )
+
+        result = pull_sessions.pull_all(client=client, institutions=["HDCITY"])
+
+        # Recorded for display...
+        self.assertEqual(
+            self.titles_of(result),
+            {
+                "s-ok": "(F) Morning",
+                "s-bad": "Weekend School",
+                "s-typo": "(FX) Morning",
+            },
+        )
+        # ...and STILL reported as unmatched, writing nothing to the catalogue.
+        self.assertEqual(
+            sorted(u.session_id for u in result.unmatched), ["s-bad", "s-typo"]
+        )
+        flat = json.dumps(result.catalogue)
+        self.assertNotIn("s-bad", flat)
+        self.assertNotIn("s-typo", flat)
+
+    def test_a_session_with_no_id_or_no_usable_title_is_not_stored(self):
+        client = FakeRest(
+            {
+                CITY_ID: [
+                    {"title": "(F) Morning"},  # no id: nothing to key it by
+                    {"id": "s-blank", "title": "   "},
+                    {"id": "s-none", "title": None},
+                    session("s-ok", "Afternoon"),
+                ]
+            }
+        )
+
+        result = pull_sessions.pull_all(client=client, institutions=["HDCITY"])
+
+        self.assertEqual(self.titles_of(result), {"s-ok": "Afternoon"})
+
+    def test_existing_titles_are_merged_not_replaced(self):
+        self.session_titles_file.write_text(
+            json.dumps(
+                {
+                    "institutions": {
+                        "HDCITY": {
+                            "sessions": {
+                                "s-old": "(F) Afternoon",  # discontinued: not returned now
+                                "s-1": "stale title",
+                            }
+                        },
+                        "HDCW": {"sessions": {"s-cw": "Full Day"}},
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        client = FakeRest({CITY_ID: [session("s-1", "(F) Morning")]})
+
+        result = pull_sessions.pull_all(client=client, institutions=["HDCITY"])
+
+        self.assertEqual(
+            self.titles_of(result),
+            {"s-old": "(F) Afternoon", "s-1": "(F) Morning"},
+        )
+        # An institution this run did not touch is left exactly as it was.
+        self.assertEqual(self.titles_of(result, "HDCW"), {"s-cw": "Full Day"})
+
+    def test_one_institutions_failure_leaves_its_titles_untouched(self):
+        self.session_titles_file.write_text(
+            json.dumps({"institutions": {"HDCW": {"sessions": {"s-cw": "Full Day"}}}}),
+            encoding="utf-8",
+        )
+        client = FakeRest(
+            {
+                CITY_ID: [session("s-1", "(F) Morning")],
+                CW_ID: RestHTTPError("down", 502, "nope"),
+            }
+        )
+
+        result = pull_sessions.pull_all(client=client)
+
+        self.assertIn("HDCW", result.institutions_failed)
+        self.assertEqual(self.titles_of(result), {"s-1": "(F) Morning"})
+        self.assertEqual(self.titles_of(result, "HDCW"), {"s-cw": "Full Day"})
+        self.assertNotIn("HDCW", result.titles_counts)
+
+    def test_the_institution_filter_applies_to_titles_too(self):
+        client = FakeRest(
+            {
+                CITY_ID: [session("s-1", "(F) Morning")],
+                CW_ID: [session("s-2", "Afternoon")],
+            }
+        )
+
+        result = pull_sessions.pull_all(client=client, institutions=["HDCITY"])
+
+        self.assertEqual(list(result.titles["institutions"]), ["HDCITY"])
+
+    def test_a_site_with_no_institution_id_stores_nothing(self):
+        self.catalogue_file.write_text(
+            json.dumps({"sites": {"HDNONE": {"label": "x"}}}), encoding="utf-8"
+        )
+
+        result = pull_sessions.pull_all(client=FakeRest({}))
+
+        self.assertEqual(result.titles, {"institutions": {}})
+
+    # --- writing --------------------------------------------------------- #
+    def test_write_titles_writes_the_documented_shape(self):
+        client = FakeRest({CITY_ID: [session("s-1", "(F) Morning")]})
+        result = pull_sessions.pull_all(client=client, institutions=["HDCITY"])
+
+        backup = pull_sessions.write_titles(result)
+
+        self.assertIsNone(backup)  # first-ever write: nothing to back up
+        written = self.written()
+        self.assertEqual(
+            written["institutions"], {"HDCITY": {"sessions": {"s-1": "(F) Morning"}}}
+        )
+        self.assertIn("_comment", written)
+
+    def test_a_backup_is_made_before_the_titles_file_is_overwritten(self):
+        original = {"institutions": {"HDCITY": {"sessions": {"s-1": "old"}}}}
+        self.session_titles_file.write_text(json.dumps(original), encoding="utf-8")
+        client = FakeRest({CITY_ID: [session("s-1", "(F) Morning")]})
+        result = pull_sessions.pull_all(client=client, institutions=["HDCITY"])
+
+        backup = pull_sessions.write_titles(result)
+
+        self.assertIsNotNone(backup)
+        self.assertEqual(json.loads(backup.read_text(encoding="utf-8")), original)
+        self.assertEqual(
+            self.written()["institutions"]["HDCITY"]["sessions"]["s-1"], "(F) Morning"
+        )
+
+    def test_an_existing_comment_is_preserved(self):
+        self.session_titles_file.write_text(
+            json.dumps({"_comment": ["hello"], "institutions": {}}), encoding="utf-8"
+        )
+        result = pull_sessions.pull_all(
+            client=FakeRest({CITY_ID: [session("s-1", "Afternoon")]}),
+            institutions=["HDCITY"],
+        )
+
+        pull_sessions.write_titles(result)
+
+        self.assertEqual(self.written()["_comment"], ["hello"])
+
+    def test_the_catalogue_file_is_not_touched_by_the_titles_write(self):
+        result = pull_sessions.pull_all(
+            client=FakeRest({CITY_ID: [session("s-1", "(F) Morning")]}),
+            institutions=["HDCITY"],
+        )
+
+        pull_sessions.write_titles(result)
+
+        self.assertFalse(self.session_catalogue_file.exists())
+
+    # --- display-only: a bad titles file must not stop the catalogue ------- #
+    def test_a_malformed_titles_file_is_reported_and_never_overwritten(self):
+        self.session_titles_file.write_text("{not json", encoding="utf-8")
+        client = FakeRest({CITY_ID: [session("s-1", "(F) Morning")]})
+
+        result = pull_sessions.pull_all(client=client, institutions=["HDCITY"])
+
+        self.assertIsNone(result.titles)
+        self.assertIn("could not be read as JSON", result.titles_error)
+        self.assertIsNone(pull_sessions.write_titles(result))
+        self.assertEqual(self.session_titles_file.read_text(encoding="utf-8"), "{not json")
+
+    def test_a_malformed_titles_file_does_not_stop_the_catalogue_refresh(self):
+        self.session_titles_file.write_text("{not json", encoding="utf-8")
+        client = FakeRest({CITY_ID: [session("s-1", "(F) Morning")]})
+
+        result = pull_sessions.pull_all(client=client, institutions=["HDCITY"])
+        pull_sessions.write_catalogue(result)
+
+        self.assertEqual(result.institutions_pulled, ["HDCITY"])
+        written = json.loads(self.session_catalogue_file.read_text(encoding="utf-8"))
+        self.assertEqual(
+            written["institutions"]["HDCITY"]["funded"]["with_meals_and_activities"],
+            {"morning": "s-1"},
+        )
+        self.assertEqual(
+            pull_sessions.summary_payload(result)["titlesError"], result.titles_error
+        )
+
+    # --- the CLI and pull-references ------------------------------------- #
+    def run_cli(self, dry_run=False):
+        import argparse
+
+        from actions.pull_sessions import cli
+
+        args = argparse.Namespace(dry_run=dry_run, institution=["HDCITY"])
+        client = FakeRest({CITY_ID: [session("s-1", "(F) Morning")]})
+        with mock.patch.object(pull_sessions, "RestClient", lambda *a, **k: client):
+            return cli.handle(args)
+
+    def test_the_cli_writes_both_files(self):
+        summary = self.run_cli()
+
+        self.assertTrue(self.session_catalogue_file.exists())
+        self.assertTrue(self.session_titles_file.exists())
+        self.assertEqual(summary["titlesStoredPerInstitution"], {"HDCITY": 1})
+        self.assertIsNone(summary["titlesError"])
+
+    def test_a_dry_run_writes_neither_file_but_still_reports(self):
+        summary = self.run_cli(dry_run=True)
+
+        self.assertFalse(self.session_catalogue_file.exists())
+        self.assertFalse(self.session_titles_file.exists())
+        self.assertTrue(summary["dryRun"])
+        self.assertEqual(summary["titlesStoredPerInstitution"], {"HDCITY": 1})
+        self.assertIsNone(summary["titlesBackupFile"])
+
+    def test_pull_references_writes_the_titles_too(self):
+        from actions.pull_references import runner as pull_references
+
+        client = FakeRest({CITY_ID: [session("s-1", "(F) Morning")]})
+        with mock.patch.object(pull_sessions, "RestClient", lambda *a, **k: client), \
+             mock.patch.object(pull_references, "PULLS", {"sessions": pull_sessions}):
+            outcome = pull_references.pull_all_references(institutions=["HDCITY"])
+            summary = pull_references.summary_payload(outcome)
+
+        self.assertEqual(
+            self.written()["institutions"]["HDCITY"]["sessions"], {"s-1": "(F) Morning"}
+        )
+        self.assertEqual(summary["pulls"]["sessions"]["titlesStoredPerInstitution"], {"HDCITY": 1})
+
+    def test_pull_references_dry_run_writes_no_titles(self):
+        from actions.pull_references import runner as pull_references
+
+        client = FakeRest({CITY_ID: [session("s-1", "(F) Morning")]})
+        with mock.patch.object(pull_sessions, "RestClient", lambda *a, **k: client), \
+             mock.patch.object(pull_references, "PULLS", {"sessions": pull_sessions}):
+            pull_references.pull_all_references(institutions=["HDCITY"], dry_run=True)
+
+        self.assertFalse(self.session_titles_file.exists())
+        self.assertFalse(self.session_catalogue_file.exists())
 
 
 if __name__ == "__main__":
