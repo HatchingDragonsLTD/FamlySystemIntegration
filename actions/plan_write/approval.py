@@ -35,6 +35,7 @@ import threading
 import uuid
 from datetime import date
 
+from actions.read_child_plans.runner import current_monthly_estimate
 from core.config import ConfigError, load_config
 from core.rest_client import RestHTTPError
 from integrations import slack
@@ -541,7 +542,10 @@ def _complete_adjustment(
         )
         return
 
-    estimate = getattr(result.plan, "monthly_estimate", None) if result.plan else None
+    # The base the adjustment is added to: the pricing period covering today,
+    # the same one the adjustment's pricing group came from. The plan-level
+    # estimate only mirrors the FIRST period.
+    estimate = current_monthly_estimate(result.plan) if result.plan else None
     new_preview_id = str(uuid.uuid4())
 
     # Record the adjustment in the plan's own note, so it is traceable inside

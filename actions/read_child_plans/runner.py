@@ -34,6 +34,7 @@ the top-level Plan (and on the result) so anything not modelled is reachable.
 """
 
 from dataclasses import dataclass, field
+from datetime import date, datetime
 from typing import Any
 
 from core.rest_client import RestClient
@@ -43,6 +44,16 @@ PLANS_PATH = "v2/plans/"
 
 # The endpoint is versioned by query param, not by path.
 DEFAULT_VERSION = 3
+
+
+def _parse_iso_date(value: Any) -> date | None:
+    """An ISO date (or the date part of an ISO datetime), else None."""
+    if not isinstance(value, str) or len(value.strip()) < 10:
+        return None
+    try:
+        return date.fromisoformat(value.strip()[:10])
+    except ValueError:
+        return None
 
 
 # --------------------------------------------------------------------------- #
@@ -91,6 +102,13 @@ class PlanState:
     to: str | None = None
     plan_part_states: list[PlanPartState] = field(default_factory=list)
     raw: dict = field(default_factory=dict)
+    # This period's own figures. Each period is priced under its own pricing
+    # group (e.g. the rate moves when the child changes age group), so these
+    # differ between periods; the plan-level `monthlyEstimate`/`publicFunding`
+    # are only a mirror of the FIRST period (confirmed against live plans).
+    monthly_estimate: Any | None = None
+    pricing_group_id: str | None = None
+    public_funding: "PublicFunding | None" = None
 
     @property
     def weekly_total(self) -> float | None:
@@ -182,17 +200,89 @@ class Plan:
         """The plan's part IDs -- an edit needs these to target a part."""
         return [p.plan_part_id for p in self.plan_parts if p.plan_part_id]
 
+    def current_plan_state(self, today: date | None = None) -> "PlanState | None":
+        """The pricing period (`planState`) that covers `today`.
+
+        A plan has one `planState` per pricing period -- more than one means
+        the rate changes mid-plan (live plans routinely have two, e.g. when
+        the child moves to the next age group). The FIRST one is often not the
+        one in force: of 21 live plans checked, 3 had a first period that had
+        already ended. Everything that quotes or adjusts a price has to use the
+        period that applies today.
+
+        Rules, in order:
+
+          * the period where `from <= today` and (`to` is null or
+            `to >= today`) -- if periods ever overlap, the latest-starting one;
+          * the whole plan is in the future -> the first period;
+          * no period covers today but some have started (every period is in
+            the past, or today falls in a gap between two) -> the most recently
+            started period, i.e. the last one when every period is past;
+          * no period carries a usable `from` date (or the plan has no periods
+            at all) -> the first period / None, i.e. the old behaviour.
+
+        Args:
+            today: injectable so tests are deterministic; defaults to
+                `date.today()`.
+        """
+        if not self.plan_states:
+            return None
+
+        if isinstance(today, datetime):
+            today = today.date()
+        today = today or date.today()
+
+        dated = [
+            (start, state)
+            for state in self.plan_states
+            if (start := _parse_iso_date(state.from_)) is not None
+        ]
+        if not dated:
+            return self.plan_states[0]
+
+        started = [(start, state) for start, state in dated if start <= today]
+        if not started:
+            return self.plan_states[0]
+
+        covering = [
+            (start, state)
+            for start, state in started
+            if not state.to or ((end := _parse_iso_date(state.to)) is not None and end >= today)
+        ]
+        # Latest-starting wins; max() keeps the earlier entry on a tie, so key
+        # on the date only.
+        pool = covering or started
+        return max(pool, key=lambda pair: pair[0])[1]
+
+    def current_monthly_estimate(self, today: date | None = None) -> Any | None:
+        """The monthly estimate for the period covering `today`.
+
+        The plan-level `monthly_estimate` only mirrors the FIRST period, so it
+        is the wrong base for anything quoted today on a multi-period plan.
+        Falls back to the plan-level figure when the period carries none.
+        """
+        state = self.current_plan_state(today)
+        if state is not None and state.monthly_estimate is not None:
+            return state.monthly_estimate
+        return self.monthly_estimate
+
+    def current_public_funding(self, today: date | None = None) -> PublicFunding | None:
+        """Public funding for the period covering `today` (plan-level fallback)."""
+        state = self.current_plan_state(today)
+        if state is not None and state.public_funding is not None:
+            return state.public_funding
+        return self.public_funding
+
     @property
     def active_pricing_group_id(self) -> str | None:
-        """The pricing group whose prices apply to this plan.
+        """The pricing group whose prices apply to this plan TODAY.
 
-        From the plan itself, falling back to the first plan state (the current
-        period) when the plan node does not carry it. Prices are per pricing
-        group, so anything reading or writing a price must name this one.
+        Prices are per pricing group, so anything reading or writing a price
+        must name this one. See `pricing_group_source` for how it is chosen.
         """
         return self.pricing_group_source()[0]
 
-    def pricing_group_source(self) -> tuple[str | None, str]:
+    def pricing_group_source(self, today: date | None = None) -> tuple[str | None, str]:
         """The active pricing group and WHERE it came from.
 
         Three sources, most authoritative first. The source matters when an
@@ -200,14 +290,22 @@ class Plan:
         group the plan is not actually priced under is accepted by Famly and
         then does nothing, so knowing which of these answered is the first
         thing to check.
+
+        The group is per PERIOD, so the first source is the period covering
+        `today` (`current_plan_state`) -- never another period's group. (Live
+        plans carry no plan-level `pricingGroupId`; if one ever does, it still
+        ranks below the current period's own group.)
         """
+        state = self.current_plan_state(today)
+        if state is not None:
+            group = state.pricing_group_id
+            if not group and isinstance(state.raw, dict):
+                group = state.raw.get("pricingGroupId")
+            if group:
+                return group, "planStates[].pricingGroupId"
+
         if self.pricing_group_id:
             return self.pricing_group_id, "plan.pricingGroupId"
-
-        for state in self.plan_states:
-            raw = getattr(state, "raw", None)
-            if isinstance(raw, dict) and raw.get("pricingGroupId"):
-                return raw["pricingGroupId"], "planStates[].pricingGroupId"
 
         # Last resort: the group the plan's own prices are keyed under. If the
         # two ever disagree, THIS is the one the money is expressed in.
@@ -365,6 +463,9 @@ def _parse_plan_states(node: Any) -> list[PlanState]:
             to=s.get("to"),
             plan_part_states=_parse_plan_part_states(s.get("planPartStates")),
             raw=s,
+            monthly_estimate=s.get("monthlyEstimate"),
+            pricing_group_id=s.get("pricingGroupId"),
+            public_funding=_parse_public_funding(s.get("publicFunding")),
         )
         for s in node
         if isinstance(s, dict)
@@ -456,6 +557,19 @@ def parse_plan(node: Any) -> Plan:
         else [],
         raw=node,
     )
+
+
+def current_monthly_estimate(plan: Any, today: date | None = None) -> Any | None:
+    """A plan's monthly estimate for the period covering `today`.
+
+    The one accessor the write path (stored baseline, adjustment base) uses, so
+    they cannot disagree. Duck-typed: a stand-in that is not a `Plan` (tests,
+    or anything else with only a plain `monthly_estimate`) is read as before.
+    """
+    method = getattr(plan, "current_monthly_estimate", None)
+    if callable(method):
+        return method(today)
+    return getattr(plan, "monthly_estimate", None)
 
 
 def _parse_sessions(node: Any) -> list[SessionRef]:

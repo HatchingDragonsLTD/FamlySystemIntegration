@@ -39,6 +39,7 @@ import hmac
 import json
 import logging
 import time
+from datetime import date
 from typing import Any
 from urllib.parse import parse_qs
 
@@ -199,13 +200,20 @@ def _discount_amount(discount: dict) -> str:
     return _percent(amount)
 
 
-def _active_pricing_group(plan: Any) -> str | None:
-    """The pricing group whose prices apply to this plan.
+def _active_pricing_group(plan: Any, today: date | None = None) -> str | None:
+    """The pricing group whose prices apply to this plan today.
 
-    Taken from the plan itself, falling back to the first plan state (the
-    current period) when the plan node does not carry it.
+    A real Plan answers for the pricing period covering `today` (see
+    `Plan.current_plan_state`) -- the group is per period, so using another
+    period's would price the sessions at the wrong rate. The fallbacks below
+    cover a duck-typed stand-in that has no such method.
     """
-    # The Plan model owns this; the fallbacks below cover a duck-typed stand-in.
+    source = getattr(plan, "pricing_group_source", None)
+    if callable(source):
+        group = source(today)[0]
+        if group:
+            return group
+
     group = getattr(plan, "active_pricing_group_id", None)
     if group:
         return group
@@ -220,6 +228,29 @@ def _active_pricing_group(plan: Any) -> str | None:
         if isinstance(raw, dict) and raw.get("pricingGroupId"):
             return raw["pricingGroupId"]
     return None
+
+
+def _current_state(plan: Any, today: date | None = None) -> Any | None:
+    """The pricing period covering `today`, or the first for a stand-in."""
+    method = getattr(plan, "current_plan_state", None)
+    if callable(method):
+        return method(today)
+    states = getattr(plan, "plan_states", None) or []
+    return states[0] if states else None
+
+
+def _current_monthly_estimate(plan: Any, today: date | None = None) -> Any | None:
+    method = getattr(plan, "current_monthly_estimate", None)
+    if callable(method):
+        return method(today)
+    return getattr(plan, "monthly_estimate", None)
+
+
+def _current_public_funding(plan: Any, today: date | None = None) -> Any | None:
+    method = getattr(plan, "current_public_funding", None)
+    if callable(method):
+        return method(today)
+    return getattr(plan, "public_funding", None)
 
 
 def _session_price(booking: Any, pricing_group_id: str | None) -> Any | None:
@@ -245,6 +276,7 @@ def build_summary(
     session_titles: dict | None = None,
     product_titles: dict | None = None,
     site: dict | None = None,
+    today: date | None = None,
 ) -> str:
     """Format a previewed plan as plain, scannable Slack text for an approver.
 
@@ -257,13 +289,19 @@ def build_summary(
         site: resolved site metadata ({"label", ...}) for the Site line. Shows
             "unknown" when absent or unresolved -- it is informational, and
             decides nothing about the plan.
+        today: the date used to pick the pricing period; defaults to
+            `date.today()`. A parameter so tests are deterministic.
 
     Either map may be None or empty: an unresolved id is shown as the id
     itself. A readable label is a nicety and must never cost the approver the
     message.
 
     Prices come from the COMPUTED PLAN, not the catalogue, so they are what
-    this plan actually charges.
+    this plan actually charges. A plan can have several pricing periods
+    (`planStates`); the weekly total, monthly estimate, public funding and the
+    per-session prices all come from the one covering `today`, labelled with
+    its start date, and any other periods are listed on one line so the
+    approver can see the rate moves.
 
     Returns:
         The message text. Defensive throughout: this runs on the success path,
@@ -274,7 +312,7 @@ def build_summary(
 
     session_titles = session_titles or {}
     product_titles = product_titles or {}
-    pricing_group_id = _active_pricing_group(plan)
+    pricing_group_id = _active_pricing_group(plan, today)
 
     child_id = getattr(plan, "child_id", None) or "unknown"
     date_from = getattr(plan, "from_", None) or "unknown"
@@ -345,20 +383,35 @@ def build_summary(
             lines.append(f"• {title} — {_discount_amount(discount)}")
 
     # --- Totals ------------------------------------------------------------ #
+    # Everything below is the pricing period covering today, not simply the
+    # first one: a plan's first period is often already over.
     lines.append("")
     states = getattr(plan, "plan_states", None) or []
-    weekly = states[0].weekly_total if states else None
+    current = _current_state(plan, today)
+    weekly = getattr(current, "weekly_total", None) if current is not None else None
+    period_start = getattr(current, "from_", None)
 
+    if period_start:
+        lines.append(f"*Current pricing* (From {str(period_start)[:10]})")
     lines.append(f"• Weekly total: {_money(weekly)}")
-    lines.append(f"• Monthly estimate: {_money(getattr(plan, 'monthly_estimate', None))}")
+    lines.append(f"• Monthly estimate: {_money(_current_monthly_estimate(plan, today))}")
 
     if len(states) > 1:
-        # Don't enumerate every period -- just flag that the figure above is
-        # the current one and the rate moves later.
+        # Flag that the rate moves, and list the OTHER periods on one line so
+        # the approver can see when and to what (a period that has already
+        # ended is listed too: it explains why the figure above is not the
+        # plan's first one).
         lines.append(f"• _(rate changes during plan — {len(states)} periods)_")
+        others = [
+            f"From {str(getattr(state, 'from_', None) or 'unknown')[:10]} — "
+            f"{_money(getattr(state, 'monthly_estimate', None))}"
+            for state in states
+            if state is not current
+        ]
+        lines.append(f"• Other periods: {'; '.join(others)}")
 
     # --- Public funding, only when funded ---------------------------------- #
-    funding = getattr(plan, "public_funding", None)
+    funding = _current_public_funding(plan, today)
     amount = getattr(funding, "amount", None)
     hours = getattr(funding, "hours", None)
     minutes = getattr(funding, "minutes", None)

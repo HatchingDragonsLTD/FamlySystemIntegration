@@ -30,6 +30,7 @@ import os
 import uuid
 from typing import Any
 
+from actions.read_child_plans.runner import current_monthly_estimate
 from integrations import catalogue, slack
 
 from . import hubspot_intake, preview_store
@@ -215,10 +216,13 @@ def run_preview_and_post(
             site_code=site.get("site_code"),
             institution_id=site.get("institution_id"),
             # Recorded so an adjustment can name the same pricing group the
-            # plan was priced against.
+            # plan was priced against. Both this and the estimate below are
+            # the pricing period covering TODAY -- not the plan's first period,
+            # which is often already over and priced under a different group.
             pricing_group_id=getattr(preview.plan, "active_pricing_group_id", None),
-            # Kept so an adjustment can tell whether the re-price moved.
-            monthly_estimate=getattr(preview.plan, "monthly_estimate", None),
+            # Kept so an adjustment can tell whether the re-price moved, and
+            # shown as the base in the adjustment modal.
+            monthly_estimate=current_monthly_estimate(preview.plan),
             # So a later Approve (or Adjust & Approve) commits with the SAME
             # oldPlanId/replaceOldPlan this preview used. None/False for an
             # ordinary plan_preview -- unchanged from before this parameter
