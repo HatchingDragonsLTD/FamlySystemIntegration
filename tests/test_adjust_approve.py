@@ -19,7 +19,7 @@ from pathlib import Path
 from unittest import mock
 
 from actions.plan_write import approval, preview_store
-from integrations import slack
+from integrations import child_lookup, slack
 
 logging.disable(logging.CRITICAL)
 
@@ -113,6 +113,20 @@ class AdjustTestCase(unittest.TestCase):
         )
         opener.start()
         self.addCleanup(opener.stop)
+
+        # The live child-name lookup must never reach the network from a test.
+        # None is what a failed lookup returns, so these tests keep exercising
+        # the bare-id path; tests of the name itself set `self.child_name`.
+        self.child_name = None
+        self.looked_up = []
+
+        def fake_lookup(child_id, client=None):
+            self.looked_up.append(child_id)
+            return self.child_name
+
+        lookup = mock.patch.object(child_lookup, "lookup_child_name", fake_lookup)
+        lookup.start()
+        self.addCleanup(lookup.stop)
 
     def save_pending(
         self, preview_id=PREVIEW_ID, pricing_group=PRICING_GROUP, estimate=900.00

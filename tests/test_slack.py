@@ -361,8 +361,14 @@ class CatalogueTests(unittest.TestCase):
         raw = json.loads(
             catalogue.DEFAULT_CATALOGUE_PATH.read_text(encoding="utf-8")
         )
-        self.assertIsInstance(raw.get("sessions"), dict)
-        self.assertIsInstance(raw.get("products"), dict)
+        self.assertIsInstance(raw, dict)
+        self.assertIsInstance(raw.get("sites"), dict)
+        # The flat `sessions`/`products` maps are now OPTIONAL manual overrides
+        # (names are derived from the pulled catalogues, see display_names.py),
+        # so the file may omit them -- but where present they must be maps.
+        for key in ("sessions", "products"):
+            if key in raw:
+                self.assertIsInstance(raw[key], dict, key)
 
     def test_names_from_the_file_reach_the_summary(self):
         with tempfile.TemporaryDirectory() as tmp:

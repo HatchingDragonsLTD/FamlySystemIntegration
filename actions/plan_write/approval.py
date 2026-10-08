@@ -38,7 +38,7 @@ from datetime import date
 from actions.read_child_plans.runner import current_monthly_estimate
 from core.config import ConfigError, load_config
 from core.rest_client import RestHTTPError
-from integrations import slack
+from integrations import child_lookup, slack
 
 from . import preview_store, runner
 
@@ -403,7 +403,15 @@ def total_to_bill(estimate, value):
     return float(estimate) + float(value)
 
 
-def _adjusted_summary(value: float, before, estimate, result, pricing_group_id) -> str:
+def _adjusted_summary(
+    value: float,
+    before,
+    estimate,
+    result,
+    pricing_group_id,
+    child_id=None,
+    child_name=None,
+) -> str:
     """The re-priced message: the base figure, the adjustment, and the real total.
 
     Famly keeps `monthlyEstimate` and `totalAdjustments` apart and only combines
@@ -413,8 +421,14 @@ def _adjusted_summary(value: float, before, estimate, result, pricing_group_id) 
     """
     total = total_to_bill(estimate, value)
 
-    lines = [
-        "*Adjusted plan — awaiting final confirmation*",
+    lines = ["*Adjusted plan — awaiting final confirmation*"]
+
+    # Who the money is for, in the same form as the preview: the name (when the
+    # live lookup found one) before the id. Omitted if the child is unknown.
+    if child_id:
+        lines.append(slack.child_line(child_id, child_name))
+
+    lines += [
         f"• Base monthly estimate (Famly, pre-adjustment — unchanged by "
         f"this adjustment): {_money(estimate)}",
         f"• Adjustment applied: £{value:+.2f}",
@@ -609,8 +623,21 @@ def _complete_adjustment(
         user,
     )
 
+    # Looked up live for this one message: never stored or logged, and any
+    # failure shows the bare id (see integrations.child_lookup). Done after the
+    # re-priced plan is stored, so it can only ever delay this message.
+    child_name = child_lookup.lookup_child_name(stored.child_id)
+
     if not slack.post_adjusted(
-        _adjusted_summary(value, before, estimate, result, pricing_group_id),
+        _adjusted_summary(
+            value,
+            before,
+            estimate,
+            result,
+            pricing_group_id,
+            child_id=stored.child_id,
+            child_name=child_name,
+        ),
         new_preview_id,
     ):
         # The plan is re-priced and stored, but the approver cannot see it.
