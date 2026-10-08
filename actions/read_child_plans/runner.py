@@ -572,6 +572,44 @@ def current_monthly_estimate(plan: Any, today: date | None = None) -> Any | None
     return getattr(plan, "monthly_estimate", None)
 
 
+def current_pricing_summary(plan: Any, today: date | None = None) -> dict:
+    """The pricing figures a response reports, from the period covering `today`.
+
+    One definition shared by the plan-write web response and the plan-write
+    CLI, so the two cannot drift. The plan-level `monthlyEstimate` and
+    `publicFunding` only mirror the FIRST period, which is often already over,
+    so every figure here comes from `Plan.current_plan_state`:
+
+        monthlyEstimate, weeklyTotal, publicFundingAmount/Hours/Minutes
+            the current period's (`weeklyTotal` is new -- no response carried
+            one before)
+        pricingFrom   the current period's start date
+        periods       [{from, to, monthlyEstimate}] for EVERY period, so a
+                      reader can see the rate move without a second request
+
+    Duck-typed like `current_monthly_estimate`: a stand-in that is not a
+    `Plan` is read from its plain plan-level attributes, with no periods.
+    """
+    state_of = getattr(plan, "current_plan_state", None)
+    state = state_of(today) if callable(state_of) else None
+
+    funding_of = getattr(plan, "current_public_funding", None)
+    funding = funding_of(today) if callable(funding_of) else getattr(plan, "public_funding", None)
+
+    return {
+        "monthlyEstimate": current_monthly_estimate(plan, today),
+        "weeklyTotal": state.weekly_total if state is not None else None,
+        "publicFundingAmount": getattr(funding, "amount", None),
+        "publicFundingHours": getattr(funding, "hours", None),
+        "publicFundingMinutes": getattr(funding, "minutes", None),
+        "pricingFrom": state.from_ if state is not None else None,
+        "periods": [
+            {"from": s.from_, "to": s.to, "monthlyEstimate": s.monthly_estimate}
+            for s in (getattr(plan, "plan_states", None) or [])
+        ],
+    }
+
+
 def _parse_sessions(node: Any) -> list[SessionRef]:
     """Session reference list. `title` is what names a booking in output."""
     if not isinstance(node, list):

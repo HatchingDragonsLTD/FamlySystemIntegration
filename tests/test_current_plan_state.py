@@ -28,9 +28,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from actions.plan_write import approval, hubspot_intake, preview_store, web
+from actions.plan_write import approval, cli, hubspot_intake, preview_store, web
 from actions.read_child_plans.runner import (
     current_monthly_estimate,
+    current_pricing_summary,
     parse_plan,
 )
 from integrations import slack
@@ -606,6 +607,194 @@ class AdjustmentUsesTheCurrentPeriodTests(AdjustmentFlowTestCase):
             [{"pricingGroupId": G1, "adjustment": 0.35}],
         )
         self.assertIn("Total to be billed: 812.85", self.adjusted_posts[-1][0])
+
+
+# --------------------------------------------------------------------------- #
+# What the web response and the CLI REPORT
+# --------------------------------------------------------------------------- #
+# The keys the web response carried before pricing periods were reported. They
+# must all still be there, under the same names, so nothing reading them breaks.
+EXISTING_WEB_KEYS = {
+    "planId", "childId", "from", "to", "billingScheme", "monthlyEstimate",
+    "planPartIds", "sessionCount", "publicFundingAmount", "publicFundingHours",
+    "publicFundingMinutes",
+}
+
+
+class CurrentPricingSummaryTests(unittest.TestCase):
+    """The shared helper, pinned to dates: FIRST then SECOND, today after the switch."""
+
+    def summary(self, node, today=AFTER_SWITCH):
+        return current_pricing_summary(parse_plan(node), today)
+
+    def test_the_existing_keys_carry_the_second_periods_figures(self):
+        summary = self.summary(plan_node(FIRST, SECOND))
+
+        self.assertEqual(summary["monthlyEstimate"], 705.08)
+        self.assertEqual(summary["weeklyTotal"], 162.0)
+        self.assertEqual(summary["publicFundingAmount"], 116.24)
+        self.assertEqual(summary["publicFundingHours"], 12)
+        self.assertEqual(summary["publicFundingMinutes"], 0)
+
+    def test_none_of_the_first_periods_figures_leak_into_those_keys(self):
+        summary = self.summary(plan_node(FIRST, SECOND))
+
+        self.assertNotEqual(summary["monthlyEstimate"], 749.96)
+        self.assertNotEqual(summary["weeklyTotal"], 173.0)
+        self.assertNotEqual(summary["publicFundingAmount"], 129.65)
+
+    def test_pricing_from_is_the_current_periods_start_date(self):
+        self.assertEqual(self.summary(plan_node(FIRST, SECOND))["pricingFrom"], "2026-08-01")
+
+    def test_periods_lists_both_periods_in_order(self):
+        self.assertEqual(
+            self.summary(plan_node(FIRST, SECOND))["periods"],
+            [
+                {"from": "2026-01-20", "to": "2026-07-31", "monthlyEstimate": 749.96},
+                {"from": "2026-08-01", "to": "2027-08-30", "monthlyEstimate": 705.08},
+            ],
+        )
+
+    def test_periods_lists_every_period_whichever_is_current(self):
+        summary = self.summary(plan_node(FIRST, SECOND, THIRD))
+
+        self.assertEqual(
+            [p["from"] for p in summary["periods"]],
+            ["2026-01-20", "2026-08-01", "2027-08-31"],
+        )
+        self.assertIsNone(summary["periods"][2]["to"])  # open-ended stays null
+        self.assertEqual(summary["pricingFrom"], "2026-08-01")
+
+    def test_before_the_switch_the_first_periods_figures_are_reported(self):
+        summary = self.summary(plan_node(FIRST, SECOND), BEFORE_SWITCH)
+
+        self.assertEqual(summary["monthlyEstimate"], 749.96)
+        self.assertEqual(summary["weeklyTotal"], 173.0)
+        self.assertEqual(summary["publicFundingAmount"], 129.65)
+        self.assertEqual(summary["pricingFrom"], "2026-01-20")
+        self.assertEqual(len(summary["periods"]), 2)
+
+    def test_a_single_period_plan_reports_its_figures_and_one_period(self):
+        summary = self.summary(plan_node(FIRST))
+
+        self.assertEqual(summary["monthlyEstimate"], 749.96)
+        self.assertEqual(summary["weeklyTotal"], 173.0)
+        self.assertEqual(summary["pricingFrom"], "2026-01-20")
+        self.assertEqual(len(summary["periods"]), 1)
+
+    def test_a_plan_with_no_periods_reports_plan_level_figures_and_no_periods(self):
+        summary = self.summary(
+            {"monthlyEstimate": 812.5, "publicFunding": {"amount": 9.0, "hours": 3}}
+        )
+
+        self.assertEqual(summary["monthlyEstimate"], 812.5)
+        self.assertEqual(summary["publicFundingAmount"], 9.0)
+        self.assertIsNone(summary["weeklyTotal"])
+        self.assertIsNone(summary["pricingFrom"])
+        self.assertEqual(summary["periods"], [])
+
+    def test_a_duck_typed_plan_is_read_from_its_plain_attributes(self):
+        summary = current_pricing_summary(
+            SimpleNamespace(
+                monthly_estimate=812.5,
+                public_funding=SimpleNamespace(amount=9.0, hours=3, minutes=30),
+            )
+        )
+
+        self.assertEqual(summary["monthlyEstimate"], 812.5)
+        self.assertEqual(summary["publicFundingMinutes"], 30)
+        self.assertEqual(summary["periods"], [])
+        self.assertIsNone(summary["pricingFrom"])
+
+
+class WebPlanSummaryTests(unittest.TestCase):
+    """`web._plan_summary` -- the `plan` object in the HubSpot-facing response."""
+
+    def test_the_existing_keys_carry_the_second_periods_figures(self):
+        plan = _relative_two_period_plan()  # first period over, second in force
+
+        summary = web._plan_summary(plan)
+
+        self.assertEqual(summary["monthlyEstimate"], 1791.97)
+        self.assertEqual(summary["weeklyTotal"], 380.0)
+        self.assertEqual(summary["publicFundingAmount"], 116.24)
+        # ...where the plan-level values (the first period's) say otherwise.
+        self.assertEqual(plan.monthly_estimate, 1913.99)
+
+    def test_the_pricing_period_is_identified_and_all_periods_are_listed(self):
+        plan = _relative_two_period_plan()
+        summary = web._plan_summary(plan)
+
+        self.assertEqual(summary["pricingFrom"], plan.plan_states[1].from_)
+        self.assertEqual(
+            summary["periods"],
+            [
+                {"from": s.from_, "to": s.to, "monthlyEstimate": s.monthly_estimate}
+                for s in plan.plan_states
+            ],
+        )
+        self.assertEqual(
+            [p["monthlyEstimate"] for p in summary["periods"]], [1913.99, 1791.97]
+        )
+
+    def test_every_pre_existing_key_is_still_present(self):
+        summary = web._plan_summary(_relative_two_period_plan())
+
+        self.assertTrue(EXISTING_WEB_KEYS <= set(summary), EXISTING_WEB_KEYS - set(summary))
+
+    def test_the_non_pricing_keys_are_unchanged(self):
+        summary = web._plan_summary(_relative_two_period_plan())
+
+        self.assertEqual(summary["planId"], "plan-1")
+        self.assertEqual(summary["childId"], CHILD)
+        self.assertEqual(summary["planPartIds"], ["pp-1"])
+        self.assertEqual(summary["sessionCount"], 1)
+
+    def test_no_plan_is_still_none(self):
+        self.assertIsNone(web._plan_summary(None))
+
+
+class PlanWriteCliOutputTests(unittest.TestCase):
+    """The preview-csv rows the plan-write CLI prints and returns."""
+
+    def row_for(self, plan):
+        plan_input = SimpleNamespace(child_id=CHILD)
+        result = SimpleNamespace(plan=plan, warnings=[])
+        args = SimpleNamespace(file="plans.csv", version=3)
+
+        with mock.patch.object(cli.csv_loader, "load_csv", return_value=[plan_input]), \
+             mock.patch.object(cli.input_schema, "validate", return_value=[]), \
+             mock.patch.object(cli.input_schema, "to_plan_body", return_value={}), \
+             mock.patch.object(cli.runner, "preview", return_value=result), \
+             mock.patch.object(cli, "_print_warnings"):
+            (row,) = cli._handle_csv(args)
+        return row
+
+    def test_the_monthly_estimate_is_the_second_periods(self):
+        plan = _relative_two_period_plan()
+
+        row = self.row_for(plan)
+
+        self.assertEqual(row["monthlyEstimate"], 1791.97)
+        self.assertEqual(row["weeklyTotal"], 380.0)
+        self.assertEqual(row["publicFundingAmount"], 116.24)
+        self.assertEqual(row["pricingFrom"], plan.plan_states[1].from_)
+        self.assertEqual(len(row["periods"]), 2)
+
+    def test_the_row_keeps_its_existing_keys(self):
+        row = self.row_for(_relative_two_period_plan())
+
+        for key in ("childId", "valid", "errors", "previewed", "monthlyEstimate", "warnings"):
+            self.assertIn(key, row)
+        self.assertEqual(row["childId"], CHILD)
+        self.assertTrue(row["valid"])
+        self.assertTrue(row["previewed"])
+
+    def test_a_preview_with_no_plan_still_reports_a_null_estimate(self):
+        row = self.row_for(None)
+
+        self.assertIsNone(row["monthlyEstimate"])
+        self.assertTrue(row["previewed"])
 
 
 if __name__ == "__main__":

@@ -30,7 +30,10 @@ import os
 import uuid
 from typing import Any
 
-from actions.read_child_plans.runner import current_monthly_estimate
+from actions.read_child_plans.runner import (
+    current_monthly_estimate,
+    current_pricing_summary,
+)
 from integrations import catalogue, slack
 
 from . import hubspot_intake, preview_store
@@ -50,11 +53,15 @@ def _plan_summary(plan: Any) -> dict | None:
     Mirrors `read_child_plans.runner.summarise`, so a previewed plan reads the
     same way as an existing one, plus the public funding figures the Slack
     summary reports on.
+
+    The pricing figures (`monthlyEstimate`, `weeklyTotal`, `publicFunding*`)
+    are the pricing period covering TODAY, not the plan-level values, which
+    only mirror the first period. The key names are unchanged so nothing
+    reading this response breaks; `pricingFrom` says which period they are,
+    and `periods` lists them all. See `current_pricing_summary`.
     """
     if plan is None:
         return None
-
-    funding = getattr(plan, "public_funding", None)
 
     return {
         "planId": plan.id,
@@ -62,12 +69,9 @@ def _plan_summary(plan: Any) -> dict | None:
         "from": plan.from_,
         "to": plan.to,
         "billingScheme": plan.billing_scheme,
-        "monthlyEstimate": plan.monthly_estimate,
         "planPartIds": plan.plan_part_ids,
         "sessionCount": plan.session_booking_count,
-        "publicFundingAmount": getattr(funding, "amount", None),
-        "publicFundingHours": getattr(funding, "hours", None),
-        "publicFundingMinutes": getattr(funding, "minutes", None),
+        **current_pricing_summary(plan),
     }
 
 
