@@ -13,6 +13,8 @@ import json
 import sys
 from pathlib import Path
 
+from actions.read_child_plans.runner import current_pricing_summary
+
 from . import csv_loader, input_schema, runner, warnings as plan_warnings
 
 NAME = "plan"
@@ -153,7 +155,13 @@ def _handle_csv(args: argparse.Namespace) -> list[dict]:
                 "valid": True,
                 "errors": [],
                 "previewed": True,
-                "monthlyEstimate": result.plan.monthly_estimate if result.plan else None,
+                # The pricing period covering today, not the plan-level (first
+                # period) values -- see current_pricing_summary.
+                **(
+                    current_pricing_summary(result.plan)
+                    if result.plan
+                    else {"monthlyEstimate": None}
+                ),
                 "warnings": [
                     {
                         "key": w.key,
