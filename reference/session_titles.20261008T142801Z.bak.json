@@ -1,0 +1,70 @@
+{
+  "_comment": [
+    "RAW Famly session titles per institution, kept up to date by `python",
+    "main.py pull-sessions` (or the combined `pull-references` weekly run). Do",
+    "not edit by hand -- a manual edit is overwritten for any session the next",
+    "pull returns.",
+    "",
+    "Structure: institutions.<site_code>.sessions.<session_uuid> -> the title",
+    "exactly as Famly has it, for EVERY session returned, including ones whose",
+    "title the pull could not classify (those are not in session_catalogue.json).",
+    "",
+    "DISPLAY-ONLY: nothing here chooses a session to book. The readable names in",
+    "the Slack preview are derived from these raw titles at read time by",
+    "integrations/display_names.py and are never stored. A name written by hand",
+    "in reference/catalogue.json's `sessions` map overrides the derived one.",
+    "",
+    "Point SESSION_TITLES_FILE elsewhere to override the path."
+  ],
+  "institutions": {
+    "HDCITY": {
+      "sessions": {
+        "6e3dce72-7754-40b8-94b8-1ea0cd723232": "(F) Afternoon",
+        "1c31b681-dd7b-42e5-aa6f-848c6cf15962": "(F) Full Day",
+        "f1128606-f7ae-4098-8915-ec7882b51b2f": "(F) Morning",
+        "a0d25a31-06ec-4363-927b-8e9798e545f5": "(FNA) Afternoon",
+        "74d1cb60-abd9-4727-9620-eccfcf1efca9": "(FNA) Full Day",
+        "08e0188d-a585-449e-b2cd-c054a7ec3b2f": "(FNA) Morning",
+        "493a953e-7d6c-47b9-9b2d-ea3a657c4de5": "(FNE) Afternoon",
+        "413f4246-6a57-41f6-94d6-8fc58d0d4322": "(FNE) Full Day",
+        "e9a0002e-db01-4d8c-ae1a-96bf9a5d4ed6": "(FNE) Morning",
+        "8a3cd600-f382-4365-8086-a7c2d6c7916e": "(FNM) Afternoon",
+        "dd65e7ee-1f5f-4d99-ba75-58dd539d54df": "(FNM) Full Day",
+        "4423bdd1-af63-430b-a2a4-cefdca59b7ba": "(FNM) Morning",
+        "213d769a-ef6e-4962-9bf3-6ff3e9cedba8": "Afternoon",
+        "1fe355bb-8ebf-4acd-b056-68b8de6ec640": "Full Day",
+        "10586cc4-31fc-49e7-bdd2-6d976a48bbbc": "Morning",
+        "4d877c5e-5e35-4ed9-81c7-64146d957a29": "Weekend School"
+      }
+    },
+    "HDCW": {
+      "sessions": {
+        "c6fe35a4-3fea-4c30-9313-f10fc969fb5b": "(F) Afternoon",
+        "222faa9f-b12e-498c-aac4-28fc442e4989": "(F) Full Day",
+        "75040dda-848c-468e-9efe-74b203ca2ea1": "(F) Morning",
+        "df362440-d235-4a1a-86bc-bc266f85dd6f": "(FNA) Afternoon",
+        "bce435b2-a91e-40bc-9d4f-aced25adf552": "(FNA) Full Day",
+        "a4d74181-40d5-4355-9dd2-8e3ec3c04452": "(FNA) Morning",
+        "cbed5234-158e-4488-8231-17422fa0ac94": "(FNE) Afternoon",
+        "7bb38377-7083-4197-bf0c-53df691a4718": "(FNE) Full Day",
+        "150de1f5-0fbf-49bd-8803-04df449e77a8": "(FNE) Morning",
+        "6fb46863-6b38-44ec-8f74-8e8da552e25d": "(FNM) Afternoon",
+        "d2c6f9b3-e65a-4ffa-b676-81b74ee0182b": "(FNM) Full Day",
+        "be81b77f-27fd-4b89-8b0b-41c26c9aa2fe": "(FNM) Morning",
+        "8f150941-08cd-4642-a50c-014c5429e94e": "Afternoon",
+        "4d8b109a-62e1-40eb-afab-242fc39cb71c": "Full Day",
+        "a649ec9b-242d-479c-a572-3c4d83c715a8": "Morning"
+      }
+    },
+    "HDWEST": {
+      "sessions": {
+        "e6b22db3-7a47-47bd-8baa-50ea0839cc18": "(F) Afternoon",
+        "0636fb46-687f-4833-a7d3-70e30ce0f8e2": "(F) Full Day",
+        "2ea02335-76ee-4bcd-af95-e09050ef3141": "(F) Morning",
+        "44e887a1-3349-46ec-be44-d33ced6e6f9f": "Afternoon",
+        "1ffb7cc0-2571-4e94-8f9e-fa8d0697df9b": "Full Day",
+        "e745450c-67c1-40bb-99dc-e9c5cd0e8f1a": "Morning"
+      }
+    }
+  }
+}

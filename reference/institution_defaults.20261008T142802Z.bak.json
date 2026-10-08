@@ -1,0 +1,102 @@
+{
+  "_comment": [
+    "Pricing rule group + billing-profile defaults per institution, kept up to",
+    "date by `python main.py pull-institution-defaults` (or the combined",
+    "`pull-references` weekly run). Do not edit by hand except in an emergency",
+    "-- the pull always backs up the previous file first, timestamped alongside",
+    "it, so a bad run or a lost manual edit can be recovered.",
+    "",
+    "FUNCTIONALLY LOAD-BEARING: `integrations/institution_defaults.py` reads",
+    "this at plan-build time to fill in ruleGroupId, billingProfileId,",
+    "attendanceScheduleId, weeksOfCare, billingId, billingTitle and",
+    "billingInvoices -- HubSpot no longer sends any of these.",
+    "",
+    "Structure: institutions.<site_code>.ruleGroupId -> ULID; and",
+    "institutions.<site_code>.schedules.<all_year_round|term_only> -> that",
+    "bucket's billingProfileId/attendanceScheduleId/weeksOfCare/billingId/",
+    "billingTitle/billingInvoices. <site_code> is a key from",
+    "reference/catalogue.json's `sites` section. An institution either has a",
+    "COMPLETE entry (both schedule buckets, one consistent billing scheme) or",
+    "none at all -- the pull never writes a partial one (see",
+    "actions/pull_institution_defaults/runner.py)."
+  ],
+  "institutions": {
+    "HDCITY": {
+      "ruleGroupId": "01M0SMS6EKAXPZKBF4QSWK9TP8",
+      "schedules": {
+        "all_year_round": {
+          "billingProfileId": "995f5f46-e5ae-416e-9046-755a22045da3",
+          "attendanceScheduleId": "7c9e3b0a-b32d-4cdd-8656-b447b24c8c5e",
+          "weeksOfCare": 51.0,
+          "billingId": "ANNUALIZED_V2",
+          "billingTitle": "Annualised",
+          "billingInvoices": 12.0
+        },
+        "term_only": {
+          "billingProfileId": "0d2bef00-4c89-411f-955e-c35a7b94834a",
+          "attendanceScheduleId": "32d393d7-8793-4609-a1f1-2c256d638f4b",
+          "weeksOfCare": 38.0,
+          "billingId": "ANNUALIZED_V2",
+          "billingTitle": "Annualised",
+          "billingInvoices": 12.0
+        }
+      },
+      "addonProducts": {
+        "mealsProductId": "3b128632-ef11-4f8b-8b44-93ea00e00dd6",
+        "activitiesProductId": "e485a0fc-b659-4be9-92e6-4e824d588193"
+      }
+    },
+    "HDCW": {
+      "ruleGroupId": "01M0SM9F33THW1DTNFZHXBSCGW",
+      "schedules": {
+        "all_year_round": {
+          "billingProfileId": "78ca454e-ea20-4cf2-9f51-8b2fd6a64fe8",
+          "attendanceScheduleId": "49c3f11d-226b-4f2e-a5bf-b81f0d201de0",
+          "weeksOfCare": 51.0,
+          "billingId": "ANNUALIZED_V2",
+          "billingTitle": "Annualised",
+          "billingInvoices": 12.0
+        },
+        "term_only": {
+          "billingProfileId": "2f9e2cae-09a1-4d28-87aa-65ca7e936e0b",
+          "attendanceScheduleId": "f81a9531-4826-4485-8546-6a102d38b788",
+          "weeksOfCare": 38.0,
+          "billingId": "ANNUALIZED_V2",
+          "billingTitle": "Annualised",
+          "billingInvoices": 12.0
+        }
+      },
+      "addonProducts": {
+        "mealsProductId": "8a95de4f-f080-4063-8d49-3b03fe95644c",
+        "activitiesProductId": "7de23b4b-699a-4847-9ca6-6928d70886fb",
+        "halfMealsProductId": "7561cc9e-e0cb-41b5-8a83-2ce56715f600",
+        "halfActivitiesProductId": "da99c7be-7f4b-475d-b650-27a363a03fd3"
+      }
+    },
+    "HDWEST": {
+      "ruleGroupId": "01M0J0PSG8PPGNP4XP50EJVBPH",
+      "schedules": {
+        "all_year_round": {
+          "billingProfileId": "56a9555b-a908-402d-8430-27bd87bbdfdf",
+          "attendanceScheduleId": "8019dc2e-273b-458e-81d4-3eecb85a1984",
+          "weeksOfCare": 51.0,
+          "billingId": "ANNUALIZED_V2",
+          "billingTitle": "Annualised",
+          "billingInvoices": 12.0
+        },
+        "term_only": {
+          "billingProfileId": "86b1f9b3-d030-4873-9852-dab1717f8685",
+          "attendanceScheduleId": "2409cfcf-48e7-4dd6-817b-d66b88a2d7c1",
+          "weeksOfCare": 38.0,
+          "billingId": "ANNUALIZED_V2",
+          "billingTitle": "Annualised",
+          "billingInvoices": 12.0
+        }
+      },
+      "addonProducts": {
+        "mealsProductId": "2ac668e6-2de1-4fa6-8f92-24aed2ce0d6b",
+        "activitiesProductId": "5284ce7c-927c-413f-a175-c2c410072ba5"
+      }
+    }
+  }
+}

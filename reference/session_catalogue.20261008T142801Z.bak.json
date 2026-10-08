@@ -27,38 +27,38 @@
     "HDCITY": {
       "funded": {
         "with_meals_and_activities": {
-          "morning": "f1128606-f7ae-4098-8915-ec7882b51b2f",
-          "afternoon": "6e3dce72-7754-40b8-94b8-1ea0cd723232",
-          "full_day": "1c31b681-dd7b-42e5-aa6f-848c6cf15962"
+          "morning": "",
+          "afternoon": "",
+          "full_day": ""
         },
         "no_meals": {
-          "morning": "4423bdd1-af63-430b-a2a4-cefdca59b7ba",
-          "afternoon": "8a3cd600-f382-4365-8086-a7c2d6c7916e",
-          "full_day": "dd65e7ee-1f5f-4d99-ba75-58dd539d54df"
+          "morning": "",
+          "afternoon": "",
+          "full_day": ""
         },
         "no_activities": {
-          "morning": "08e0188d-a585-449e-b2cd-c054a7ec3b2f",
-          "afternoon": "a0d25a31-06ec-4363-927b-8e9798e545f5",
-          "full_day": "74d1cb60-abd9-4727-9620-eccfcf1efca9"
+          "morning": "",
+          "afternoon": "",
+          "full_day": ""
         },
         "neither": {
-          "morning": "e9a0002e-db01-4d8c-ae1a-96bf9a5d4ed6",
-          "afternoon": "493a953e-7d6c-47b9-9b2d-ea3a657c4de5",
-          "full_day": "413f4246-6a57-41f6-94d6-8fc58d0d4322"
+          "morning": "",
+          "afternoon": "",
+          "full_day": ""
         }
       },
       "non_funded": {
-        "morning": "10586cc4-31fc-49e7-bdd2-6d976a48bbbc",
-        "afternoon": "213d769a-ef6e-4962-9bf3-6ff3e9cedba8",
-        "full_day": "1fe355bb-8ebf-4acd-b056-68b8de6ec640"
+        "morning": "",
+        "afternoon": "",
+        "full_day": ""
       }
     },
     "HDWEST": {
       "funded": {
         "with_meals_and_activities": {
-          "morning": "2ea02335-76ee-4bcd-af95-e09050ef3141",
-          "afternoon": "e6b22db3-7a47-47bd-8baa-50ea0839cc18",
-          "full_day": "0636fb46-687f-4833-a7d3-70e30ce0f8e2"
+          "morning": "",
+          "afternoon": "",
+          "full_day": ""
         },
         "no_meals": {
           "morning": "",
@@ -77,9 +77,9 @@
         }
       },
       "non_funded": {
-        "morning": "e745450c-67c1-40bb-99dc-e9c5cd0e8f1a",
-        "afternoon": "44e887a1-3349-46ec-be44-d33ced6e6f9f",
-        "full_day": "1ffb7cc0-2571-4e94-8f9e-fa8d0697df9b"
+        "morning": "",
+        "afternoon": "",
+        "full_day": ""
       }
     },
     "HDCW": {
