@@ -10,7 +10,10 @@ import argparse
 from . import runner
 
 NAME = "pull-sessions"
-HELP = "Pull live session UUIDs from Famly and refresh reference/session_catalogue.json"
+HELP = (
+    "Pull live session UUIDs from Famly, refresh reference/session_catalogue.json, "
+    "and record the raw session titles in reference/session_titles.json"
+)
 
 
 def add_args(parser: argparse.ArgumentParser) -> None:
@@ -19,7 +22,7 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help=(
             "Pull and report what would change, without writing "
-            "session_catalogue.json or a backup"
+            "session_catalogue.json, session_titles.json or a backup"
         ),
     )
     parser.add_argument(
@@ -40,5 +43,6 @@ def handle(args: argparse.Namespace):
     backup = None
     if not args.dry_run:
         backup = runner.write_catalogue(result)
+        runner.write_extras(result)
 
     return runner.summary_payload(result, backup=backup, dry_run=args.dry_run)

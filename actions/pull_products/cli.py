@@ -45,6 +45,6 @@ def handle(args: argparse.Namespace):
     backup = None
     if not args.dry_run:
         backup = runner.write_catalogue(result)
-        runner.write_addon_products(result)
+        runner.write_extras(result)
 
     return runner.summary_payload(result, backup=backup, dry_run=args.dry_run)

@@ -26,7 +26,9 @@ from actions.pull_sessions import runner as pull_sessions
 # name -> that pull's runner module. Every module here exposes the same
 # interface: pull_all(client=None, institutions=None) -> PullResult,
 # write_catalogue(result, path=None) -> backup path or None, and
-# summary_payload(result, *, backup=None, dry_run=False) -> dict.
+# summary_payload(result, *, backup=None, dry_run=False) -> dict. A pull with a
+# SECONDARY output (session titles, addon products) also exposes
+# write_extras(result), which is called right after write_catalogue.
 PULLS = {
     "sessions": pull_sessions,
     "groups": pull_groups,
@@ -79,6 +81,9 @@ def pull_all_references(
         backup = None
         if not dry_run:
             backup = module.write_catalogue(result)
+            write_extras = getattr(module, "write_extras", None)
+            if callable(write_extras):
+                write_extras(result)
         outcome.backups[name] = backup
 
     return outcome

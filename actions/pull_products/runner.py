@@ -79,16 +79,16 @@ from pathlib import Path
 from typing import Any
 
 from core.rest_client import RestClient, RestHTTPError
-from integrations import catalogue, institution_defaults
+from integrations import catalogue, display_names, institution_defaults
 from integrations.catalogue import UnknownInstitutionError  # re-exported; see there
 
 logger = logging.getLogger(__name__)
 
 PRODUCTS_PATH = "v2/products"
 
-DEFAULT_CATALOGUE_PATH = (
-    Path(__file__).resolve().parents[2] / "reference" / "products_catalogue.json"
-)
+# Where this file lives is defined once, in integrations.display_names, so the
+# pull that writes it and `catalogue.load_titles` that reads it cannot disagree.
+DEFAULT_CATALOGUE_PATH = display_names.DEFAULT_PRODUCTS_CATALOGUE_PATH
 
 # The two fixed, known titles this pull resolves into addonProducts. EXACT,
 # case-sensitive match only -- see the module docstring for why normalizing
@@ -101,8 +101,7 @@ HALF_ACTIVITIES_TITLE = institution_defaults.ADDON_PRODUCT_TITLES["halfActivitie
 
 def catalogue_path() -> Path:
     """The products catalogue file in use."""
-    override = os.environ.get("PRODUCTS_CATALOGUE_FILE", "").strip()
-    return Path(override) if override else DEFAULT_CATALOGUE_PATH
+    return display_names.products_catalogue_path()
 
 
 class AddonProductAnomaly(RuntimeError):
@@ -151,6 +150,8 @@ class PullResult:
     # (missing or duplicated title). Reported only -- never blocks that
     # institution's full pair; see the module docstring.
     half_products_failed: dict[str, str] = field(default_factory=dict)
+    # label -> backup path, filled in by `write_extras`.
+    extra_backups: dict[str, Path | None] = field(default_factory=dict)
 
 
 def _normalise_institution_code(code: str) -> str:
@@ -498,6 +499,17 @@ def write_addon_products(result: PullResult, path: Path | None = None) -> Path |
     return backup
 
 
+def write_extras(result: PullResult) -> None:
+    """Write this pull's SECONDARY output: addonProducts in institution_defaults.
+
+    The hook every caller -- this module's CLI and `pull-references` -- uses.
+    (`pull-references` used to call only `write_catalogue`, so the weekly run
+    refreshed the flat products map but never `addonProducts`.) The backup
+    lands in `result.extra_backups` for the summary.
+    """
+    result.extra_backups["addonProducts"] = write_addon_products(result)
+
+
 def summary_payload(
     result: PullResult, *, backup: Path | None = None, dry_run: bool = False
 ) -> dict:
@@ -521,5 +533,10 @@ def summary_payload(
         "addonProductsResolved": sorted(result.addon_products),
         "addonProductsFailed": result.addon_products_failed,
         "halfProductsFailed": result.half_products_failed,
+        "addonProductsBackupFile": (
+            str(result.extra_backups["addonProducts"])
+            if result.extra_backups.get("addonProducts")
+            else None
+        ),
         "backupFile": str(backup) if backup else None,
     }

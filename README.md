@@ -492,7 +492,7 @@ actions read, replacing manual copy-paste from Famly:
 
 | Command | Writes | Status |
 | --- | --- | --- |
-| `python main.py pull-sessions` | `reference/session_catalogue.json` | live -- functionally load-bearing (booking logic reads it) |
+| `python main.py pull-sessions` | `reference/session_catalogue.json` **and** `reference/session_titles.json` | live -- the catalogue is functionally load-bearing (booking logic reads it); the titles file is display-only (see "Readable names in Slack") |
 | `python main.py pull-groups` | `reference/groups_catalogue.json` | live -- informational only today, nothing reads it yet |
 | `python main.py pull-products` | `reference/products_catalogue.json` **and** `reference/institution_defaults.json`'s `addonProducts` | live -- the flat map is informational; `addonProducts` is functionally load-bearing for non-funded add-on bookings (see below) |
 | `python main.py pull-institution-defaults` | `reference/institution_defaults.json` | live -- functionally load-bearing (`hubspot_flatten` reads it for every plan part; see below) |
@@ -587,6 +587,32 @@ duplicated half title is reported by the pull (`halfProductsFailed`) but never
 blocks the full pair; it only fails a booking that actually needs a half, with
 an error naming the missing title. The old `half_day_adjustment` /
 `half_day_amount` discount is gone and those fields are ignored.
+
+### Readable names in Slack
+
+The Slack preview names sessions and products automatically, from the pulled
+catalogues, without anyone maintaining a name list. `pull-sessions` records the
+RAW Famly title of every session it sees in `reference/session_titles.json`
+(including ones it cannot classify for booking); `pull-products` already stores
+raw product titles in `products_catalogue.json`. The readable wording is derived
+from those at read time by `integrations/display_names.py` and **never stored**,
+so changing the wording needs no re-pull:
+
+| Famly title | Slack shows |
+| --- | --- |
+| `(F) Morning` | Funded Morning |
+| `(FNM) Full Day` | Funded Full Day (No Meals) |
+| `(FNA) Afternoon` | Funded Afternoon (No Activities) |
+| `(FNE) Morning` | Funded Morning (No Extras) |
+| `Afternoon` | Afternoon |
+| `(F) Meals & Snacks` / `(1/2) Meals & Snacks` / `(1/2,F) ...` | Funded ... / Half Day ... / Half Day Funded ... |
+
+`catalogue.load_titles()` names each id by the first of: (a) the flat `sessions`/
+`products` maps in `reference/catalogue.json`, kept as **manual overrides** (they
+win, so a hand-written name there hides the derived one); (b) the derived name;
+(c) the raw Famly title, which is what (b) returns for a title that does not
+parse; (d) the raw UUID. A missing or malformed pulled file logs a warning and
+falls through -- it can cost names, never a preview.
 
 ### Scheduling it weekly
 
