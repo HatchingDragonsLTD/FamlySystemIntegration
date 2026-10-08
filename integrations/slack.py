@@ -200,6 +200,35 @@ def _discount_amount(discount: dict) -> str:
     return _percent(amount)
 
 
+MAX_CHILD_NAME_LENGTH = 100
+
+
+def _slack_safe_name(name: str) -> str:
+    """A child's name made safe to put in a mrkdwn message.
+
+    The name is free text from Famly, so it is escaped the way Slack requires
+    (`&`, `<`, `>` -- which are what turn text into `<@U123>`/`<!channel>`
+    mentions and links), reduced to one line, and capped.
+    """
+    one_line = " ".join(name.split())[:MAX_CHILD_NAME_LENGTH]
+    return one_line.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def child_line(child_id: Any, child_name: str | None = None) -> str:
+    """The `• Child:` line, shared by the preview and the adjusted-plan message.
+
+    With a name: `• Child: Alex Smith (`<id>`)` -- name first, then the id in
+    code formatting. Without one (the lookup failed, timed out or found no
+    match): `• Child: `<id>`` exactly as before, so a name is only ever an
+    addition. The name is rendered, never stored; see `integrations.child_lookup`.
+    """
+    shown_id = child_id or "unknown"
+    name = _slack_safe_name(child_name) if isinstance(child_name, str) else ""
+    if name:
+        return f"• Child: {name} (`{shown_id}`)"
+    return f"• Child: `{shown_id}`"
+
+
 def _active_pricing_group(plan: Any, today: date | None = None) -> str | None:
     """The pricing group whose prices apply to this plan today.
 
@@ -277,6 +306,7 @@ def build_summary(
     product_titles: dict | None = None,
     site: dict | None = None,
     today: date | None = None,
+    child_name: str | None = None,
 ) -> str:
     """Format a previewed plan as plain, scannable Slack text for an approver.
 
@@ -291,6 +321,10 @@ def build_summary(
             decides nothing about the plan.
         today: the date used to pick the pricing period; defaults to
             `date.today()`. A parameter so tests are deterministic.
+        child_name: the child's full name, shown before the id. Looked up live
+            by the CALLER (`integrations.child_lookup`) and passed in, so this
+            function stays a pure formatter that does no I/O; None (the
+            lookup failed) shows the bare id.
 
     Either map may be None or empty: an unresolved id is shown as the id
     itself. A readable label is a nicety and must never cost the approver the
@@ -323,7 +357,7 @@ def build_summary(
     lines = [
         "*Plan preview awaiting approval*",
         f"• Site: {site_label or 'unknown'}",
-        f"• Child: `{child_id}`",
+        child_line(child_id, child_name),
         f"• Dates: {date_from} → {date_to}",
     ]
 

@@ -34,7 +34,7 @@ from actions.read_child_plans.runner import (
     current_monthly_estimate,
     current_pricing_summary,
 )
-from integrations import catalogue, slack
+from integrations import catalogue, child_lookup, slack
 
 from . import hubspot_intake, preview_store
 
@@ -246,6 +246,11 @@ def run_preview_and_post(
     # only. No Famly call, so a preview costs exactly one request as before.
     session_titles, product_titles = _catalogue_titles()
 
+    # The child's name, looked up live for THIS message only: never stored
+    # (not in the preview store above, not in the response or any log) and a
+    # failure or timeout just shows the bare id. See integrations.child_lookup.
+    child_name = child_lookup.lookup_child_name(getattr(preview.plan, "child_id", None))
+
     data["slack_posted"] = slack.post_preview(
         slack.build_summary(
             preview.plan,
@@ -253,6 +258,7 @@ def run_preview_and_post(
             session_titles=session_titles,
             product_titles=product_titles,
             site=site,
+            child_name=child_name,
         ),
         preview_id,
     )

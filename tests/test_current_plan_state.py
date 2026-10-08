@@ -34,7 +34,7 @@ from actions.read_child_plans.runner import (
     current_pricing_summary,
     parse_plan,
 )
-from integrations import slack
+from integrations import child_lookup, slack
 
 logging.disable(logging.CRITICAL)
 
@@ -452,6 +452,8 @@ class AdjustmentFlowTestCase(unittest.TestCase):
         self.addCleanup(env.stop)
 
         self.plan = _relative_two_period_plan()
+        # The live child-name lookup must never reach the network from a test.
+        self.child_name = None
         self.previews = []  # (body, version) sent to Famly's preview
         self.preview_posts = []  # (text, preview_id) posted to Slack
         self.adjusted_posts = []  # (text, preview_id) posted after an adjustment
@@ -478,6 +480,10 @@ class AdjustmentFlowTestCase(unittest.TestCase):
             ),
             (slack, ("post_notice", lambda text: True)),
             (slack, ("update_message", lambda url, text: True)),
+            (
+                child_lookup,
+                ("lookup_child_name", lambda child_id, client=None: self.child_name),
+            ),
         ):
             patcher = mock.patch.object(target, replacement[0], replacement[1])
             patcher.start()

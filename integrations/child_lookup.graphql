@@ -1,0 +1,27 @@
+# CONFIRMED AGAINST THE LIVE PUBLIC API (2026-10-08) -- see child_lookup.py for
+# why this hits Famly's PUBLIC API rather than the internal one.
+#
+# Schema (introspected): ChildrenQueries.listByChildIds(childIds: [ChildId!]!,
+# nextToken: ChildCursor) -> ChildrenListResult { result: [Child!]!, next }.
+# Child.name is a Name object; `fullName` is the one display string.
+#
+# NAME ONLY, ONE CHILD: exactly one id goes in, and the only fields selected are
+# the id (to confirm the row really is that child) and name.fullName. Nothing
+# else about the child is requested, and `next` is not read.
+#
+# Live behaviour (checked against a real child): a known id -> one row in ~0.1s;
+# an empty list -> an empty result; a well-formed but unknown id -> HTTP 500
+# ("Something went wrong"); a malformed id -> HTTP 400. All of those, and any
+# timeout, make the caller fall back to showing the bare id.
+query ChildName($childIds: [ChildId!]!) {
+  children {
+    listByChildIds(childIds: $childIds) {
+      result {
+        id
+        name {
+          fullName
+        }
+      }
+    }
+  }
+}
