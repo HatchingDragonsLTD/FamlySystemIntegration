@@ -57,6 +57,15 @@ failure rather than silently papered over. If HubSpot still sends
 `product_1_id`/`product_2_id`, they are ignored -- a no-op, same as the seven
 fields above.
 
+THE END DATE. In a flat payload, `to` is the LAST DAY THE CHILD IS COVERED
+(inclusive -- a leave date is the last day of attendance). Famly's plan `to` is
+the first day NOT covered, so the plan body this module produces sends `to` plus
+ONE day (`exclusive_end`). That conversion happens HERE and nowhere else: every
+flat payload -- plan_preview, additional_plan, create_timeline and the queue --
+goes through `flatten_to_nested`, and nothing after it (the stored body, an
+adjusted body, a commit) touches `to` again. An empty `to` stays null (an
+open-ended plan). `from` is unchanged: it is the first covered day in both.
+
 This module reshapes the payload into the single-plan-part nested structure.
 It does NOT validate -- it only restructures; `input_schema.validate` still
 runs after. Two kinds of problems a producer can find here ride separate
@@ -72,7 +81,7 @@ channels:
 """
 
 import math
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from integrations import catalogue, institution_defaults, session_catalogue
@@ -185,6 +194,25 @@ def _to_iso_date(value: Any) -> str | None:
     except (ValueError, TypeError):
         return s  # unrecognised; let validate() report it rather than crash
     return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+
+
+def exclusive_end(last_day: Any) -> str | None:
+    """Famly's plan `to` for a last covered day: that date plus one day.
+
+    `last_day` is a flat payload's `to` -- an ISO date, or HubSpot's epoch
+    milliseconds. Empty or missing stays None (open-ended). A value that is not
+    a date is returned UNCHANGED (as `_to_iso_date` does) so `validate` reports
+    it instead of this raising or inventing a date.
+
+        2026-12-31 -> 2027-01-01      2028-02-29 -> 2028-03-01
+    """
+    iso = _to_iso_date(last_day)
+    if iso is None:
+        return None
+    try:
+        return (date.fromisoformat(iso) + timedelta(days=1)).isoformat()
+    except (ValueError, OverflowError):
+        return iso
 
 
 def build_discounts(data: Any) -> tuple[list, list[str]]:
@@ -646,7 +674,8 @@ def flatten_to_nested(data: Any) -> dict:
     nested = {
         "childId": _s(data.get("childId")) or None,
         "from": _to_iso_date(data.get("from")),
-        "to": _to_iso_date(data.get("to")),
+        # The ONE place the inclusive last day becomes Famly's exclusive end.
+        "to": exclusive_end(data.get("to")),
         "ruleGroupId": defaults.get("ruleGroupId"),
         "note": _s(data.get("note")),
         "planParts": [plan_part],

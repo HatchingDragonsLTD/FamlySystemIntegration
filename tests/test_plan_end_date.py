@@ -233,19 +233,20 @@ class EndToEndTests(unittest.TestCase):
 
     def test_a_real_to_value_reaches_the_final_plan_body(self):
         # The exact regression: a real end date, sent the way HubSpot sends a
-        # date property (epoch milliseconds), must come out the other end
-        # as the same ISO date -- not be silently dropped anywhere along
-        # flatten_to_nested -> from_dict -> to_plan_body.
+        # date property (epoch milliseconds), must come out the other end --
+        # not be silently dropped anywhere along flatten_to_nested ->
+        # from_dict -> to_plan_body. The flat `to` is the LAST covered day, and
+        # Famly's plan `to` is the first day NOT covered: one day later.
         plan_input, body = self._final_body(to=_epoch_ms("2026-12-19"))
 
-        self.assertEqual(plan_input.to_date, "2026-12-19")
-        self.assertEqual(body["plan"]["to"], "2026-12-19")
+        self.assertEqual(plan_input.to_date, "2026-12-20")
+        self.assertEqual(body["plan"]["to"], "2026-12-20")
         self.assertEqual(input_schema.validate(plan_input), [])
 
     def test_an_already_iso_to_value_reaches_the_final_plan_body(self):
         plan_input, body = self._final_body(to="2026-12-19")
 
-        self.assertEqual(body["plan"]["to"], "2026-12-19")
+        self.assertEqual(body["plan"]["to"], "2026-12-20")
 
     def test_no_to_value_gives_an_open_ended_plan(self):
         plan_input, body = self._final_body()
@@ -275,6 +276,90 @@ class EndToEndTests(unittest.TestCase):
         matching = [e for e in errors if e.startswith("to:")]
         self.assertEqual(len(matching), 1)
         self.assertIn("notarealdate", matching[0])
+
+
+# --------------------------------------------------------------------------- #
+# Famly's plan `to` is the first day NOT covered. A flat payload's `to` is the
+# LAST covered day, so the flattener -- and only the flattener -- adds one day.
+# --------------------------------------------------------------------------- #
+class ExclusiveEndConversionTests(unittest.TestCase):
+    def test_the_conversions_asked_for(self):
+        for last_day, sent in (
+            ("2028-08-31", "2028-09-01"),
+            ("2026-12-31", "2027-01-01"),
+            ("2028-02-29", "2028-03-01"),  # a leap day
+            ("2027-02-28", "2027-03-01"),  # not a leap year
+            ("2026-09-30", "2026-10-01"),
+            ("2026-01-31", "2026-02-01"),
+        ):
+            with self.subTest(last_day=last_day):
+                self.assertEqual(flatten.exclusive_end(last_day), sent)
+
+    def test_empty_stays_null(self):
+        for empty in (None, "", "   "):
+            with self.subTest(empty=empty):
+                self.assertIsNone(flatten.exclusive_end(empty))
+
+    def test_hubspot_epoch_milliseconds_are_converted_then_advanced(self):
+        self.assertEqual(flatten.exclusive_end(_epoch_ms("2026-12-31")), "2027-01-01")
+
+    def test_a_datetime_string_uses_its_date_part(self):
+        self.assertEqual(flatten.exclusive_end("2026-12-31T00:00:00Z"), "2027-01-01")
+
+    def test_something_that_is_not_a_date_passes_through_for_validate_to_report(self):
+        self.assertEqual(flatten.exclusive_end("notarealdate"), "notarealdate")
+        self.assertEqual(flatten.exclusive_end("2026-13-45"), "2026-13-45")
+
+    def test_the_last_representable_day_does_not_raise(self):
+        self.assertEqual(flatten.exclusive_end("9999-12-31"), "9999-12-31")
+
+
+class ExclusiveEndEndToEndTests(unittest.TestCase):
+    """Through the flattener, the schema and the body: leave + 1, exactly once."""
+
+    setUp = EndToEndTests.setUp
+    _final_body = EndToEndTests._final_body
+
+    def test_the_body_sends_the_last_day_plus_one_exactly_once(self):
+        for last_day, sent in (
+            ("2028-08-31", "2028-09-01"),
+            ("2026-12-31", "2027-01-01"),
+            ("2028-02-29", "2028-03-01"),
+        ):
+            with self.subTest(last_day=last_day):
+                plan_input, body = self._final_body(to=last_day)
+
+                self.assertEqual(body["plan"]["to"], sent)  # not last_day + 2
+                self.assertEqual(plan_input.to_date, sent)
+                self.assertEqual(input_schema.validate(plan_input), [])
+
+    def test_empty_stays_null_in_the_body(self):
+        for empty in ("", None):
+            with self.subTest(empty=empty):
+                _, body = self._final_body(to=empty)
+
+                self.assertIsNone(body["plan"]["to"])
+                self.assertIn("to", body["plan"])
+
+    def test_from_is_not_moved(self):
+        _, body = self._final_body(to="2026-12-31")
+
+        self.assertEqual(body["plan"]["from"], "2026-09-01")
+
+    def test_a_body_is_not_converted_again_when_it_is_read_back_into_the_schema(self):
+        # Only the FLAT contract is "last covered day". A nested body (the CSV
+        # path, a stored plan) already carries Famly's exclusive end.
+        nested = flatten.flatten_to_nested(flat_payload(to="2026-12-31"))
+        once = input_schema.to_plan_body(input_schema.from_dict(nested))
+        twice = input_schema.to_plan_body(input_schema.from_dict(once["plan"]))
+
+        self.assertEqual(once["plan"]["to"], "2027-01-01")
+        self.assertEqual(twice["plan"]["to"], "2027-01-01")
+
+    def test_flattening_twice_is_not_a_thing_the_nested_dict_survives(self):
+        nested = flatten.flatten_to_nested(flat_payload(to="2026-12-31"))
+
+        self.assertEqual(nested["to"], "2027-01-01")
 
 
 if __name__ == "__main__":

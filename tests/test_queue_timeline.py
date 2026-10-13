@@ -435,7 +435,7 @@ class CleanChainTests(QueueTestCase):
         self.queue()
         self.run_all()
 
-        self.assertEqual([self.sent(c)["to"] for c in self.famly.commits], [None, None, "2027-07-31"])
+        self.assertEqual([self.sent(c)["to"] for c in self.famly.commits], [None, None, "2027-08-01"])
         for call in self.famly.commits[1:]:
             self.assertEqual(call["params"]["replaceOldPlan"], "false")
 
@@ -445,7 +445,7 @@ class CleanChainTests(QueueTestCase):
 
         self.assertEqual(
             [(p["from"], p["to"]) for p in self.famly.plans],
-            [("2026-09-01", "2026-11-01"), ("2026-11-01", "2027-01-01"), ("2027-01-01", "2027-07-31")],
+            [("2026-09-01", "2026-11-01"), ("2026-11-01", "2027-01-01"), ("2027-01-01", "2027-08-01")],
         )
 
     def test_the_funded_plan_uses_the_servers_funding_rules(self):
@@ -1714,6 +1714,50 @@ class SiteCodeFromInstitutionTests(QueueTestCase):
             self.run_all()
 
         self.assertTrue(all(s["dry_run"]["clean"] for s in self.job(data).segments))
+
+class FinalEndDateTests(QueueTestCase):
+    def end_warnings(self):
+        return [n for n in self.notices if "was sent" in n and "end date" in n]
+
+    def test_the_final_plan_is_sent_leave_plus_one_and_the_others_no_end(self):
+        self.queue()
+        self.run_all()
+
+        self.assertEqual([self.sent(c)["to"] for c in self.famly.commits], [None, None, "2027-08-01"])
+
+    def test_a_matching_saved_end_date_is_quiet(self):
+        self.queue()
+        self.run_all()
+
+        self.assertEqual(self.end_warnings(), [])
+
+    def test_a_saved_end_date_that_differs_warns_once_and_the_job_still_completes(self):
+        data = self.queue()
+        real_post = self.famly.post
+
+        def post(path, params=None, json_body=None):
+            node = real_post(path, params, json_body)
+            if (params or {}).get("preview") == "false" and self.famly.commit_attempts == 3:
+                self.famly.plans[-1]["to"] = "2027-07-31"
+            return node
+
+        with mock.patch.object(self.famly, "post", post):
+            self.run_all()
+
+        self.assertEqual(self.job(data).status, jobs.STATUS_DONE)
+        warnings = self.end_warnings()
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("saved end date is 2027-07-31", warnings[0])
+        self.assertIn("2027-08-01 was sent", warnings[0])
+
+    def test_the_headings_stay_inclusive(self):
+        data = self.queue()
+
+        self.assertEqual(self.job(data).segments[-1]["to"], "2027-07-31")
+        self.assertEqual(
+            harness.engine.heading_text(self.job(data).segments, 2),
+            "Plan 3 of 3 (base, 2027-01-01 to 2027-07-31)",
+        )
 
 
 if __name__ == "__main__":

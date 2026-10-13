@@ -231,7 +231,9 @@ def segment_payload(base: dict, segment: dict, *, is_last: bool) -> dict:
 
       * `from` is the segment's start. `to` is left EMPTY for every segment but
         the last (Famly trims the previous plan when the next one arrives); the
-        last gets the leave date, or none when there is no leave date.
+        last gets the leave date -- INCLUSIVE, the last day the child attends --
+        or none when there is no leave date. The flattener turns that into
+        Famly's exclusive end (leave + 1 day), once; it is not done here.
       * a FUNDED segment books the funded session variants (`funded` true) and
         gets its three funding settings -- method, weekly hours and the cap --
         from the SERVER's per-institution rules (`integrations.funding_rules`),
@@ -605,6 +607,34 @@ def _find(plans: list, plan_id):
     return next((p for p in plans if plan_id and p.id == plan_id), None)
 
 
+def sent_end(segment: dict) -> str | None:
+    """The plan `to` the flattener sends for a FINAL segment: leave + 1 day.
+
+    None when there is no leave date. Uses the flattener's own conversion, so
+    "what was sent" is defined in one place.
+    """
+    return hubspot_flatten.exclusive_end(segment.get("to"))
+
+
+def final_end_problem(segment: dict, plan) -> str | None:
+    """Why the saved final plan's `to` is not the date that was sent, or None.
+
+    A WARNING for a human, never a stop: the plan is saved and the rest is
+    sound, but the child would be billed to the wrong day.
+    """
+    expected = sent_end(segment)
+    saved = _day(plan.to)
+    if (expected is None and plan.to in (None, "")) or (
+        expected is not None and saved is not None and saved.isoformat() == expected
+    ):
+        return None
+    return (
+        f"the saved end date is {plan.to or 'open-ended'}, but {expected or 'no end date'} "
+        f"was sent (Famly's end date is exclusive: the leave date {segment.get('to') or 'none'} "
+        f"plus one day)"
+    )
+
+
 def join_problem(previous, this) -> str | None:
     """Why `previous` does not meet `this`, or None when it does.
 
@@ -688,6 +718,16 @@ def _verify_and_advance(chain: chains.Chain, index: int) -> None:
             f"{READBACK_DELAY_SECONDS}s apart), so it could not be verified.",
         )
         return
+
+    # The FINAL plan's end date: the saved `to` must be the date that was sent.
+    if index == chain.last_index:
+        end_problem = final_end_problem(chain.segments[index], this)
+        if end_problem:
+            logger.warning("END DATE CHECK chain_id=%s %s: %s", chain.chain_id, name, end_problem)
+            slack.post_notice(
+                f":warning: {name} (`{plan_id}`) — {end_problem}. The chain is "
+                f"complete; please check the plan's end date in Famly."
+            )
 
     # Automatic rounding: each saved period's estimate plus its adjustment must
     # equal the target. A miss is a WARNING for a human, never a stop -- the

@@ -24,6 +24,7 @@ import tempfile
 import unittest
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from actions.create_timeline import chains, engine, maintenance
@@ -361,7 +362,7 @@ class BaseOnlyTests(ChainTestCase):
         self.assertNotIn("oldPlanId", call["params"])
         self.assertNotIn("replaceOldPlan", call["params"])
         self.assertEqual(self.sent(call)["from"], "2026-09-01")
-        self.assertEqual(self.sent(call)["to"], "2027-07-31")
+        self.assertEqual(self.sent(call)["to"], "2027-08-01")  # leave 2027-07-31, plus one day
 
     def test_approving_it_completes_the_chain(self):
         data = self.run_all()
@@ -404,7 +405,7 @@ class FundedInTheMiddleTests(ChainTestCase):
         self.run_all(with_funding())
 
         ends = [self.sent(c)["to"] for c in self.famly.commits]
-        self.assertEqual(ends, [None, None, "2027-07-31"])
+        self.assertEqual(ends, [None, None, "2027-08-01"])
         starts = [self.sent(c)["from"] for c in self.famly.commits]
         self.assertEqual(starts, ["2026-09-01", "2026-11-01", "2027-01-01"])
 
@@ -573,7 +574,7 @@ class OverlapTests(ChainTestCase):
                 ("2026-10-01", "2026-11-01"),
                 ("2026-11-01", "2026-12-01"),
                 ("2026-12-01", "2027-04-01"),
-                ("2027-04-01", "2027-07-31"),
+                ("2027-04-01", "2027-08-01"),
             ],
         )
 
@@ -1779,7 +1780,7 @@ class ChainResumeTests(SweepTestCase):
 
         self.assertEqual(self.chain(data).status, chains.STATUS_COMPLETE)
         self.assertEqual(
-            [self.sent(c)["to"] for c in self.famly.commits], [None, None, "2027-07-31"]
+            [self.sent(c)["to"] for c in self.famly.commits], [None, None, "2027-08-01"]
         )
 
     def test_refuses_when_the_next_preview_is_already_pending(self):
@@ -2208,6 +2209,187 @@ class ExclusiveEndTests(ChainTestCase):
         )
         self.assertEqual(self.heading(), "*Plan 1 of 3 (base, 2026-09-01 to 2026-10-31)*")
 
+# --------------------------------------------------------------------------- #
+# The final plan's end date: Famly's `to` is leave + 1 day, sent exactly once
+# --------------------------------------------------------------------------- #
+class FinalEndDateTests(ChainTestCase):
+    def last_sent_end(self, **overrides):
+        self.run_all(payload(**overrides))
+        return self.sent(self.famly.commits[-1])["to"]
+
+    def test_leave_plus_one_day_for_the_dates_asked_for(self):
+        for leave, sent in (
+            ("2028-08-31", "2028-09-01"),
+            ("2026-12-31", "2027-01-01"),
+            ("2028-02-29", "2028-03-01"),
+        ):
+            with self.subTest(leave=leave):
+                self.famly.plans.clear()
+                self.famly.posts.clear()
+                self.famly._commits = 0
+                with mock.patch.object(approval, "_spawn", lambda work: work()):
+                    data, _ = self.start(payload(leave_date=leave, start_date="2026-09-01"))
+                    self.approve()
+                self.assertEqual(self.sent(self.famly.commits[-1])["to"], sent)
+                chains.finish(data["chain_id"], chains.STATUS_CANCELLED)
+                self.previews_posted.clear()
+
+    def test_no_leave_date_stays_null(self):
+        self.assertIsNone(self.last_sent_end(leave_date=""))
+
+    def test_the_final_plan_has_leave_plus_one_exactly_once_in_every_request(self):
+        self.run_all(with_funding())
+
+        final_from = "2027-01-01"
+        for call in self.famly.posts:
+            if self.sent(call)["from"] == final_from:
+                self.assertEqual(self.sent(call)["to"], "2027-08-01")  # preview AND commit
+
+    def test_intermediate_plans_have_no_end_date(self):
+        self.run_all(with_funding())
+
+        ends = [self.sent(c)["to"] for c in self.famly.commits]
+        self.assertEqual(ends[:-1], [None, None])
+        for call in self.famly.posts:
+            if self.sent(call)["from"] != "2027-01-01":
+                self.assertIsNone(self.sent(call)["to"])
+
+    def test_the_slack_heading_still_shows_the_inclusive_leave_date(self):
+        self.start(with_funding())
+        self.approve()
+        self.approve()
+
+        self.assertEqual(self.heading(), "*Plan 3 of 3 (base, 2027-01-01 to 2027-07-31)*")
+
+    def test_the_chain_record_and_segments_stay_inclusive(self):
+        data, _ = self.start(with_funding())
+
+        self.assertEqual(data["segments"][-1]["to"], "2027-07-31")
+        self.assertEqual(self.chain(data).segments[-1]["to"], "2027-07-31")
+
+    def test_the_segment_payload_still_carries_the_inclusive_date(self):
+        segment = {"from": "2027-01-01", "to": "2027-07-31", "funded": False, "advanced": False}
+        built = engine.segment_payload(engine.clean_payload(payload()), segment, is_last=True)
+
+        self.assertEqual(built["to"], "2027-07-31")  # the flattener adds the day, not this
+
+    def test_the_stored_body_is_not_shifted_again_by_adjust_and_approve(self):
+        data, _ = self.start(with_funding())
+        self.approve()
+        self.approve()  # plan 3 (the final plan) is now posted
+        original = preview_store.get(self.last_preview_id())
+
+        approval.handle_adjust_submission(original.preview_id, "0.25", "drew", spawn=lambda w: w())
+        adjusted = preview_store.get(self.adjusted_posted[-1][1])
+
+        self.assertEqual(original.plan_body["plan"]["to"], "2027-08-01")
+        self.assertEqual(adjusted.plan_body["plan"]["to"], "2027-08-01")
+
+    def test_plan_preview_converts_a_flat_to_once(self):
+        from actions.plan_write import web as plan_write_web
+
+        plan_write_web.handle(payload(**{"from": "2026-09-01", "to": "2026-12-31"}))
+
+        self.assertEqual(self.sent(self.famly.previews[0])["to"], "2027-01-01")
+
+    def test_additional_plan_converts_a_flat_to_once(self):
+        from actions.additional_plan import web as additional_plan_web
+
+        self.famly.plans.append({"id": "existing", "childId": CHILD, "from": "2025-09-01", "to": None})
+        additional_plan_web.handle(
+            payload(**{"from": "2026-09-01", "to": "2026-12-31"}), sleeper=lambda s: None
+        )
+
+        self.assertEqual(self.sent(self.famly.previews[0])["to"], "2027-01-01")
+
+
+class FinalEndDateReadBackTests(ChainTestCase):
+    def saved_end_becomes(self, value, body=None):
+        """Run the chain; the moment the FINAL plan is written Famly keeps `value`."""
+        real_post = self.famly.post
+
+        def post(path, params=None, json_body=None):
+            node = real_post(path, params, json_body)
+            if (params or {}).get("preview") == "false" and self.famly._commits == 3:
+                self.famly.plans[-1]["to"] = value
+            return node
+
+        with mock.patch.object(self.famly, "post", post):
+            return self.run_all(body if body is not None else with_funding())
+
+    def end_warnings(self):
+        return [n for n in self.notices if "end date" in n and "was sent" in n]
+
+    def test_a_saved_end_date_that_matches_the_one_sent_is_quiet(self):
+        self.run_all(with_funding())
+
+        self.assertEqual(self.end_warnings(), [])
+
+    def test_the_inclusive_date_saved_instead_posts_a_warning_and_stops_nothing(self):
+        data = self.saved_end_becomes("2027-07-31")  # Famly kept the leave date itself
+
+        warnings = self.end_warnings()
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("saved end date is 2027-07-31", warnings[0])
+        self.assertIn("2027-08-01 was sent", warnings[0])
+        self.assertEqual(self.chain(data).status, chains.STATUS_COMPLETE)
+        self.assertTrue(any("All 3 plans created" in n for n in self.notices))
+
+    def test_an_end_date_saved_as_open_ended_posts_a_warning(self):
+        self.saved_end_becomes(None)
+
+        self.assertEqual(len(self.end_warnings()), 1)
+        self.assertIn("open-ended", self.end_warnings()[0])
+
+    def test_with_no_leave_date_an_end_date_appearing_posts_a_warning(self):
+        self.famly._commits = 0
+        self.saved_end_becomes("2027-08-01", body=with_funding(leave_date=""))
+
+        warnings = self.end_warnings()
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("no end date was sent", warnings[0])
+
+    def test_with_no_leave_date_and_no_saved_end_it_is_quiet(self):
+        self.run_all(with_funding(leave_date=""))
+
+        self.assertEqual(self.end_warnings(), [])
+
+    def test_only_the_final_plan_is_checked_for_an_end_date(self):
+        self.run_all(with_funding())  # plans 1 and 2 are saved with a `to` set by Famly's trim
+
+        self.assertEqual(self.end_warnings(), [])
+
+    def test_the_helpers(self):
+        final = {"from": "2027-01-01", "to": "2027-07-31"}
+        open_ended = {"from": "2027-01-01", "to": None}
+        plan = lambda to: SimpleNamespace(to=to)  # noqa: E731
+
+        self.assertEqual(engine.sent_end(final), "2027-08-01")
+        self.assertIsNone(engine.sent_end(open_ended))
+        self.assertIsNone(engine.final_end_problem(final, plan("2027-08-01")))
+        self.assertIsNone(engine.final_end_problem(final, plan("2027-08-01T00:00:00Z")))
+        self.assertIsNone(engine.final_end_problem(open_ended, plan(None)))
+        self.assertIn("2027-07-31", engine.final_end_problem(final, plan("2027-07-31")))
+        self.assertIn("open-ended", engine.final_end_problem(final, plan(None)))
+        self.assertIn("no end date was sent", engine.final_end_problem(open_ended, plan("2027-08-01")))
+
+
+class SummaryShowsTheLastCoveredDayTests(unittest.TestCase):
+    def summary(self, to):
+        from actions.read_child_plans.runner import Plan
+        from integrations import slack as slack_module
+
+        return slack_module.build_summary(Plan(id="p", child_id=CHILD, from_="2026-09-01", to=to), [])
+
+    def test_famlys_exclusive_end_is_shown_as_the_last_day(self):
+        self.assertIn("Dates: 2026-09-01 → 2026-12-31", self.summary("2027-01-01"))
+        self.assertIn("→ 2028-02-29", self.summary("2028-03-01"))
+
+    def test_open_ended_is_unchanged(self):
+        self.assertIn("→ open-ended", self.summary(None))
+
+    def test_a_value_that_is_not_a_date_is_shown_as_it_is(self):
+        self.assertIn("→ notadate", self.summary("notadate"))
 
 
 if __name__ == "__main__":
