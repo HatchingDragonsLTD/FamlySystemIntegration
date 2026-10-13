@@ -8,8 +8,11 @@ stored as a job, and answered at once with the job id. The worker
 Nothing here calls Famly. Enqueueing is ONE atomic INSERT and the database settles
 races between simultaneous webhooks (two gunicorn workers at once):
 
-    identical request (same child, start date, allow-listed payload)
+    identical request (same child, start date, allow-listed payload) while a
+    job for it is queued, running, held or done
         -> 200 with the EXISTING job's id and `already_queued: true`
+        (a failed or cancelled job does not count: the same request then makes
+        a new job)
     a different request for a child that already has an active job
         -> 409 with that job's id, and a Slack notice saying so, with the
            `queue-cancel` command to replace it

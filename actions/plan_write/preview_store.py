@@ -141,11 +141,14 @@ _JOBS_ADDED_COLUMNS: dict[str, str] = {}
 # beforehand: two gunicorn workers handling webhooks at once both INSERT, and
 # exactly one wins. Two indexes do it:
 #
-#   * the idempotency key is UNIQUE outright -- an identical request, whatever
-#     became of the first, is the same job;
+#   * the idempotency key is unique among LIVE jobs (queued, running, held or
+#     done): an identical request while one is active or finished is the same
+#     job. A failed or cancelled job does not hold its key, so the same request
+#     can be submitted again and gets a new job;
 #   * a child can have at most ONE active job (queued, running or held).
 _JOBS_KEY_UNIQUE = """
-CREATE UNIQUE INDEX IF NOT EXISTS jobs_job_key_unique ON jobs (job_key)
+CREATE UNIQUE INDEX IF NOT EXISTS jobs_live_job_key ON jobs (job_key)
+WHERE status IN ('queued', 'running', 'held', 'done')
 """
 
 _JOBS_ONE_ACTIVE_PER_CHILD = """
@@ -153,8 +156,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS jobs_one_active_per_child
 ON jobs (child_id) WHERE status IN ('queued', 'running', 'held')
 """
 
-# The earlier, weaker key index (unique only among live jobs). Replaced above.
-_JOBS_OLD_KEY_INDEX = "jobs_one_live_per_key"
+# Earlier key indexes, replaced by the one above: dropped when found.
+_JOBS_OLD_KEY_INDEXES = ("jobs_one_live_per_key", "jobs_job_key_unique")
 
 _QUEUE_STATE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS queue_state (
@@ -274,7 +277,7 @@ def _schema_version() -> int:
             _QUEUE_STATE_SCHEMA,
             _JOBS_KEY_UNIQUE,
             _JOBS_ONE_ACTIVE_PER_CHILD,
-            _JOBS_OLD_KEY_INDEX,
+            _JOBS_OLD_KEY_INDEXES,
             sorted(_ADDED_COLUMNS.items()),
             sorted(_CHAINS_ADDED_COLUMNS.items()),
             sorted(_JOBS_ADDED_COLUMNS.items()),
@@ -330,11 +333,12 @@ def _ensure_schema(connection: sqlite3.Connection) -> None:
         connection.execute(_QUEUE_STATE_SCHEMA)
         _migrate(connection)
         connection.execute(_CHAINS_ONE_ACTIVE)
-        if connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?",
-            (_JOBS_OLD_KEY_INDEX,),
-        ).fetchone():
-            connection.execute(f"DROP INDEX {_JOBS_OLD_KEY_INDEX}")
+        for old_index in _JOBS_OLD_KEY_INDEXES:
+            if connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?",
+                (old_index,),
+            ).fetchone():
+                connection.execute(f"DROP INDEX {old_index}")
         connection.execute(_JOBS_KEY_UNIQUE)
         connection.execute(_JOBS_ONE_ACTIVE_PER_CHILD)
         connection.execute(f"PRAGMA user_version = {version}")
