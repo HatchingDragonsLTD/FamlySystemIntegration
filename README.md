@@ -284,6 +284,15 @@ carry child data — only the sample is committed.
 the deal's `institution` and `termTimeOnly`. HubSpot sending any of them is a
 no-op.
 
+**End dates.** In a flat HubSpot payload, `to` is the **last day the child is
+covered** (the leave date, inclusive). Famly's plan `to` is the first day *not*
+covered, so the plan body sends `to` plus one day (`2026-12-31` becomes
+`2027-01-01`, `2028-02-29` becomes `2028-03-01`; empty stays null). The
+conversion happens once, in `hubspot_flatten.exclusive_end`, and nothing after it
+touches `to`. `from` is unchanged. Slack headings and the `create_timeline`
+segments keep the inclusive date; the Slack summary's "Dates" line shows the last
+covered day too. A plan read back from Famly carries the exclusive date.
+
 `actions/plan_write/hubspot_intake.py` accepts the same payload, nested under
 `properties` or `data` or neither:
 

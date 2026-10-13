@@ -39,7 +39,7 @@ import hmac
 import json
 import logging
 import time
-from datetime import date
+from datetime import date, timedelta
 from typing import Any
 from urllib.parse import parse_qs
 
@@ -299,6 +299,16 @@ def _session_price(booking: Any, pricing_group_id: str | None) -> Any | None:
     return None
 
 
+def _last_covered_day(exclusive_to: Any) -> str | None:
+    """The day before Famly's (exclusive) plan `to`; the value itself if not a date."""
+    if not exclusive_to:
+        return None
+    try:
+        return (date.fromisoformat(str(exclusive_to)[:10]) - timedelta(days=1)).isoformat()
+    except (ValueError, OverflowError):
+        return str(exclusive_to)
+
+
 def build_summary(
     plan: Any,
     warnings: list,
@@ -309,6 +319,7 @@ def build_summary(
     child_name: str | None = None,
     heading: str | None = None,
     rounding: list | None = None,
+    funding_clamp: Any = None,
 ) -> str:
     """Format a previewed plan as plain, scannable Slack text for an approver.
 
@@ -333,6 +344,10 @@ def build_summary(
         rounding: the periods automatic rounding adjusted (objects with
             `from_`, `estimate`, `target`), each shown as
             "Rounded: 269.03 -> 270.00". None or empty shows nothing.
+        funding_clamp: set when the funded hours were brought down to the hours
+            Famly can fund (objects with `hours` and `entitlement_hours`,
+            Decimals); shown as "Funding set to scheduled hours: 27.5h
+            (entitlement 33h)". None shows nothing.
 
     Either map may be None or empty: an unresolved id is shown as the id
     itself. A readable label is a nicety and must never cost the approver the
@@ -358,7 +373,9 @@ def build_summary(
 
     child_id = getattr(plan, "child_id", None) or "unknown"
     date_from = getattr(plan, "from_", None) or "unknown"
-    date_to = getattr(plan, "to", None) or "open-ended"
+    # Famly's plan `to` is the first day NOT covered; the approver knows the
+    # LAST covered day (the leave date), so that is what the line shows.
+    date_to = _last_covered_day(getattr(plan, "to", None)) or "open-ended"
 
     site_label = (site or {}).get("label") if isinstance(site, dict) else None
 
@@ -459,6 +476,17 @@ def build_summary(
         if len(periods) > 1:
             line += f" (from {str(period.from_ or 'unknown')[:10]})"
         lines.append(line)
+
+    # --- Funded hours brought down to the scheduled hours ------------------- #
+    if funding_clamp is not None:
+        def _hours(value: Any) -> str:
+            text = f"{value:.2f}".rstrip("0").rstrip(".")
+            return text or "0"
+
+        lines.append(
+            f"• Funding set to scheduled hours: {_hours(funding_clamp.hours)}h "
+            f"(entitlement {_hours(funding_clamp.entitlement_hours)}h)"
+        )
 
     # --- Public funding, only when funded ---------------------------------- #
     funding = _current_public_funding(plan, today)

@@ -47,7 +47,7 @@ from decimal import Decimal
 import requests
 
 from actions.create_timeline import engine
-from actions.plan_write import approval, auto_round, preview_store, rounding
+from actions.plan_write import approval, auto_round, funded_hours, preview_store, rounding
 from actions.plan_write import web as plan_write_web
 from actions.read_child_plans import runner as read_child_plans
 from core.rest_client import RestHTTPError
@@ -74,7 +74,7 @@ RATE_LIMIT_BACKOFF_SECONDS = 30
 
 # Famly warnings that are information, not a problem, and so do not make a plan
 # unclean. Matched on the lowercased title.
-INFORMATIONAL_TITLES = ("funding limit",)
+INFORMATIONAL_TITLES = funded_hours.INFORMATIONAL_TITLE_FRAGMENTS
 
 _sleep = time.sleep
 
@@ -344,6 +344,17 @@ def check_state(job: jobs.Job, plans: list) -> str | None:
             return f"plan `{later}`: {problem}"
 
     last = by_id[ids[-1]]
+
+    # The final plan's end date: the saved `to` must be the date that was sent
+    # (leave + 1 day). A warning, not a failure -- the plan is saved.
+    if len(done) == len(job.segments):
+        end_problem = engine.final_end_problem(done[-1], last)
+        if end_problem:
+            slack.post_notice(
+                f":warning: Queue job `{job.job_id}`: plan `{last.id}` — {end_problem}. "
+                f"The job is complete; please check the plan's end date in Famly."
+            )
+
     off = rounding.check_saved(last)
     if off:
         slack.post_notice(

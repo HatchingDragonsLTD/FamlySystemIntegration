@@ -36,7 +36,7 @@ from actions.read_child_plans.runner import (
 )
 from integrations import catalogue, child_lookup, slack
 
-from . import auto_round, hubspot_intake, preview_store
+from . import auto_round, funded_hours, hubspot_intake, preview_store
 from . import warnings as plan_warnings
 
 logger = logging.getLogger(__name__)
@@ -143,6 +143,7 @@ class Prepared:
     warnings: list = dataclasses.field(default_factory=list)  # serialised
     rounded_periods: list = dataclasses.field(default_factory=list)
     outcome: Any = None  # the auto_round.Outcome, when auto-rounding was on
+    funding_clamp: Any = None  # the funded_hours.Outcome, when hours were clamped
     site: dict = dataclasses.field(default_factory=dict)
     preview_id: str | None = None
 
@@ -255,10 +256,43 @@ def prepare_preview(
         # is posted to Slack: there is no plan to approve.
         return Prepared(data=data, status=422, result=result, preview=preview, warnings=warnings)
 
+    store_body = result.plan_body or {}
+
+    # Funded hours are clamped to the hours Famly can actually fund, BEFORE
+    # rounding: the rounding then verifies and adjusts the clamped plan. When
+    # the clamp cannot be verified it is discarded and the original body and
+    # Famly's own warning stand. See funded_hours.py.
+    funding_clamp = None
+    if funded_hours.funded_settings(store_body) is not None:
+        try:
+            clamp = funded_hours.apply(
+                store_body,
+                preview,
+                PLAN_VERSION,
+                old_plan_id=old_plan_id,
+                replace_old_plan=replace_old_plan,
+            )
+        except Exception:  # noqa: BLE001 - a clamp problem must never break a preview
+            logger.exception("Funded-hours clamp failed; previewing the plan unclamped")
+            clamp = funded_hours.Outcome(body=store_body, preview=preview)
+        if clamp.applied:
+            funding_clamp = clamp
+            store_body = clamp.body
+            # The re-priced plan is the plan now: its warnings and figures are
+            # what the approver (and the queue's clean-check) see.
+            preview = result.result = clamp.preview
+            warnings[:] = _serialise_warnings(result.warnings)
+            data["plan"] = _plan_summary(preview.plan)
+        elif clamp.reason:
+            warnings.extend(
+                _serialise_warnings(
+                    [plan_warnings.local_warning(f"Funded hours not clamped: {clamp.reason}")]
+                )
+            )
+
     # Automatic rounding of the monthly totals: the body that is stored, and so
     # committed, carries the adjustments. When it cannot be applied safely the
     # plan goes ahead exactly as previewed. See auto_round.py.
-    store_body = result.plan_body or {}
     rounded_periods: list = []
     outcome = None
     if auto_round.enabled(hubspot_intake.unwrap_payload(payload)):
@@ -336,6 +370,7 @@ def prepare_preview(
         warnings=warnings,
         rounded_periods=rounded_periods,
         outcome=outcome,
+        funding_clamp=funding_clamp,
         site=site,
         preview_id=preview_id,
     )
@@ -373,6 +408,7 @@ def post_prepared(
             child_name=child_name,
             heading=heading,
             rounding=prepared.rounded_periods,
+            funding_clamp=prepared.funding_clamp,
         ),
         prepared.preview_id,
     )
