@@ -27,6 +27,8 @@ import json
 import logging
 import os
 import sqlite3
+import time
+import zlib
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -135,12 +137,24 @@ CREATE TABLE IF NOT EXISTS jobs (
 
 _JOBS_ADDED_COLUMNS: dict[str, str] = {}
 
-# A duplicate request returns the existing job -- but only while that job is
-# alive or finished. A failed or cancelled job does not block asking again.
-_JOBS_ONE_LIVE_PER_KEY = """
-CREATE UNIQUE INDEX IF NOT EXISTS jobs_one_live_per_key
-ON jobs (job_key) WHERE status IN ('queued', 'running', 'held', 'done')
+# ENQUEUEING IS CONCURRENCY-SAFE BECAUSE THE DATABASE DECIDES, not a check made
+# beforehand: two gunicorn workers handling webhooks at once both INSERT, and
+# exactly one wins. Two indexes do it:
+#
+#   * the idempotency key is UNIQUE outright -- an identical request, whatever
+#     became of the first, is the same job;
+#   * a child can have at most ONE active job (queued, running or held).
+_JOBS_KEY_UNIQUE = """
+CREATE UNIQUE INDEX IF NOT EXISTS jobs_job_key_unique ON jobs (job_key)
 """
+
+_JOBS_ONE_ACTIVE_PER_CHILD = """
+CREATE UNIQUE INDEX IF NOT EXISTS jobs_one_active_per_child
+ON jobs (child_id) WHERE status IN ('queued', 'running', 'held')
+"""
+
+# The earlier, weaker key index (unique only among live jobs). Replaced above.
+_JOBS_OLD_KEY_INDEX = "jobs_one_live_per_key"
 
 _QUEUE_STATE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS queue_state (
@@ -244,24 +258,91 @@ def _open():
         connection.close()
 
 
+def _schema_version() -> int:
+    """A number that changes whenever the schema definitions below do.
+
+    Stored in the file's `user_version`, so a connection can tell in one cheap
+    READ whether the schema is current -- and only a connection that finds it
+    stale takes the write lock to fix it.
+    """
+    definitions = repr(
+        (
+            _SCHEMA,
+            _CHAINS_SCHEMA,
+            _CHAINS_ONE_ACTIVE,
+            _JOBS_SCHEMA,
+            _QUEUE_STATE_SCHEMA,
+            _JOBS_KEY_UNIQUE,
+            _JOBS_ONE_ACTIVE_PER_CHILD,
+            _JOBS_OLD_KEY_INDEX,
+            sorted(_ADDED_COLUMNS.items()),
+            sorted(_CHAINS_ADDED_COLUMNS.items()),
+            sorted(_JOBS_ADDED_COLUMNS.items()),
+        )
+    )
+    return (zlib.crc32(definitions.encode("utf-8")) & 0x7FFFFFFF) or 1
+
+
 def _connect() -> sqlite3.Connection:
-    """Open the store, creating the file and schema on first use."""
+    """Open the store, creating the file and schema on first use.
+
+    Safe for several processes opening it at once (two gunicorn workers, the
+    queue worker): the busy timeout makes writers wait for each other, and the
+    schema is created and migrated under ONE write lock by whichever connection
+    gets there first -- the others find it done.
+    """
     path = store_path()
     path.parent.mkdir(parents=True, exist_ok=True)
 
     connection = sqlite3.connect(path, timeout=10)
     connection.row_factory = sqlite3.Row
-    # Concurrent workers: WAL lets a reader run while another writes.
-    connection.execute("PRAGMA journal_mode=WAL")
-    connection.execute(_SCHEMA)
-    connection.execute(_CHAINS_SCHEMA)
-    connection.execute(_JOBS_SCHEMA)
-    connection.execute(_QUEUE_STATE_SCHEMA)
-    _migrate(connection)
-    connection.execute(_CHAINS_ONE_ACTIVE)
-    connection.execute(_JOBS_ONE_LIVE_PER_KEY)
-    connection.commit()
+    _ensure_schema(connection)
     return connection
+
+
+def _ensure_schema(connection: sqlite3.Connection) -> None:
+    version = _schema_version()
+    if connection.execute("PRAGMA user_version").fetchone()[0] == version:
+        return  # current: nothing to write, no lock taken
+
+    # Concurrent workers: WAL lets a reader run while another writes. It is
+    # persistent in the file, so this is only ever needed once; switching can
+    # briefly find the file busy while another connection does the same.
+    for attempt in range(100):
+        try:
+            if connection.execute("PRAGMA journal_mode").fetchone()[0].lower() != "wal":
+                connection.execute("PRAGMA journal_mode=WAL")
+            break
+        except sqlite3.OperationalError:
+            if attempt == 99:
+                raise
+            time.sleep(0.05)
+
+    connection.execute("BEGIN IMMEDIATE")  # waits (busy timeout) for the write lock
+    try:
+        if connection.execute("PRAGMA user_version").fetchone()[0] == version:
+            connection.execute("COMMIT")  # another connection finished while we waited
+            return
+
+        connection.execute(_SCHEMA)
+        connection.execute(_CHAINS_SCHEMA)
+        connection.execute(_JOBS_SCHEMA)
+        connection.execute(_QUEUE_STATE_SCHEMA)
+        _migrate(connection)
+        connection.execute(_CHAINS_ONE_ACTIVE)
+        if connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?",
+            (_JOBS_OLD_KEY_INDEX,),
+        ).fetchone():
+            connection.execute(f"DROP INDEX {_JOBS_OLD_KEY_INDEX}")
+        connection.execute(_JOBS_KEY_UNIQUE)
+        connection.execute(_JOBS_ONE_ACTIVE_PER_CHILD)
+        connection.execute(f"PRAGMA user_version = {version}")
+        connection.execute("COMMIT")
+    except BaseException:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
 
 
 def _migrate(connection: sqlite3.Connection) -> None:

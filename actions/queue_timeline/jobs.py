@@ -9,7 +9,7 @@ A job row:
 
     job_id       uuid4
     job_key      sha256 of child id + start date + a hash of the allow-listed
-                 payload: the idempotency key
+                 payload: the idempotency key (UNIQUE)
     child_id
     payload      the allow-listed request (no names -- see engine.ALLOWED_FIELDS)
     segments     [{from, to, funded, advanced, plan_id, committed_at, dry_run}]
@@ -18,6 +18,17 @@ A job row:
     detail       the last reason: why held / failed / cancelled
     preview_id   the stored preview a HELD job waits on a human for
     digest_sent  whether a Slack digest has already reported it
+
+ENQUEUEING is a single atomic INSERT, and the database -- not a check made first --
+decides races (see the two unique indexes in preview_store.py):
+
+    * the idempotency key is UNIQUE: an identical request is the same job, in
+      whatever state it has reached (`already_queued`);
+    * a child can have ONE active job (queued, running or held): a different
+      request for a child that has one is refused (`active_conflict`).
+
+Jobs are taken OLDEST FIRST: by `created_at` (stamped by SQLite inside the INSERT,
+so it follows the order the inserts really happened in), then by row.
 
 A job moves:  queued -> running -> done | held | failed | cancelled, and
 held -> queued when a human approves the held plan. `running` is only ever the
@@ -124,34 +135,63 @@ def _row_to_job(row: sqlite3.Row) -> Job:
 # --------------------------------------------------------------------------- #
 # Jobs
 # --------------------------------------------------------------------------- #
-def create(child_id: str, start: str, payload: dict, segments: list[dict]) -> tuple[Job, bool]:
-    """Record a new queued job, or return the existing one for the same request.
+CREATED = "created"
+ALREADY_QUEUED = "already_queued"
+ACTIVE_CONFLICT = "active_conflict"
 
-    Returns (job, created). The duplicate is decided by the database's partial
-    unique index on the key, so two simultaneous identical requests make one job.
+
+@dataclass
+class Enqueued:
+    """What an enqueue did: `job` is the new job, or the existing one it hit."""
+
+    job: Job
+    outcome: str  # CREATED | ALREADY_QUEUED | ACTIVE_CONFLICT
+
+
+def create(child_id: str, start: str, payload: dict, segments: list[dict]) -> Enqueued:
+    """Enqueue a job with ONE atomic INSERT, and let the database settle races.
+
+    No read comes first: the INSERT either succeeds or violates a unique index.
+
+      * the idempotency-key index  -> the existing job, outcome ALREADY_QUEUED
+        (checked first: an identical request is the same job whatever else is
+        true);
+      * the one-active-job-per-child index -> the child's active job, outcome
+        ACTIVE_CONFLICT -- nothing was created.
+
+    `created_at` is stamped by SQLite inside the INSERT, so it follows the order
+    inserts really happened in even when requests race.
     """
     key = job_key(child_id, start, payload)
-    job_id = str(uuid.uuid4())
-    now = _now()
     stored = [{**s, "plan_id": None} for s in segments]
 
-    try:
-        with preview_store.open_store() as connection:
-            connection.execute(
-                "INSERT INTO jobs (job_id, job_key, child_id, payload, segments, "
-                "next_index, status, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)",
-                (job_id, key, child_id, json.dumps(payload), json.dumps(stored),
-                 STATUS_QUEUED, now, now),
-            )
-    except sqlite3.IntegrityError:
-        existing = find_live_by_key(key)
-        if existing is not None:
-            return existing, False
-        raise
+    # A violation names a job that can have finished by the time we look for it
+    # (a rare race); in that case the INSERT is simply tried again.
+    for _attempt in range(3):
+        job_id = str(uuid.uuid4())
+        now = _now()
+        try:
+            with preview_store.open_store() as connection:
+                connection.execute(
+                    "INSERT INTO jobs (job_id, job_key, child_id, payload, segments, "
+                    "next_index, status, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, 0, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?)",
+                    (job_id, key, child_id, json.dumps(payload), json.dumps(stored),
+                     STATUS_QUEUED, now),
+                )
+        except sqlite3.IntegrityError:
+            existing = find_by_key(key)
+            if existing is not None:
+                return Enqueued(existing, ALREADY_QUEUED)
+            active = find_active_for_child(child_id)
+            if active is not None:
+                return Enqueued(active, ACTIVE_CONFLICT)
+            continue
 
-    logger.info("Job queued job_id=%s child_id=%s segments=%d", job_id, child_id, len(segments))
-    return get(job_id), True
+        logger.info("Job queued job_id=%s child_id=%s segments=%d", job_id, child_id, len(segments))
+        return Enqueued(get(job_id), CREATED)
+
+    raise RuntimeError("could not enqueue: the database kept refusing the job")
 
 
 def get(job_id: str) -> Job | None:
@@ -162,11 +202,19 @@ def get(job_id: str) -> Job | None:
     return _row_to_job(row) if row is not None else None
 
 
-def find_live_by_key(key: str) -> Job | None:
+def find_by_key(key: str) -> Job | None:
+    """The job for an idempotency key, in whatever state it is in."""
+    with preview_store.open_store() as connection:
+        row = connection.execute("SELECT * FROM jobs WHERE job_key = ?", (key,)).fetchone()
+    return _row_to_job(row) if row is not None else None
+
+
+def find_active_for_child(child_id: str) -> Job | None:
+    """The child's active (queued, running or held) job, if there is one."""
     with preview_store.open_store() as connection:
         row = connection.execute(
-            "SELECT * FROM jobs WHERE job_key = ? AND status IN (?, ?, ?, ?)",
-            (key, STATUS_QUEUED, STATUS_RUNNING, STATUS_HELD, STATUS_DONE),
+            "SELECT * FROM jobs WHERE child_id = ? AND status IN (?, ?, ?)",
+            (child_id, STATUS_QUEUED, STATUS_RUNNING, STATUS_HELD),
         ).fetchone()
     return _row_to_job(row) if row is not None else None
 
@@ -176,10 +224,10 @@ def list_jobs(status: str | None = None) -> list[Job]:
     with preview_store.open_store() as connection:
         if status:
             rows = connection.execute(
-                "SELECT * FROM jobs WHERE status = ? ORDER BY created_at", (status,)
+                "SELECT * FROM jobs WHERE status = ? ORDER BY created_at, rowid", (status,)
             ).fetchall()
         else:
-            rows = connection.execute("SELECT * FROM jobs ORDER BY created_at").fetchall()
+            rows = connection.execute("SELECT * FROM jobs ORDER BY created_at, rowid").fetchall()
     return [_row_to_job(r) for r in rows]
 
 
@@ -191,10 +239,10 @@ def counts() -> dict[str, int]:
 
 
 def claim_next() -> Job | None:
-    """Take the oldest queued job and mark it running, atomically."""
+    """Take the OLDEST queued job and mark it running, atomically."""
     with preview_store.open_store() as connection:
         row = connection.execute(
-            "SELECT job_id FROM jobs WHERE status = ? ORDER BY created_at LIMIT 1",
+            "SELECT job_id FROM jobs WHERE status = ? ORDER BY created_at, rowid LIMIT 1",
             (STATUS_QUEUED,),
         ).fetchone()
         if row is None:
@@ -286,7 +334,8 @@ def mark_digested(job_ids: list[str]) -> None:
 def undigested_done() -> list[Job]:
     with preview_store.open_store() as connection:
         rows = connection.execute(
-            "SELECT * FROM jobs WHERE status = ? AND digest_sent = 0 ORDER BY created_at",
+            "SELECT * FROM jobs WHERE status = ? AND digest_sent = 0 "
+            "ORDER BY created_at, rowid",
             (STATUS_DONE,),
         ).fetchall()
     return [_row_to_job(r) for r in rows]
