@@ -997,5 +997,295 @@ class NoNamesAndNoCommitTests(DeleteTestCase):
         self.assertNotIn(".post(", source.replace("slack.post_notice(", ""))
 
 
+# --------------------------------------------------------------------------- #
+# delete-resume, the separate pause flags, and the documented outcomes
+# --------------------------------------------------------------------------- #
+class DeleteResumeTests(DeleteTestCase):
+    def test_it_clears_the_pause_flag_and_the_failure_count(self):
+        runner.set_paused(True)
+        runner._state_set(runner.FAILURES_KEY, "3")
+
+        result = runner.resume()
+
+        self.assertTrue(result["wasPaused"])
+        self.assertFalse(result["paused"])
+        self.assertEqual(result["consecutiveFailures"], 0)
+        self.assertFalse(runner.is_paused())
+
+    def test_it_reports_when_it_was_not_paused(self):
+        self.assertFalse(runner.resume()["wasPaused"])
+
+    def test_it_prints_the_state(self):
+        self.three_plans()
+        self.request()  # three deleted today
+
+        state = runner.resume()
+
+        self.assertEqual(state["mode"], "live")
+        self.assertEqual(state["paused"], False)
+        self.assertEqual(state["childrenDoneToday"], 1)
+        self.assertEqual(state["maxPerDay"], 40)
+        self.assertEqual(
+            set(state),
+            {"wasPaused", "mode", "paused", "consecutiveFailures", "childrenDoneToday", "maxPerDay", "lastLogRows"},
+        )
+
+    def test_it_shows_the_last_five_log_rows_newest_first(self):
+        self.three_plans()
+        self.request()  # started + 3 deleted = 4 rows
+        self.request()  # nothing_to_delete: the 5th
+        self.request()  # and a 6th
+
+        rows = runner.resume()["lastLogRows"]
+
+        self.assertEqual(len(rows), 5)
+        ids = [r["id"] for r in rows]
+        self.assertEqual(ids, sorted(ids, reverse=True))
+        self.assertEqual(rows[0]["outcome"], "nothing_to_delete")
+        self.assertEqual(rows[-1]["outcome"], "deleted")  # `started`, the oldest, fell off
+        for key in ("child_id", "plan_id", "at", "mode", "outcome", "detail"):
+            self.assertIn(key, rows[0])
+
+    def test_fewer_than_five_rows_shows_what_there_is(self):
+        self.assertEqual(runner.resume()["lastLogRows"], [])
+        self.request()  # nothing to delete: one row
+        self.assertEqual(len(runner.resume()["lastLogRows"]), 1)
+
+    def test_children_done_today_counts_children_not_plans_and_resets_each_day(self):
+        self.three_plans()
+        self.request()
+
+        self.assertEqual(runner.resume()["childrenDoneToday"], 1)
+        self.clock += timedelta(days=1)
+        self.assertEqual(runner.resume()["childrenDoneToday"], 0)
+
+    def test_a_dry_run_does_not_count_as_done(self):
+        self.three_plans()
+        with mock.patch.dict("os.environ", {"DELETE_PLANS_MODE": "dry_run"}):
+            self.request()
+
+        self.assertEqual(runner.resume()["childrenDoneToday"], 0)
+
+    def test_the_mode_shown_is_the_current_one(self):
+        with mock.patch.dict("os.environ", {"DELETE_PLANS_MODE": "bogus"}):
+            self.assertEqual(runner.resume()["mode"], "off")
+
+    def test_a_cleared_pause_lets_a_delete_run_again(self):
+        self.three_plans()
+        runner.set_paused(True)
+        self.assertEqual(self.request()[0]["outcome"], "failed")
+
+        runner.resume()
+
+        self.assertEqual(self.request()[0]["outcome"], "deleted")
+
+    def test_the_cli_command_is_registered_and_runs(self):
+        import argparse
+
+        import main
+        from actions.delete_plans import delete_resume
+
+        runner.set_paused(True)
+        self.assertEqual(main.build_parser().parse_args(["delete-resume"]).action, "delete-resume")
+
+        result = delete_resume.handle(argparse.Namespace())
+
+        self.assertTrue(result["wasPaused"])
+        self.assertFalse(runner.is_paused())
+        self.assertEqual(delete_resume.NAME, "delete-resume")
+
+    def test_the_command_prints_json_through_main(self):
+        import io
+        from contextlib import redirect_stdout
+
+        import main
+
+        with redirect_stdout(io.StringIO()) as out:
+            code = main.main(["delete-resume"])
+
+        self.assertEqual(code, 0)
+        printed = json.loads(out.getvalue())
+        self.assertEqual(printed["mode"], "live")
+        self.assertIn("lastLogRows", printed)
+
+
+class SeparatePauseFlagsTests(DeleteTestCase):
+    def queue_keys(self):
+        with preview_store.open_store() as connection:
+            return {r["key"] for r in connection.execute("SELECT key FROM queue_state")}
+
+    def test_the_keys_are_different(self):
+        from actions.queue_timeline import jobs
+
+        self.assertEqual(runner.PAUSED_KEY, "delete_plans:paused")
+        self.assertEqual(runner.FAILURES_KEY, "delete_plans:consecutive_failures")
+        self.assertNotEqual(runner.PAUSED_KEY, "paused")
+        self.assertNotEqual(runner.FAILURES_KEY, "consecutive_failures")
+        self.assertIsNone(jobs.state_get("paused"))
+
+    def test_the_delete_plans_pause_is_stored_under_its_own_key(self):
+        runner.set_paused(True)
+
+        self.assertEqual(self.queue_keys(), {"delete_plans:paused"})
+
+    def test_tripping_the_delete_pause_does_not_pause_the_plan_queue(self):
+        from actions.queue_timeline import jobs
+
+        runner.set_paused(True)
+
+        self.assertTrue(runner.is_paused())
+        self.assertFalse(jobs.is_paused())
+
+    def test_tripping_the_queue_pause_does_not_pause_delete_plans(self):
+        from actions.queue_timeline import jobs
+
+        jobs.set_paused(True)
+
+        self.assertTrue(jobs.is_paused())
+        self.assertFalse(runner.is_paused())
+        self.three_plans()
+        self.assertEqual(self.request()[0]["outcome"], "deleted")
+
+    def test_the_failure_counters_are_separate_too(self):
+        from actions.queue_timeline import jobs
+
+        runner._state_set(runner.FAILURES_KEY, "2")
+        jobs.state_set("consecutive_failures", "1")
+
+        self.assertEqual(runner.consecutive_failures(), 2)
+        self.assertEqual(jobs.consecutive_failures(), 1)
+
+    def test_the_breaker_trips_only_the_delete_flag(self):
+        from actions.queue_timeline import jobs
+
+        children = [f"00000000-0000-0000-0000-0000000000d{n}" for n in range(1, 4)]
+        self.allowlist_file.write_text("\n".join(children) + "\n", encoding="utf-8")
+        for index, child in enumerate(children):
+            self.famly.plans.append(plan_node(f"z{index}", "2026-01-01", child=child))
+        self.delete_effect = lambda plan: (_ for _ in ()).throw(RuntimeError("no"))
+
+        for child in children:
+            self.request(child=child)
+
+        self.assertTrue(runner.is_paused())
+        self.assertFalse(jobs.is_paused())
+        self.assertEqual(jobs.consecutive_failures(), 0)
+
+    def test_the_queue_breaker_trips_only_the_queue_flag(self):
+        from actions.queue_timeline import jobs
+
+        for _ in range(3):
+            jobs.state_increment("consecutive_failures")
+        jobs.set_paused(True)
+
+        self.assertFalse(runner.is_paused())
+        self.assertEqual(runner.consecutive_failures(), 0)
+
+    def test_delete_resume_does_not_clear_the_plan_queues_pause(self):
+        from actions.queue_timeline import jobs
+
+        jobs.set_paused(True)
+        jobs.state_set("consecutive_failures", "3")
+        runner.set_paused(True)
+
+        runner.resume()
+
+        self.assertFalse(runner.is_paused())
+        self.assertTrue(jobs.is_paused())  # still paused
+        self.assertEqual(jobs.consecutive_failures(), 3)
+
+    def test_queue_resume_does_not_clear_the_delete_plans_pause(self):
+        from actions.queue_timeline import jobs, worker
+
+        runner.set_paused(True)
+        runner._state_set(runner.FAILURES_KEY, "3")
+        jobs.set_paused(True)
+
+        worker.resume()
+
+        self.assertFalse(jobs.is_paused())
+        self.assertTrue(runner.is_paused())  # still paused
+        self.assertEqual(runner.consecutive_failures(), 3)
+
+    def test_both_flags_can_be_set_and_cleared_independently(self):
+        from actions.queue_timeline import jobs
+
+        jobs.set_paused(True)
+        runner.set_paused(True)
+        self.assertEqual(self.queue_keys(), {"paused", "delete_plans:paused"})
+
+        runner.set_paused(False)
+        self.assertEqual(self.queue_keys(), {"paused"})
+
+
+class DocumentedOutcomesTests(DeleteTestCase):
+    README = (Path(__file__).resolve().parent.parent / "README.md").read_text(encoding="utf-8")
+
+    def section(self):
+        start = self.README.index("## `delete_plans`")
+        end = self.README.index("\n## ", start + 1)
+        return self.README[start:end]
+
+    def test_there_is_a_delete_plans_section_marked_temporary(self):
+        section = self.section()
+
+        self.assertIn("TEMPORARY", section)
+        self.assertIn("delete-resume", section)
+
+    def test_every_outcome_is_listed_in_the_readme_with_a_meaning(self):
+        section = self.section()
+
+        for outcome, meaning in runner.OUTCOMES.items():
+            with self.subTest(outcome=outcome):
+                self.assertRegex(section, rf"\| `{outcome}` \|")
+                self.assertTrue(meaning)
+
+    def test_the_readme_lists_no_outcome_the_code_does_not_have(self):
+        import re
+
+        section = self.section()
+        table = section[section.index("| `data.outcome` |"):]
+        table = table[: table.index("\n\n")]
+        listed = set(re.findall(r"^\| `(\w+)` \|", table, flags=re.M)) - {"data"}
+
+        self.assertEqual(listed, set(runner.OUTCOMES))
+
+    def test_every_outcome_the_code_can_emit_is_in_the_table(self):
+        import re
+
+        source = Path(runner.__file__).read_text(encoding="utf-8") + Path(delete_web.__file__).read_text(
+            encoding="utf-8"
+        )
+        emitted = set(re.findall(r'result\.outcome = "(\w+)"', source))
+        emitted |= set(re.findall(r'_refuse\(\s*result,\s*"(\w+)"', source))
+        emitted |= set(re.findall(r'"outcome": "(\w+)"', source))
+        emitted |= set(re.findall(r'"deleted" if skipped == 0 else "(\w+)"', source)) | {"deleted"}
+
+        self.assertTrue(emitted)
+        self.assertEqual(emitted - set(runner.OUTCOMES), set())
+        self.assertEqual(set(runner.OUTCOMES) - emitted, set())
+
+    def test_the_outcomes_seen_in_responses_are_all_documented(self):
+        seen = set()
+        self.three_plans()
+        seen.add(self.request()[0]["outcome"])  # deleted
+        seen.add(self.request()[0]["outcome"])  # nothing_to_delete
+        seen.add(self.request(child=OTHER)[0]["outcome"])  # not_allowlisted
+        seen.add(self.request(confirm="x")[0]["outcome"])  # malformed
+        with mock.patch.dict("os.environ", {"DELETE_PLANS_MODE": "off"}):
+            seen.add(self.request()[0]["outcome"])  # off
+        with mock.patch.dict("os.environ", {"DELETE_PLANS_MODE": "dry_run"}):
+            self.famly.plans = [plan_node("a", "2026-01-01")]
+            seen.add(self.request()[0]["outcome"])  # dry_run
+        self.famly.get_failures = [RuntimeError("down")]
+        seen.add(self.request()[0]["outcome"])  # error
+        self.delete_effect = self.leave_plan_in_place
+        seen.add(self.request()[0]["outcome"])  # failed
+        self.famly.plans = [plan_node("b", "2026-01-01", deletable=False)]
+        seen.add(self.request()[0]["outcome"])  # partial
+
+        self.assertEqual(seen, set(runner.OUTCOMES))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -611,6 +611,69 @@ same `.env` the web server reads (the worker shares the preview store file, so
 `PREVIEW_STORE_PATH` must match). Leave `QUEUE_MODE` unset (dry run) until the
 digests look right, then set `auto`.
 
+## `delete_plans` (TEMPORARY, DESTRUCTIVE)
+
+A one-off clean-up action that deletes **all** of one child's plans per webhook.
+Delete the whole `actions/delete_plans/` package, its entry in `web_registry.py`
+and its tests when the clean-up is finished. **The delete itself
+(`_delete_plan`) is not written yet**, so only `dry_run` works today.
+
+```json
+{"action": "delete_plans", "childId": "<uuid>", "confirm": "DELETE"}
+```
+
+`confirm` must be exactly `DELETE`; `childId` must be a UUID. The guards:
+
+| setting | meaning |
+|---|---|
+| `DELETE_PLANS_MODE` | `off` (the default; an unknown value counts as off), `dry_run` or `live` |
+| `DELETE_PLANS_ALLOWLIST_FILE` | one child id per line, default `var/delete_plans_allowlist.txt` (gitignored). Re-read on every request. A missing or empty file allows nothing |
+| `DELETE_PLANS_MAX_PER_DAY` | the most **children** touched per UTC day (default 40), checked before every delete |
+| `DELETE_PLANS_BACKUP_DIR` | where backups go, default `var/plan-backups` (gitignored: personal data) |
+
+In `live` mode each child's plans are deleted latest-starting first. A plan without
+`CanDeletePlan` is skipped and reported. Each plan's full read-back JSON is written
+to `var/plan-backups/<child>/<plan>.json` **first** (no backup, no delete); the plans
+are read back afterwards to prove it is gone, and the neighbouring plans' end dates
+are reported. The first unexpected result stops that child and goes to Slack. A
+delete is **never retried**. Every decision is a row in the `delete_log` table.
+After 3 consecutive failed children a **pause flag** is set (and Slack told); it is
+checked before every delete. The flag is its own key in `queue_state`
+(`delete_plans:paused`), separate from the plan queue's `paused`, so tripping one
+never pauses the other.
+
+```bash
+python main.py delete-resume   # clears the delete_plans pause flag and shows the state
+```
+
+`delete-resume` prints the mode, whether it is paused, the consecutive-failure count,
+how many children were done today, and the last five `delete_log` rows (newest
+first). It clears only the delete_plans flag; `queue-resume` is the plan queue's.
+
+### Responses
+
+The HTTP status is **200 for every outcome, failures included**, so HubSpot never
+retries a destructive call; only a malformed request is 422. The envelope's own
+`ok` mirrors HTTP 200, so read **`data.ok`** and **`data.outcome`**:
+
+| `data.outcome` | `data.ok` | meaning |
+|---|---|---|
+| `malformed` | false | HTTP **422**: a bad `childId` or a `confirm` that is not exactly `DELETE`. Nothing was done |
+| `off` | false | `DELETE_PLANS_MODE` is off, unset or unknown. Nothing was done, logged or posted |
+| `not_allowlisted` | false | the child is not on the allowlist file. Nothing was read or done; a Slack notice was posted |
+| `nothing_to_delete` | true | the child has no plans. A harmless no-op, so a repeat request lands here |
+| `dry_run` | true | `dry_run` mode: the plans were listed in Slack and logged. Nothing was deleted |
+| `deleted` | true | `live`: every plan was deleted, each backed up first and confirmed gone by read-back |
+| `partial` | false | `live`: every plan that could be deleted was, but at least one was skipped for lacking `CanDeletePlan` and remains |
+| `failed` | false | `live`: the child was stopped by an unexpected result (a backup, delete or read-back failure, an unexpected read-back, the pause flag, the daily cap, or `_delete_plan` not being written yet). See `data.message` |
+| `error` | false | an unexpected error, for example Famly could not be read. Reported, never raised |
+
+The `delete_log` table records finer-grained outcomes per plan and child:
+`started` (a live child began, counted against the daily cap), `deleted`,
+`skipped`, `backup_failed`, `delete_failed`, `readback_failed`, `unexpected`,
+`paused`, `cap_reached`, plus the response outcomes `dry_run`, `nothing_to_delete`,
+`not_allowlisted` and `error`.
+
 ## Reference-data pulls (sessions, groups, products, institution defaults)
 
 Four maintenance commands refresh the local JSON reference files that other
