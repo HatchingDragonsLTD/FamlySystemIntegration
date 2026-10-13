@@ -159,6 +159,21 @@ ON jobs (child_id) WHERE status IN ('queued', 'running', 'held')
 # Earlier key indexes, replaced by the one above: dropped when found.
 _JOBS_OLD_KEY_INDEXES = ("jobs_one_live_per_key", "jobs_job_key_unique")
 
+# The audit trail of the TEMPORARY delete_plans action (actions/delete_plans):
+# one row per decision -- the child, the plan (null for a child-level row), when,
+# the mode and the outcome. Written by that action only.
+_DELETE_LOG_SCHEMA = """
+CREATE TABLE IF NOT EXISTS delete_log (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    child_id TEXT NOT NULL,
+    plan_id  TEXT,
+    at       TEXT NOT NULL,
+    mode     TEXT NOT NULL,
+    outcome  TEXT NOT NULL,
+    detail   TEXT
+)
+"""
+
 _QUEUE_STATE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS queue_state (
     key   TEXT PRIMARY KEY,
@@ -275,6 +290,7 @@ def _schema_version() -> int:
             _CHAINS_ONE_ACTIVE,
             _JOBS_SCHEMA,
             _QUEUE_STATE_SCHEMA,
+            _DELETE_LOG_SCHEMA,
             _JOBS_KEY_UNIQUE,
             _JOBS_ONE_ACTIVE_PER_CHILD,
             _JOBS_OLD_KEY_INDEXES,
@@ -331,6 +347,7 @@ def _ensure_schema(connection: sqlite3.Connection) -> None:
         connection.execute(_CHAINS_SCHEMA)
         connection.execute(_JOBS_SCHEMA)
         connection.execute(_QUEUE_STATE_SCHEMA)
+        connection.execute(_DELETE_LOG_SCHEMA)
         _migrate(connection)
         connection.execute(_CHAINS_ONE_ACTIVE)
         for old_index in _JOBS_OLD_KEY_INDEXES:
@@ -612,3 +629,4 @@ def _reset_for_tests() -> None:
         connection.execute("DELETE FROM chains")
         connection.execute("DELETE FROM jobs")
         connection.execute("DELETE FROM queue_state")
+        connection.execute("DELETE FROM delete_log")
