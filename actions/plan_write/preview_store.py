@@ -143,8 +143,9 @@ _JOBS_ADDED_COLUMNS: dict[str, str] = {}
 #
 #   * the idempotency key is unique among LIVE jobs (queued, running, held or
 #     done): an identical request while one is active or finished is the same
-#     job. A failed or cancelled job does not hold its key, so the same request
-#     can be submitted again and gets a new job;
+#     job. A failed, cancelled or DRY-RUN job does not hold its key, so the same
+#     request can be submitted again and gets a new job. `dry_done` is absent
+#     from the index below ON PURPOSE -- that absence is the whole mechanism;
 #   * a child can have at most ONE active job (queued, running or held).
 _JOBS_KEY_UNIQUE = """
 CREATE UNIQUE INDEX IF NOT EXISTS jobs_live_job_key ON jobs (job_key)
@@ -158,6 +159,15 @@ ON jobs (child_id) WHERE status IN ('queued', 'running', 'held')
 
 # Earlier key indexes, replaced by the one above: dropped when found.
 _JOBS_OLD_KEY_INDEXES = ("jobs_one_live_per_key", "jobs_job_key_unique")
+
+# Dry runs used to finish as `done`, which held the idempotency key and stopped
+# the same request being run for real. They are recognised by the detail the
+# worker wrote. Moving them OUT of a status the key index covers can never
+# violate it, so this is safe to run against a live store.
+_JOBS_DRY_DONE_BACKFILL = """
+UPDATE jobs SET status = 'dry_done'
+WHERE status = 'done' AND detail LIKE 'dry run%'
+"""
 
 # The audit trail of the TEMPORARY delete_plans action (actions/delete_plans):
 # one row per decision -- the child, the plan (null for a child-level row), when,
@@ -300,6 +310,7 @@ def _schema_version() -> int:
             _JOBS_KEY_UNIQUE,
             _JOBS_ONE_ACTIVE_PER_CHILD,
             _JOBS_OLD_KEY_INDEXES,
+            _JOBS_DRY_DONE_BACKFILL,
             sorted(_ADDED_COLUMNS.items()),
             sorted(_CHAINS_ADDED_COLUMNS.items()),
             sorted(_JOBS_ADDED_COLUMNS.items()),
@@ -380,6 +391,12 @@ def _migrate(connection: sqlite3.Connection) -> None:
     written before a column existed would break on read. Adding in place keeps
     the pending previews already in it.
     """
+    # Data migration: retire dry runs that finished as `done` before dry_done
+    # existed, so they stop holding their idempotency keys.
+    moved = connection.execute(_JOBS_DRY_DONE_BACKFILL).rowcount
+    if moved:
+        logger.info("Preview store: moved %d dry run(s) from done to dry_done", moved)
+
     for table, added in (
         ("previews", _ADDED_COLUMNS),
         ("chains", _CHAINS_ADDED_COLUMNS),

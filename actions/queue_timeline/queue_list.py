@@ -12,7 +12,10 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--status",
         default=None,
-        help="queued, running, done, held, failed or cancelled. Omit for every job.",
+        help=(
+            "queued, running, done, dry_done, held, failed or cancelled. "
+            "Omit for every job."
+        ),
     )
 
 
