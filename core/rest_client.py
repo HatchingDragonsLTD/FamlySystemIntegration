@@ -102,6 +102,22 @@ class RestClient:
                 body=response.text,
             ) from exc
 
+    def request(
+        self,
+        method: str,
+        path: str,
+        params: dict | None = None,
+        json_body: Any | None = None,
+    ) -> Any:
+        """Send any method (`DELETE`, ...) and return the parsed JSON response.
+
+        The same request path `get` and `post` use, so errors and auth behave the
+        same: a non-2xx raises RestHTTPError. With no `params` and no `json_body`
+        nothing is sent in the query string or the body (a DELETE needs neither),
+        and a `[]` response is simply returned as `[]`.
+        """
+        return self._request(method, path, params=params, json_body=json_body)
+
     def get(self, path: str, params: dict | None = None) -> Any:
         """GET `path` and return the parsed JSON response."""
         return self._request("GET", path, params=params)

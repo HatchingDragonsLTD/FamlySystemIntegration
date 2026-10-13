@@ -615,8 +615,9 @@ digests look right, then set `auto`.
 
 A one-off clean-up action that deletes **all** of one child's plans per webhook.
 Delete the whole `actions/delete_plans/` package, its entry in `web_registry.py`
-and its tests when the clean-up is finished. **The delete itself
-(`_delete_plan`) is not written yet**, so only `dry_run` works today.
+and its tests when the clean-up is finished. `live` mode **really deletes**: for
+each plan it sends one `DELETE v2/plans/<id>` (no params, no body; Famly answers
+HTTP 200 with `[]`, which is not treated as proof). Only `dry_run` is harmless.
 
 ```json
 {"action": "delete_plans", "childId": "<uuid>", "confirm": "DELETE"}
@@ -629,14 +630,18 @@ and its tests when the clean-up is finished. **The delete itself
 | `DELETE_PLANS_MODE` | `off` (the default; an unknown value counts as off), `dry_run` or `live` |
 | `DELETE_PLANS_ALLOWLIST_FILE` | one child id per line, default `var/delete_plans_allowlist.txt` (gitignored). Re-read on every request. A missing or empty file allows nothing |
 | `DELETE_PLANS_MAX_PER_DAY` | the most **children** touched per UTC day (default 40), checked before every delete |
+| `DELETE_DIGEST_ON_COMPLETE` | default `false`: digests come only from `delete-digest`. `true`: a webhook request also posts the digest once every allowlist child has reported (bare ids) |
 | `DELETE_PLANS_BACKUP_DIR` | where backups go, default `var/plan-backups` (gitignored: personal data) |
 
 In `live` mode each child's plans are deleted latest-starting first. A plan without
 `CanDeletePlan` is skipped and reported. Each plan's full read-back JSON is written
 to `var/plan-backups/<child>/<plan>.json` **first** (no backup, no delete); the plans
-are read back afterwards to prove it is gone, and the neighbouring plans' end dates
-are reported. The first unexpected result stops that child and goes to Slack. A
-delete is **never retried**. Every decision is a row in the `delete_log` table.
+are read back afterwards, and that read-back -- never the `[]` -- decides. A delete is
+**never retried**. "Unexpected" means exactly one of: the plan is **still present** in
+the read-back, an **HTTP error**, or the child's **plan count not dropping by exactly
+one**; it stops that child and posts to Slack at once. A change to a neighbouring plan's
+end date is logged and listed in the digest but **never stops the run**, since every
+plan is being deleted anyway. Every decision is a row in the `delete_log` table.
 After 3 consecutive failed children a **pause flag** is set (and Slack told); it is
 checked before every delete. The flag is its own key in `queue_state`
 (`delete_plans:paused`), separate from the plan queue's `paused`, so tripping one
@@ -654,8 +659,13 @@ in a row) and a daily-cap stop. Everything else -- deleted, nothing to delete,
 partly deleted, refused (including a child stopped by an already-set pause), a
 dry run -- goes in **one end-of-run digest**.
 
-* **When it posts.** After each child is processed, if every child on the
-  allowlist has an unreported `delete_log` row. `python main.py delete-digest`
+* **When it posts.** By default a digest comes **only from the `delete-digest`
+  command**: a webhook request never posts one. With `DELETE_DIGEST_ON_COMPLETE=true`
+  (default `false`; read on every request; anything but `true`, `1`, `yes` or `on`
+  counts as false) a webhook request also posts it after each child, once every
+  child on the allowlist has an unreported `delete_log` row -- with bare ids, never
+  names. The three immediate messages (an unexpected stop, a tripped pause, a
+  daily-cap stop) are the same either way. `python main.py delete-digest`
   posts whatever is unreported now, listing any allowlist child with no row as
   **Not received**. `python main.py delete-digest --if-quiet 10` posts only if
   there are unreported rows and the newest is at least 10 minutes old, so it can
@@ -671,10 +681,11 @@ dry run -- goes in **one end-of-run digest**.
   Slack's size limit it is split into numbered messages (1/2, 2/2).
 * **Names.** Fetched at digest time with the existing 3-second lookup, falling back
   to the bare id, and never stored. They are never fetched during a webhook
-  request, so a digest a webhook triggers shows ids only; the `delete-digest`
-  command shows names.
-* The neighbouring plans' end dates after each delete are in the `delete_log` row
-  for that plan (`detail`), not in Slack.
+  request, so the digest a webhook triggers (only with `DELETE_DIGEST_ON_COMPLETE=true`)
+  shows bare ids only; the `delete-digest` command shows names.
+* A neighbouring plan's end date that moved after a delete is in the `delete_log` row
+  for that plan (`detail`) and is listed on that child's digest line ("neighbour end
+  dates changed: ..."); it never stops the run.
 
 `delete-resume` prints the mode, whether it is paused, the consecutive-failure count,
 how many children were done today, and the last five `delete_log` rows (newest
@@ -690,12 +701,12 @@ retries a destructive call; only a malformed request is 422. The envelope's own
 |---|---|---|
 | `malformed` | false | HTTP **422**: a bad `childId` or a `confirm` that is not exactly `DELETE`. Nothing was done |
 | `off` | false | `DELETE_PLANS_MODE` is off, unset or unknown. Nothing was done, logged or posted |
-| `not_allowlisted` | false | the child is not on the allowlist file. Nothing was read or done; a Slack notice was posted |
+| `not_allowlisted` | false | the child is not on the allowlist file. Nothing was read or done; it is logged and reported in the digest |
 | `nothing_to_delete` | true | the child has no plans. A harmless no-op, so a repeat request lands here |
-| `dry_run` | true | `dry_run` mode: the plans were listed in Slack and logged. Nothing was deleted |
+| `dry_run` | true | `dry_run` mode: the plans were logged (and appear in the digest). Nothing was deleted |
 | `deleted` | true | `live`: every plan was deleted, each backed up first and confirmed gone by read-back |
 | `partial` | false | `live`: every plan that could be deleted was, but at least one was skipped for lacking `CanDeletePlan` and remains |
-| `failed` | false | `live`: the child was stopped by an unexpected result (a backup, delete or read-back failure, an unexpected read-back, the pause flag, the daily cap, or `_delete_plan` not being written yet). See `data.message` |
+| `failed` | false | `live`: the child was stopped by an unexpected result (a backup, delete or read-back failure, the plan still present, the plan count not dropping by exactly one, the pause flag, or the daily cap). See `data.message` |
 | `error` | false | an unexpected error, for example Famly could not be read. Reported, never raised |
 
 The `delete_log` table records finer-grained outcomes per plan and child:

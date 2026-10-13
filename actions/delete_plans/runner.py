@@ -25,19 +25,29 @@ LATEST-STARTING FIRST; each plan must carry `CanDeletePlan` (otherwise it is
 skipped and reported); its full read-back JSON is written to
 `var/plan-backups/<child>/<plan>.json` BEFORE it is deleted (no backup, no
 delete); the plans are read back afterwards to prove it is gone, and the
-neighbouring plans' end dates are reported. The first unexpected result stops
-that child and goes to Slack. A delete is NEVER retried automatically.
+neighbouring plans' end dates are reported. A delete is NEVER retried automatically.
 
-`dry_run` reads and reports -- one Slack message listing each plan -- and never
-calls `_delete_plan`.
+`dry_run` reads and logs -- the plans that would be deleted appear in the digest --
+and never calls `_delete_plan`.
 
-`_delete_plan` is NOT WRITTEN YET: it raises NotImplementedError until the
-captured Famly request is pasted in, so only `dry_run` works today.
+`_delete_plan` sends ONE request, `DELETE v2/plans/<id>` (no params, no body),
+exactly as captured. Famly answers HTTP 200 with `[]`, but `[]` is NOT proof of
+deletion: the read-back after each delete decides.
+
+"UNEXPECTED" -- what stops a child -- is exactly one of: the plan is still present
+in the read-back, an HTTP error, or the child's plan count not dropping by
+exactly one. (A guard -- no backup, the pause flag, the daily cap -- also stops a
+child before a delete, as described above.) A change to a neighbouring plan's end
+date is reported (the digest and the log) but NEVER stops the run: every plan on
+the child is being deleted anyway.
 
 Every outcome is a row in the `delete_log` table of the preview store's SQLite
 file. The backups are personal data and live under the gitignored `var/`.
 
 SLACK. There is ONE end-of-run DIGEST (see digest.py), not a message per child.
+By default it comes only from the `delete-digest` command; with
+DELETE_DIGEST_ON_COMPLETE=true a webhook request also posts it once every
+allowlist child has reported (with bare ids).
 Only three things post immediately: an unexpected result that stops a child, a
 tripped pause (the breaker) and a daily-cap stop. Everything else -- deleted,
 nothing to delete, partly deleted, refused, a dry run -- waits for the digest.
@@ -48,12 +58,14 @@ then; they are never fetched during a webhook request and never stored.
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
 
 from actions.plan_write import input_schema, preview_store
 from actions.read_child_plans import runner as read_child_plans
+from core.rest_client import RestClient
 from integrations import slack
 
 logger = logging.getLogger(__name__)
@@ -87,7 +99,7 @@ OUTCOMES = {
     "dry_run": "dry_run mode: the plans were listed in Slack and logged. Nothing was deleted.",
     "deleted": "live mode: every plan was deleted, each backed up first and confirmed gone by read-back.",
     "partial": "live mode: every plan that could be deleted was, but at least one was skipped for lacking CanDeletePlan and remains.",
-    "failed": "live mode: the child was stopped (a backup, delete or read-back failure, an unexpected read-back, the pause flag, the daily cap, or _delete_plan not being written yet). See `message`.",
+    "failed": "live mode: the child was stopped (a backup, delete or read-back failure, an unexpected read-back, the pause flag, the daily cap). See `message`.",
     "error": "an unexpected error (for example Famly could not be read). Reported, never raised.",
 }
 
@@ -126,6 +138,20 @@ def allowlist() -> set[str]:
         for line in text.splitlines()
         if line.strip() and not line.strip().startswith("#")
     }
+
+
+_TRUE_VALUES = ("1", "true", "yes", "on")
+
+
+def digest_on_complete() -> bool:
+    """DELETE_DIGEST_ON_COMPLETE: may a webhook request post the digest? Default no.
+
+    Read fresh on every request. Anything but a clear yes is no, so a typo can
+    only ever mean fewer messages. When false, digests come ONLY from
+    `delete-digest`; the immediate messages (an unexpected stop, a tripped pause,
+    a daily-cap stop) are not affected.
+    """
+    return os.environ.get("DELETE_DIGEST_ON_COMPLETE", "").strip().lower() in _TRUE_VALUES
 
 
 def max_per_day() -> int:
@@ -266,18 +292,24 @@ def _record_child_result(failed: bool, child_id: str) -> None:
 # --------------------------------------------------------------------------- #
 # The delete itself -- NOT WRITTEN YET
 # --------------------------------------------------------------------------- #
-def _delete_plan(child_id: str, plan) -> None:
-    """Delete one plan in Famly.
+_PLAN_ID = re.compile(r"[A-Za-z0-9_-]+")
 
-    NOT IMPLEMENTED: the captured Famly request has not been supplied. Raises
-    NotImplementedError until it is, so `live` mode cannot delete anything and
-    only `dry_run` works. When written it must send exactly one request, never
-    retry, and let any failure raise.
+
+def _delete_plan(plan_id: str) -> None:
+    """Delete one plan in Famly: `DELETE v2/plans/<plan_id>`, no params, no body.
+
+    That is the captured request. Famly answers HTTP 200 with `[]`; the answer is
+    NOT inspected -- `[]` proves nothing, and the caller's read-back of the child's
+    plans is what decides whether the plan is gone. A non-2xx response raises
+    RestHTTPError (from the client) and is not caught here. Exactly one request is
+    made: nothing is retried.
+
+    Refuses (ValueError, before any request) an id that is not a plain token, so
+    nothing but a plan id can ever be spliced into the path.
     """
-    raise NotImplementedError(
-        "delete_plans: _delete_plan is not implemented -- paste the captured Famly "
-        "delete request into actions/delete_plans/runner.py. Only dry_run works until then."
-    )
+    if not isinstance(plan_id, str) or not _PLAN_ID.fullmatch(plan_id):
+        raise ValueError(f"not a plan id: {plan_id!r}")
+    RestClient().request("DELETE", f"v2/plans/{plan_id}")
 
 
 # --------------------------------------------------------------------------- #
@@ -373,12 +405,14 @@ def _refuse(result: Result, outcome: str, message: str, *, notify: bool, log: bo
 def run(child_id: str) -> Result:
     """Handle one validated request for one child. Never raises.
 
-    The caller has already checked the request is well formed. After each child
-    the digest is posted if every allowlist child now has an unreported row
-    (see digest.py) -- from the webhook, so with ids only: no name is fetched.
+    The caller has already checked the request is well formed. Only when
+    DELETE_DIGEST_ON_COMPLETE is true is the digest posted after each child, if
+    every allowlist child now has an unreported row (see digest.py) -- from the
+    webhook, so with ids only: no name is fetched. By default a webhook request
+    never posts a digest.
     """
     result = _process(child_id)
-    if result.mode != MODE_OFF:
+    if result.mode != MODE_OFF and digest_on_complete():
         try:
             from . import digest
 
@@ -456,13 +490,18 @@ def _dry_run(result: Result, plans: list) -> Result:
     return result
 
 
-def _neighbours(before: list, after: list, gone_id: str) -> list[str]:
-    """What happened to the end dates of the plans either side of a deleted one."""
-    lines = []
+def _neighbours(before: list, after: list, gone_id: str) -> tuple[list[str], list[str]]:
+    """What happened to the end dates of the plans either side of a deleted one.
+
+    Returns (lines, changes): a line for each neighbour, and a short note for each
+    whose end date MOVED. Reported, never a reason to stop.
+    """
+    lines: list[str] = []
+    changes: list[str] = []
     ordered = sorted(before, key=lambda p: _day(p.from_))
     index = next((i for i, p in enumerate(ordered) if p.id == gone_id), None)
     if index is None:
-        return lines
+        return lines, changes
     after_by_id = {p.id: p for p in after}
     for label, offset in (("previous", -1), ("next", 1)):
         j = index + offset
@@ -473,12 +512,15 @@ def _neighbours(before: list, after: list, gone_id: str) -> list[str]:
                 f"  {label} plan `{ordered[j].id}`: end date {was or 'open-ended'} -> "
                 f"{now or 'open-ended'} ({change})"
             )
-    return lines
+            if was != now:
+                changes.append(f"`{ordered[j].id}` {was or 'open-ended'} -> {now or 'open-ended'}")
+    return lines, changes
 
 
 def _live(result: Result, plans: list) -> Result:
     child_id = result.child_id
     summary: list[str] = []
+    end_changes: list[str] = []  # neighbour end dates that moved, for the digest
     deleted = skipped = 0
     failure: str | None = None
     counts_as_failed = True  # a pause or the daily cap is not a failed child
@@ -531,7 +573,7 @@ def _live(result: Result, plans: list) -> Result:
             break
 
         try:
-            _delete_plan(child_id, plan)  # exactly one attempt, never retried
+            _delete_plan(plan.id)  # exactly one attempt, never retried
         except Exception as exc:  # noqa: BLE001 - the first unexpected result stops the child
             row["result"] = "delete_failed"
             failure = f"deleting plan {plan.id} failed ({type(exc).__name__}: {exc})"
@@ -546,20 +588,26 @@ def _live(result: Result, plans: list) -> Result:
             log_row(child_id, plan.id, MODE_LIVE, "readback_failed", failure)
             break
 
-        expected = {p.id for p in current} - {plan.id}
-        if plan.id in {p.id for p in after} or {p.id for p in after} != expected:
+        # The two read-back results that are unexpected: the plan is still there,
+        # or the plan count did not drop by exactly one.
+        still_there = plan.id in {p.id for p in after}
+        if still_there or len(after) != len(current) - 1:
             row["result"] = "unexpected"
             failure = (
-                f"after deleting plan {plan.id} the child's plans were not as expected "
-                f"(it is {'still there' if plan.id in {p.id for p in after} else 'gone, but others changed'}); stopping"
+                f"after deleting plan {plan.id} it is still there; stopping"
+                if still_there
+                else f"after deleting plan {plan.id} the child has {len(after)} plan(s), not "
+                f"{len(current) - 1} (the count should drop by exactly one); stopping"
             )
             log_row(child_id, plan.id, MODE_LIVE, "unexpected", failure)
             break
 
-        lines = _neighbours(current, after, plan.id)
+        # A neighbour's end date moving is reported and logged -- never a stop.
+        lines, changed = _neighbours(current, after, plan.id)
         row["result"] = "deleted"
         summary.append(f"• `{plan.id}` deleted (backup {target.name})")
         summary.extend(lines)
+        end_changes.extend(changed)
         log_row(child_id, plan.id, MODE_LIVE, "deleted", "; ".join(l.strip() for l in lines) or None)
         deleted += 1
         current = after
@@ -568,7 +616,7 @@ def _live(result: Result, plans: list) -> Result:
         result.outcome = "failed"
         result.message = failure
         result.errors = [failure]
-        _terminal_row(child_id, stopped_by, deleted, skipped, failure)
+        _terminal_row(child_id, stopped_by, deleted, skipped, failure, end_changes)
         if counts_as_failed:
             _record_child_result(True, child_id)
             # An unexpected result that stopped a child posts AT ONCE.
@@ -581,23 +629,29 @@ def _live(result: Result, plans: list) -> Result:
         result.ok = skipped == 0
         result.outcome = "deleted" if skipped == 0 else "partial"
         result.message = f"{deleted} plan(s) deleted" + (f", {skipped} skipped" if skipped else "")
-        _terminal_row(child_id, "done" if skipped == 0 else "partial", deleted, skipped, result.message)
+        _terminal_row(
+            child_id, "done" if skipped == 0 else "partial", deleted, skipped, result.message, end_changes
+        )
         _record_child_result(False, child_id)
         # Routine: reported in the digest, not on its own.
 
     return result
 
 
-def _terminal_row(child_id: str, outcome: str, deleted: int, skipped: int, message: str) -> None:
+def _terminal_row(
+    child_id: str, outcome: str, deleted: int, skipped: int, message: str, end_changes: list[str] | None = None
+) -> None:
     """The one row per live child request that says how it ended, for the digest.
 
     outcome: done | partial | stopped (an unexpected result) | refused (the pause
-    flag or the daily cap). `detail` is JSON: {deleted, skipped, message}.
+    flag or the daily cap). `detail` is JSON: {deleted, skipped, message, end_changes}.
     """
     log_row(
         child_id,
         None,
         MODE_LIVE,
         outcome,
-        json.dumps({"deleted": deleted, "skipped": skipped, "message": message}),
+        json.dumps(
+            {"deleted": deleted, "skipped": skipped, "message": message, "end_changes": end_changes or []}
+        ),
     )

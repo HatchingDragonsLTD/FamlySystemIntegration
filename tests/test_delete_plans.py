@@ -23,6 +23,7 @@ from actions.delete_plans import runner
 from actions.delete_plans import web as delete_web
 from actions.plan_write import preview_store
 from actions.read_child_plans import runner as read_child_plans
+from core.rest_client import RestHTTPError
 from integrations import child_lookup, slack
 
 logging.disable(logging.CRITICAL)
@@ -57,6 +58,8 @@ class FakeFamly:
         self.plans: list[dict] = []
         self.gets = 0
         self.get_failures: list[Exception] = []
+        self.requests: list[tuple] = []  # (method, path, params, json_body) of every request()
+        self.delete_mode = "normal"  # normal | noop | two | http500 | reopen_previous | dict_body
 
     def get(self, path, params=None):
         self.gets += 1
@@ -67,6 +70,28 @@ class FakeFamly:
 
     def post(self, *args, **kwargs):
         raise AssertionError("delete_plans must never POST (the commit path)")
+
+    # -- what the real client's `request` does, for the real `_delete_plan` ---- #
+    def request(self, method, path, params=None, json_body=None):
+        self.requests.append((method, path, params, json_body))
+        plan_id = path.rsplit("/", 1)[-1]
+        mode = self.delete_mode
+        ordered = sorted(self.plans, key=lambda p: p["from"])
+        index = next((i for i, p in enumerate(ordered) if p["id"] == plan_id), None)
+
+        if mode == "http500":
+            raise RestHTTPError(f"{method} {path} failed with HTTP 500: boom", 500, "boom")
+        if mode == "noop" or index is None:
+            return []
+        gone = {plan_id}
+        if mode == "wrong_plan" and index > 0:
+            gone = {ordered[index - 1]["id"]}  # the count drops by one, but the WRONG plan went
+        if mode == "two" and index > 0:
+            gone.add(ordered[index - 1]["id"])  # Famly removed the one before it too
+        if mode == "reopen_previous" and index > 0:
+            ordered[index - 1]["to"] = None  # the plan before is left open-ended
+        self.plans = [p for p in self.plans if p["id"] not in gone]
+        return {"unexpected": "body"} if mode == "dict_body" else []
 
 
 class DeleteTestCase(unittest.TestCase):
@@ -136,9 +161,10 @@ class DeleteTestCase(unittest.TestCase):
         self.addCleanup(patcher.stop)
 
     # -- the fake delete --------------------------------------------------- #
-    def fake_delete(self, child_id, plan):
+    def fake_delete(self, plan_id):
+        plan = SimpleNamespaceId(plan_id)
         self.delete_calls.append(plan.id)
-        self.backup_present_at_delete.append((self.backups / child_id / f"{plan.id}.json").is_file())
+        self.backup_present_at_delete.append(bool(list(self.backups.glob(f"*/{plan.id}.json"))))
         if self.delete_hook:
             self.delete_hook(plan)
         self.delete_effect(plan)
@@ -583,14 +609,14 @@ class LiveDeleteTests(DeleteTestCase):
         self.assertEqual(len(self.notices), 1)
         self.assertEqual(len(self.famly.plans), 3)
 
-    def test_other_plans_vanishing_is_unexpected_too(self):
+    def test_the_count_not_dropping_by_exactly_one_is_unexpected(self):
         self.three_plans()
         self.delete_effect = lambda plan: setattr(self.famly, "plans", [])  # took everything
 
         data, _ = self.request()
 
         self.assertEqual(data["outcome"], "failed")
-        self.assertIn("others changed", data["message"])
+        self.assertIn("count should drop by exactly one", data["message"])
 
     def test_a_failed_read_back_stops_the_child(self):
         self.three_plans()
@@ -649,44 +675,307 @@ class LiveDeleteTests(DeleteTestCase):
 
         self.assertEqual(self.notices, [])
 
-    def test_the_real_delete_plan_raises_until_the_captured_request_is_pasted(self):
-        with self.assertRaises(NotImplementedError) as caught:
-            REAL_DELETE_PLAN(CHILD, SimpleNamespaceId("plan-x"))
-
-        self.assertIn("not implemented", str(caught.exception))
-
 
 class SimpleNamespaceId:
     def __init__(self, plan_id):
         self.id = plan_id
 
 
-class LiveWithTheRealDeleteTests(DeleteTestCase):
-    """Until the captured request is pasted, `live` cannot delete anything."""
+class RealDeleteTestCase(DeleteTestCase):
+    """The REAL `_delete_plan`, talking to the fake Famly's `request`."""
 
     def setUp(self):
         super().setUp()
-        patcher = mock.patch.object(runner, "_delete_plan", REAL_DELETE_PLAN)
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        for target in (
+            mock.patch.object(runner, "_delete_plan", REAL_DELETE_PLAN),
+            mock.patch.object(runner, "RestClient", lambda *a, **k: self.famly),
+        ):
+            target.start()
+            self.addCleanup(target.stop)
 
-    def test_live_reports_not_implemented_and_nothing_is_deleted(self):
+    def delete_paths(self):
+        return [path for method, path, _, _ in self.famly.requests if method == "DELETE"]
+
+
+class DeletePlanRequestTests(RealDeleteTestCase):
+    def test_the_request_is_a_delete_to_the_right_path_with_no_params_or_body(self):
+        client = mock.Mock()
+        client.request.return_value = []
+        with mock.patch.object(runner, "RestClient", lambda *a, **k: client):
+            runner._delete_plan("plan-x")
+
+        client.request.assert_called_once_with("DELETE", "v2/plans/plan-x")  # nothing else passed
+
+    def test_what_reaches_the_client_has_no_params_and_no_body(self):
+        self.famly.plans = [plan_node("plan-x", "2026-01-01")]
+
+        runner._delete_plan("plan-x")
+
+        self.assertEqual(self.famly.requests, [("DELETE", "v2/plans/plan-x", None, None)])
+
+    def test_an_empty_list_response_is_accepted(self):
+        self.famly.plans = [plan_node("plan-x", "2026-01-01")]
+
+        self.assertIsNone(runner._delete_plan("plan-x"))  # no exception, nothing returned
+
+    def test_the_response_body_is_never_inspected(self):
+        self.famly.plans = [plan_node("plan-x", "2026-01-01")]
+        self.famly.delete_mode = "dict_body"  # an odd body: still accepted
+
+        runner._delete_plan("plan-x")
+
+        self.assertEqual(len(self.famly.requests), 1)
+
+    def test_a_500_raises_and_is_not_retried(self):
+        self.famly.delete_mode = "http500"
+
+        with self.assertRaises(RestHTTPError) as caught:
+            runner._delete_plan("plan-x")
+
+        self.assertEqual(caught.exception.status_code, 500)
+        self.assertEqual(len(self.famly.requests), 1)  # one request, no retry
+
+    def test_a_plan_id_that_is_not_a_plain_token_is_refused_before_any_request(self):
+        for bad in ("", "../x", "a/b", "a?b=1", "a b", "plan-x/../../y", None, 12, "x\n"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                runner._delete_plan(bad)
+
+        self.assertEqual(self.famly.requests, [])
+
+    def test_real_plan_ids_are_accepted(self):
+        for good in ("01K8Z3J2X0V6Y9QJ4M7N1P5R8T", "7f3c9a52-1b0e-4c6e-9c1f-2a6d0b8e4d11", "plan_1-a"):
+            runner._delete_plan(good)
+
+        self.assertEqual(len(self.famly.requests), 3)
+
+
+class RealDeleteChildTests(RealDeleteTestCase):
+    def test_every_plan_is_deleted_latest_first_with_one_delete_each(self):
         self.three_plans()
 
         data, status = self.request()
 
-        self.assertEqual(status, 200)
-        self.assertFalse(data["ok"])
-        self.assertEqual(data["outcome"], "failed")
-        self.assertIn("NotImplementedError", data["message"])
-        self.assertEqual(len(self.famly.plans), 3)
+        self.assertEqual((status, data["outcome"]), (200, "deleted"))
+        self.assertEqual(self.delete_paths(), ["v2/plans/plan-c", "v2/plans/plan-b", "v2/plans/plan-a"])
+        self.assertEqual(self.famly.plans, [])
 
-    def test_dry_run_still_works(self):
+    def test_every_request_is_a_bare_delete(self):
+        self.three_plans()
+        self.request()
+
+        for method, path, params, body in self.famly.requests:
+            self.assertEqual((method, params, body), ("DELETE", None, None))
+
+    def test_a_backup_is_still_written_before_each_delete(self):
+        self.three_plans()
+        seen = []
+        real_request = self.famly.request
+
+        def spying(method, path, params=None, json_body=None):
+            plan_id = path.rsplit("/", 1)[-1]
+            seen.append((self.backups / CHILD / f"{plan_id}.json").is_file())
+            return real_request(method, path, params, json_body)
+
+        self.famly.request = spying
+        self.request()
+
+        self.assertEqual(seen, [True, True, True])
+
+    def test_an_empty_list_is_not_proof_the_read_back_decides(self):
+        self.three_plans()
+        self.famly.delete_mode = "noop"  # Famly says [] and does nothing
+
+        data, status = self.request()
+
+        self.assertEqual(status, 200)
+        self.assertEqual(data["outcome"], "failed")
+        self.assertIn("still there", data["message"])
+        self.assertEqual(self.delete_paths(), ["v2/plans/plan-c"])  # stopped on the first
+        self.assertEqual(len(self.famly.plans), 3)
+        self.assertEqual(len(self.notices), 1)  # an unexpected stop posts at once
+
+    def test_a_500_stops_that_child_and_nothing_is_retried(self):
+        self.three_plans()
+        self.famly.delete_mode = "http500"
+
+        data, status = self.request()
+
+        self.assertEqual(status, 200)
+        self.assertEqual(data["outcome"], "failed")
+        self.assertIn("RestHTTPError", data["message"])
+        self.assertIn("HTTP 500", data["message"])
+        self.assertEqual(self.delete_paths(), ["v2/plans/plan-c"])  # once
+        self.assertEqual(len(self.famly.plans), 3)
+        self.assertIn("delete_failed", self.outcomes())
+        self.assertEqual(len(self.notices), 1)
+
+    def test_a_500_on_a_later_plan_stops_after_the_earlier_deletes(self):
+        self.three_plans()
+        real_request = self.famly.request
+
+        def fail_on_b(method, path, params=None, json_body=None):
+            if path.endswith("plan-b"):
+                self.famly.delete_mode = "http500"
+            return real_request(method, path, params, json_body)
+
+        self.famly.request = fail_on_b
+        data, _ = self.request()
+
+        self.assertEqual(data["outcome"], "failed")
+        self.assertEqual(self.delete_paths(), ["v2/plans/plan-c", "v2/plans/plan-b"])
+        self.assertEqual([p["id"] for p in self.famly.plans], ["plan-a", "plan-b"])
+
+    def test_the_plan_still_present_stops_even_when_the_count_dropped_by_one(self):
+        self.three_plans()
+        self.famly.delete_mode = "wrong_plan"  # plan-c stays, plan-b goes: 3 -> 2
+
+        data, _ = self.request()
+
+        self.assertEqual(data["outcome"], "failed")
+        self.assertIn("plan-c it is still there", data["message"])
+        self.assertEqual(self.delete_paths(), ["v2/plans/plan-c"])
+
+    def test_a_count_that_drops_by_two_stops_the_child(self):
+        self.three_plans()
+        self.famly.delete_mode = "two"  # deleting plan-c also takes plan-b
+
+        data, status = self.request()
+
+        self.assertEqual(status, 200)
+        self.assertEqual(data["outcome"], "failed")
+        self.assertIn("1 plan(s), not 2", data["message"])
+        self.assertIn("exactly one", data["message"])
+        self.assertEqual(self.delete_paths(), ["v2/plans/plan-c"])
+        self.assertIn("unexpected", self.outcomes())
+
+    def test_a_neighbours_end_date_change_is_reported_but_does_not_stop(self):
+        self.three_plans()
+        self.famly.delete_mode = "reopen_previous"  # each delete leaves the plan before it open-ended
+
+        data, status = self.request()
+
+        self.assertEqual((status, data["outcome"], data["ok"]), (200, "deleted", True))
+        self.assertEqual(self.famly.plans, [])  # every plan was deleted anyway
+        self.assertEqual(len(self.delete_paths()), 3)
+        self.assertNotIn("unexpected", self.outcomes())
+        self.assertEqual(self.notices, [])  # no stop message
+
+    def test_the_end_date_change_is_logged(self):
+        self.three_plans()
+        self.famly.delete_mode = "reopen_previous"
+        self.request()
+
+        row = next(r for r in self.log(CHILD) if r["outcome"] == "deleted" and r["plan_id"] == "plan-c")
+        self.assertIn("previous plan `plan-b`: end date 2026-09-01 -> open-ended (changed)", row["detail"])
+
+    def test_the_end_date_change_is_reported_in_slack_in_the_digest(self):
+        from actions.delete_plans import digest
+
+        self.three_plans()
+        self.famly.delete_mode = "reopen_previous"
+        self.request()
+
+        digest.post_digest(names=False)
+
+        message = self.notices[-1]
+        self.assertIn("3 plan(s) deleted", message)
+        self.assertIn("neighbour end dates changed", message)
+        self.assertIn("`plan-b` 2026-09-01 -> open-ended", message)
+
+    def test_a_neighbour_that_did_not_change_is_not_reported_in_slack(self):
+        from actions.delete_plans import digest
+
+        self.three_plans()
+        self.request()
+
+        digest.post_digest(names=False)
+
+        self.assertNotIn("neighbour end dates changed", self.notices[-1])
+
+    def test_a_dry_run_never_sends_a_delete(self):
         self.three_plans()
         with mock.patch.dict("os.environ", {"DELETE_PLANS_MODE": "dry_run"}):
-            data, _ = self.request()
+            self.request()
 
-        self.assertEqual(data["outcome"], "dry_run")
+        self.assertEqual(self.famly.requests, [])
+        self.assertEqual(len(self.famly.plans), 3)
+
+    def test_a_plan_without_the_capability_never_gets_a_delete(self):
+        self.famly.plans = [plan_node("locked", "2026-01-01", deletable=False)]
+        self.request()
+
+        self.assertEqual(self.famly.requests, [])
+
+    def test_a_failed_backup_means_no_delete_request(self):
+        self.three_plans()
+        self.backups.parent.mkdir(parents=True, exist_ok=True)
+        self.backups.write_text("in the way", encoding="utf-8")
+
+        self.request()
+
+        self.assertEqual(self.famly.requests, [])
+
+    def test_the_commit_path_is_still_never_touched(self):
+        self.three_plans()
+        self.request()  # FakeFamly.post raises on any POST
+
+        self.assertEqual({m for m, *_ in self.famly.requests}, {"DELETE"})
+
+
+class RestClientRequestTests(unittest.TestCase):
+    """The client handles a DELETE with no body and a `[]` response."""
+
+    def client(self):
+        from core.rest_client import RestClient
+
+        config = mock.Mock(rest_base_url="https://famly.example/api")
+        session = mock.Mock()
+        session.auth_headers.return_value = {"x-famly-accesstoken": "t"}
+        return RestClient(session=session, config=config)
+
+    def response(self, status=200, body="[]"):
+        return mock.Mock(status_code=status, text=body, json=lambda: json.loads(body))
+
+    def test_a_delete_with_no_body_and_no_params_is_sent_as_such(self):
+        with mock.patch("core.rest_client.requests.request", return_value=self.response()) as sent:
+            self.client().request("DELETE", "v2/plans/plan-x")
+
+        (method, url), kwargs = sent.call_args
+        self.assertEqual(method, "DELETE")
+        self.assertEqual(url, "https://famly.example/api/v2/plans/plan-x")
+        self.assertIsNone(kwargs["params"])
+        self.assertIsNone(kwargs["data"])
+
+    def test_an_empty_list_body_is_returned_as_an_empty_list(self):
+        with mock.patch("core.rest_client.requests.request", return_value=self.response(200, "[]")):
+            self.assertEqual(self.client().request("DELETE", "v2/plans/plan-x"), [])
+
+    def test_a_non_2xx_raises_rest_http_error(self):
+        with mock.patch("core.rest_client.requests.request", return_value=self.response(500, "boom")):
+            with self.assertRaises(RestHTTPError) as caught:
+                self.client().request("DELETE", "v2/plans/plan-x")
+
+        self.assertEqual(caught.exception.status_code, 500)
+
+    def test_get_and_post_are_unchanged(self):
+        with mock.patch("core.rest_client.requests.request", return_value=self.response(200, '{"a": 1}')) as sent:
+            client = self.client()
+            self.assertEqual(client.get("v2/x", params={"q": "1"}), {"a": 1})
+            self.assertEqual(client.post("v2/y", params={"preview": "true"}, json_body={"k": "v"}), {"a": 1})
+
+        get_call, post_call = sent.call_args_list
+        self.assertEqual((get_call.args[0], get_call.kwargs["params"], get_call.kwargs["data"]), ("GET", {"q": "1"}, None))
+        self.assertEqual(post_call.args[0], "POST")
+        self.assertEqual(json.loads(post_call.kwargs["data"]), {"k": "v"})
+
+    def test_request_is_the_path_get_and_post_use(self):
+        from core.rest_client import RestClient
+
+        with mock.patch.object(RestClient, "_request", return_value="sentinel") as inner:
+            result = self.client().request("PUT", "v2/z", params={"a": 1}, json_body={"b": 2})
+
+        self.assertEqual(result, "sentinel")
+        inner.assert_called_once_with("PUT", "v2/z", params={"a": 1}, json_body={"b": 2})
 
 
 class CanDeletePlanTests(DeleteTestCase):
