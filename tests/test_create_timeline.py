@@ -6,9 +6,10 @@ Run from the project root:
     python -m unittest tests.test_create_timeline -v
 
 NOTHING HERE TOUCHES FAMLY OR SLACK. `RestClient` is replaced by `FakeFamly`, a
-small stateful stand-in that keeps the child's plans, trims the previous plan
-when a plan is created with `oldPlanId` (as Famly does, confirmed by manual
-test) and can be told not to, or to fail a commit. The Slack posters are
+small stateful stand-in that keeps the child's plans, sets the previous plan's
+`to` equal to the new plan's `from` when a plan is created with `oldPlanId` (as
+the real Famly did: its end date is exclusive) and can be told not to, or to
+fail a commit. The Slack posters are
 recorders, and the background work an approval hands off runs inline so the
 assertions are deterministic.
 
@@ -181,8 +182,7 @@ class FakeFamly:
         if old_id and self.trim:
             for existing in self.plans:
                 if existing["id"] == old_id:
-                    start = date.fromisoformat(plan["from"])
-                    existing["to"] = (start - timedelta(days=1)).isoformat()
+                    existing["to"] = plan["from"]  # exclusive end, as the real one
         self.plans.append(
             {
                 "id": node["id"],
@@ -569,10 +569,10 @@ class OverlapTests(ChainTestCase):
         self.assertEqual(
             [(p["from"], p["to"]) for p in self.famly.plans],
             [
-                ("2026-09-01", "2026-09-30"),
-                ("2026-10-01", "2026-10-31"),
-                ("2026-11-01", "2026-11-30"),
-                ("2026-12-01", "2027-03-31"),
+                ("2026-09-01", "2026-10-01"),
+                ("2026-10-01", "2026-11-01"),
+                ("2026-11-01", "2026-12-01"),
+                ("2026-12-01", "2027-04-01"),
                 ("2027-04-01", "2027-07-31"),
             ],
         )
@@ -999,8 +999,9 @@ class VerificationTests(ChainTestCase):
         self.assertEqual(len(self.previews_posted), previews_before)  # plan 3 not posted
 
         notice = self.notices[-1]
-        self.assertIn("did not end the previous plan", notice)
-        self.assertIn("expected to = 2026-10-31", notice)
+        self.assertIn("does not meet it", notice)
+        self.assertIn("Famly's end date is exclusive", notice)
+        self.assertIn("expected previous plan to = 2026-11-01, found open-ended", notice)
         self.assertIn("`plan-1`: from 2026-09-01 to open-ended", notice)
         self.assertIn("`plan-2`: from 2026-11-01 to open-ended", notice)
         self.assertIn("open-ended", notice.split("Reason")[1])
@@ -1025,14 +1026,14 @@ class VerificationTests(ChainTestCase):
         def post_trimming_one_day_late(path, params=None, json_body=None):
             node = original_post(path, params, json_body)
             if (params or {}).get("preview") == "false":
-                self.famly.plans[0]["to"] = "2026-11-01"  # should be 2026-10-31
+                self.famly.plans[0]["to"] = "2026-11-02"  # should be 2026-11-01
             return node
 
         with mock.patch.object(self.famly, "post", post_trimming_one_day_late):
             self.approve()
 
         self.assertEqual(self.chain(data).status, chains.STATUS_STOPPED)
-        self.assertIn("expected to = 2026-10-31", self.notices[-1])
+        self.assertIn("expected previous plan to = 2026-11-01, found 2026-11-02", self.notices[-1])
 
     def test_a_committed_plan_missing_from_the_read_back_stops_the_chain(self):
         data, _ = self.start(with_funding())
@@ -1442,7 +1443,7 @@ class ReadBackRetryTests(ChainTestCase):
         self.approve()
 
         self.assertEqual(self.sleeps, [])
-        self.assertIn("did not end the previous plan", self.notices[-1])
+        self.assertIn("does not meet it", self.notices[-1])
 
     def test_a_failed_read_is_not_retried(self):
         self.start(with_funding())
@@ -2074,6 +2075,93 @@ class ServerSideFundingTests(ChainTestCase):
 
         self.assertEqual(self.chain(data).payload["funding_entitlement"], "30")
         self.assertIn("funding_entitlement", engine.ALLOWED_FIELDS)
+
+# --------------------------------------------------------------------------- #
+# Famly's end date is exclusive: the previous plan's `to` equals the next `from`
+# --------------------------------------------------------------------------- #
+class ExclusiveEndTests(ChainTestCase):
+    """The read-back is strict: only `previous.to == this.from` passes."""
+
+    def commit_plan_2_with_previous_to(self, value):
+        """Run plan 1, then commit plan 2 with Famly leaving plan 1's `to` = value."""
+        data, _ = self.start(with_funding())
+        self.approve()
+
+        real_post = self.famly.post
+
+        def post(path, params=None, json_body=None):
+            node = real_post(path, params, json_body)
+            if (params or {}).get("preview") == "false":
+                self.famly.plans[0]["to"] = value
+            return node
+
+        with mock.patch.object(self.famly, "post", post):
+            self.approve()
+        return data
+
+    def test_a_previous_to_equal_to_the_new_from_passes(self):
+        data = self.commit_plan_2_with_previous_to("2026-11-01")
+
+        self.assertEqual(self.chain(data).status, chains.STATUS_ACTIVE)
+        self.assertEqual(len(self.previews_posted), 3)  # plan 3 was posted
+        self.assertFalse(any("Timeline stopped" in n for n in self.notices))
+
+    def test_the_day_before_stops_the_chain_with_the_exclusive_message(self):
+        data = self.commit_plan_2_with_previous_to("2026-10-31")
+
+        self.assertEqual(self.chain(data).status, chains.STATUS_STOPPED)
+        self.assertEqual(len(self.previews_posted), 2)
+        notice = self.notices[-1]
+        self.assertIn(
+            "Famly's end date is exclusive: expected previous plan to = 2026-11-01, "
+            "found 2026-10-31",
+            notice,
+        )
+        self.assertIn("`plan-1`: from 2026-09-01 to 2026-10-31", notice)
+        self.assertIn("`plan-2`: from 2026-11-01 to open-ended", notice)
+        self.assertIn("open-ended", notice.split("Reason")[1])
+        self.assertIn("end date or its successor", notice)
+
+    def test_one_day_after_stops_the_chain(self):
+        data = self.commit_plan_2_with_previous_to("2026-11-02")
+
+        self.assertEqual(self.chain(data).status, chains.STATUS_STOPPED)
+        self.assertIn("expected previous plan to = 2026-11-01, found 2026-11-02", self.notices[-1])
+
+    def test_an_untrimmed_open_ended_previous_plan_stops_the_chain(self):
+        data = self.commit_plan_2_with_previous_to(None)
+
+        self.assertEqual(self.chain(data).status, chains.STATUS_STOPPED)
+        self.assertIn("found open-ended", self.notices[-1])
+
+    def test_a_fake_famly_that_trims_like_the_real_one_advances_plan_2_to_plan_3(self):
+        data, _ = self.start(with_funding())
+        self.approve()  # plan 1
+        self.approve()  # plan 2: plan 1 now ends 2026-11-01, as in the real run
+
+        self.assertEqual(self.famly.plans[0]["to"], "2026-11-01")
+        self.assertEqual(
+            self.heading(), "*Plan 3 of 3 (base, 2027-01-01 to 2027-07-31)*"
+        )
+        self.approve()  # plan 3: plan 2 now ends 2027-01-01
+
+        self.assertEqual(self.famly.plans[1]["to"], "2027-01-01")
+        self.assertEqual(self.chain(data).status, chains.STATUS_COMPLETE)
+        self.assertTrue(any("All 3 plans created" in n for n in self.notices))
+
+    def test_headings_and_segments_stay_inclusive(self):
+        data, _ = self.start(with_funding())
+
+        self.assertEqual(
+            [(s["from"], s["to"]) for s in data["segments"]],
+            [
+                ("2026-09-01", "2026-10-31"),
+                ("2026-11-01", "2026-12-31"),
+                ("2027-01-01", "2027-07-31"),
+            ],
+        )
+        self.assertEqual(self.heading(), "*Plan 1 of 3 (base, 2026-09-01 to 2026-10-31)*")
+
 
 
 if __name__ == "__main__":
