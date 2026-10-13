@@ -49,3 +49,8 @@ env/
 .vscode/
 .idea/
 .DS_Store
+
+# The TEMPORARY delete_plans action: its allowlist, and the plan backups it writes
+# (child plan data -- personal). Already covered by var/ above; listed explicitly.
+var/delete_plans_allowlist.txt
+var/plan-backups/
