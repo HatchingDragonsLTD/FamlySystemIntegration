@@ -6,7 +6,9 @@ child, a tripped pause and a daily-cap stop. Everything else lands here.
 
 WHEN IT POSTS
   * after each child is processed, if EVERY child on the allowlist now has an
-    unreported `delete_log` row (`post_if_complete`);
+    unreported `delete_log` row (`post_if_complete`) -- but ONLY when
+    DELETE_DIGEST_ON_COMPLETE=true; by default a webhook request never posts a
+    digest;
   * `python main.py delete-digest` posts whatever is unreported, listing any
     allowlist child with no row as "Not received";
   * `delete-digest --if-quiet N` posts only if there are unreported rows and the
@@ -78,6 +80,7 @@ class Line:
     category: str
     deleted: int = 0
     skipped: int = 0
+    end_changes: list = field(default_factory=list)  # neighbour end dates that moved
     reason: str = ""
     plans: list = field(default_factory=list)  # dry run: what would be deleted
     dry_run: bool = False
@@ -165,6 +168,7 @@ def summarise(rows: list[dict]) -> dict[str, Line]:
         elif isinstance(detail, dict):
             line.deleted = int(detail.get("deleted") or 0)
             line.skipped = int(detail.get("skipped") or 0)
+            line.end_changes = list(detail.get("end_changes") or [])
             line.reason = str(detail.get("message") or "")
         else:
             line.reason = str(row.get("detail") or "")
@@ -193,6 +197,13 @@ def _plan_text(plan: dict) -> str:
 
 
 def _line_text(line: Line, name: str | None) -> str:
+    text = _base_line_text(line, name)
+    if line.end_changes:
+        text += f" — neighbour end dates changed: {', '.join(line.end_changes)}"
+    return text
+
+
+def _base_line_text(line: Line, name: str | None) -> str:
     who = _label(line.child_id, name)
     if line.category == "not_received":
         return f"• {who} — no request received"

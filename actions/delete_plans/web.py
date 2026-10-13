@@ -8,8 +8,7 @@ Request body:
 
     {"action": "delete_plans", "childId": "<uuid>", "confirm": "DELETE"}
 
-Deletes ALL of that one child's plans (in `live` mode only, and only once
-`_delete_plan` has been written -- until then only `dry_run` works).
+Deletes ALL of that one child's plans (in `live` mode only; `dry_run` just lists them).
 
 RESPONSE CODES. The outcome is reported in the response body, and the HTTP
 status is 200 for EVERY outcome, failures included, so HubSpot never retries a

@@ -40,6 +40,14 @@ def cid(n: int) -> str:
 
 
 class DigestTestCase(base.DeleteTestCase):
+    def setUp(self):
+        super().setUp()
+        # These tests are about the digest a webhook triggers, so that is on; the
+        # default (off) has its own tests below.
+        env = mock.patch.dict("os.environ", {"DELETE_DIGEST_ON_COMPLETE": "true"})
+        env.start()
+        self.addCleanup(env.stop)
+
     def allow(self, *children):
         self.allowlist_file.write_text("\n".join(children) + "\n", encoding="utf-8")
 
@@ -789,6 +797,211 @@ class TerminalRowTests(DigestTestCase):
             self.assertIn(fragment, section)
         for outcome in ("done", "partial", "stopped", "refused"):
             self.assertIn(f"`{outcome}`", section)
+
+
+# --------------------------------------------------------------------------- #
+# DELETE_DIGEST_ON_COMPLETE: is the webhook-triggered digest on at all?
+# --------------------------------------------------------------------------- #
+class DigestOnCompleteSettingTests(DigestTestCase):
+    def setUp(self):
+        super().setUp()
+        self.allow(cid(1), cid(2))
+        self.give(cid(1), "a")
+        self.give(cid(2), "b")
+
+    def setting(self, value):
+        return mock.patch.dict("os.environ", {"DELETE_DIGEST_ON_COMPLETE": value})
+
+    def both_report(self):
+        self.request(child=cid(1))
+        self.request(child=cid(2))
+
+    def test_the_default_is_off(self):
+        with mock.patch.dict("os.environ"):
+            import os
+
+            os.environ.pop("DELETE_DIGEST_ON_COMPLETE", None)
+            self.assertFalse(runner.digest_on_complete())
+
+    def test_with_the_default_nothing_is_posted_from_the_webhook_even_when_complete(self):
+        with mock.patch.dict("os.environ"):
+            import os
+
+            os.environ.pop("DELETE_DIGEST_ON_COMPLETE", None)
+            self.both_report()  # every allowlist child now has a row
+
+        self.assertEqual(self.notices, [])
+        self.assertEqual(len(digest.unreported_rows()), len(self.log()))  # all still waiting
+
+    def test_the_digest_check_is_not_even_run_when_it_is_off(self):
+        with self.setting("false"), mock.patch.object(digest, "post_if_complete") as check:
+            self.both_report()
+
+        check.assert_not_called()
+
+    def test_anything_but_a_clear_yes_is_off(self):
+        for value in ("", "false", "False", "0", "no", "off", "nope", "tru", " "):
+            with self.subTest(value=value), self.setting(value):
+                self.assertFalse(runner.digest_on_complete())
+
+    def test_the_clear_yes_values_are_on(self):
+        for value in ("true", "TRUE", "True", "1", "yes", "on", " true "):
+            with self.subTest(value=value), self.setting(value):
+                self.assertTrue(runner.digest_on_complete())
+
+    def test_with_it_on_the_current_behaviour_is_restored(self):
+        with self.setting("true"):
+            self.request(child=cid(1))
+            self.assertEqual(self.digests(), [])  # not complete yet
+            self.request(child=cid(2))
+
+        (message,) = self.digests()
+        self.assertIn(cid(1), message)
+        self.assertIn(cid(2), message)
+        self.assertEqual(digest.unreported_rows(), [])
+
+    def test_with_it_on_the_webhook_digest_still_shows_bare_ids_only(self):
+        self.names = {cid(1): "Alex Smith"}
+        with self.setting("true"):
+            self.both_report()
+
+        self.assertEqual(self.name_lookups, [])
+        self.assertNotIn("Alex", "\n".join(self.digests()))
+
+    def test_the_setting_is_read_on_every_request(self):
+        with self.setting("false"):
+            self.request(child=cid(1))
+        with self.setting("true"):
+            self.request(child=cid(2))  # on now, and both have rows
+        self.assertEqual(len(self.digests()), 1)
+
+        self.give(cid(1), "c")
+        with self.setting("false"):
+            self.request(child=cid(1))
+            self.request(child=cid(2))
+        self.assertEqual(len(self.digests()), 1)  # off again: no second digest
+
+    def test_the_responses_are_the_same_either_way(self):
+        with self.setting("false"):
+            off, off_status = self.request(child=cid(1))
+        self.famly.plans = []
+        self.give(cid(1), "a")
+        self.log_reset()
+        with self.setting("true"):
+            on, on_status = self.request(child=cid(1))
+
+        self.assertEqual((off_status, on_status), (200, 200))
+        self.assertEqual(off, on)
+
+    def log_reset(self):
+        with preview_store.open_store() as connection:
+            connection.execute("DELETE FROM delete_log")
+
+
+class ImmediateMessagesDoNotDependOnTheSettingTests(DigestTestCase):
+    def setUp(self):
+        super().setUp()
+        self.allow(cid(1), cid(2), cid(3), cid(9))
+        env = mock.patch.dict("os.environ", {"DELETE_DIGEST_ON_COMPLETE": "false"})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def test_an_unexpected_stop_still_posts_at_once(self):
+        self.give(cid(1), "a")
+        self.delete_effect = self.leave_plan_in_place
+        self.request(child=cid(1))
+
+        self.assertEqual(len(self.notices), 1)
+        self.assertIn("stopped", self.notices[0])
+
+    def test_a_tripped_pause_still_posts_at_once(self):
+        for index, child in enumerate((cid(1), cid(2), cid(3))):
+            self.give(child, f"z{index}")
+        self.delete_effect = lambda plan: (_ for _ in ()).throw(RuntimeError("no"))
+        for child in (cid(1), cid(2), cid(3)):
+            self.request(child=child)
+
+        self.assertEqual(len([n for n in self.notices if "paused" in n]), 1)
+
+    def test_a_daily_cap_stop_still_posts_at_once(self):
+        self.give(cid(1), "a")
+        with mock.patch.dict("os.environ", {"DELETE_PLANS_MAX_PER_DAY": "0"}):
+            self.request(child=cid(1))
+
+        self.assertEqual(len(self.notices), 1)
+        self.assertIn("daily limit", self.notices[0])
+
+    def test_routine_results_post_nothing_and_no_digest_follows(self):
+        self.give(cid(1), "a")
+        self.request(child=cid(1))
+        self.request(child=base.OTHER)
+        self.request(child=cid(2))
+
+        self.assertEqual(self.notices, [])
+
+
+class CliDigestIsUnchangedWhenTheSettingIsOffTests(DigestTestCase):
+    def setUp(self):
+        super().setUp()
+        env = mock.patch.dict("os.environ", {"DELETE_DIGEST_ON_COMPLETE": "false"})
+        env.start()
+        self.addCleanup(env.stop)
+        self.allow(cid(1), cid(2), cid(3))
+        self.give(cid(1), "a")
+        self.request(child=cid(1))
+        self.request(child=cid(2))
+
+    def test_delete_digest_posts_everything_and_lists_not_received(self):
+        self.assertEqual(self.notices, [])
+
+        result = self.cli()
+
+        self.assertTrue(result["posted"])
+        text = "\n".join(self.digests())
+        self.assertIn("*Deleted* (1)", text)
+        self.assertIn("*Nothing to delete* (1)", text)
+        self.assertIn("*Not received* (1)", text)
+        self.assertIn(f"`{cid(3)}` — no request received", text)
+        self.assertEqual(digest.unreported_rows(), [])
+
+    def test_delete_digest_still_fetches_names(self):
+        self.names = {cid(1): "Alex Smith"}
+
+        self.cli()
+
+        self.assertIn(f"Alex Smith (`{cid(1)}`)", "\n".join(self.digests()))
+        self.assertIn(cid(1), self.name_lookups)
+
+    def test_if_quiet_still_honours_its_threshold(self):
+        self.clock += timedelta(minutes=9, seconds=59)
+        self.assertFalse(self.cli(if_quiet=10)["posted"])
+        self.assertEqual(self.digests(), [])
+
+        self.clock += timedelta(seconds=1)
+        self.assertTrue(self.cli(if_quiet=10)["posted"])
+        self.assertEqual(len(self.digests()), 1)
+
+    def test_a_row_is_still_reported_once(self):
+        self.cli()
+        self.assertFalse(self.cli()["posted"])
+        self.assertEqual(len(self.digests()), 1)
+
+    def test_the_cli_works_with_the_setting_on_too(self):
+        with mock.patch.dict("os.environ", {"DELETE_DIGEST_ON_COMPLETE": "true"}):
+            self.assertTrue(self.cli()["posted"])
+
+
+class SettingDocumentationTests(unittest.TestCase):
+    def test_the_readme_documents_the_setting_and_both_behaviours(self):
+        readme = (Path(__file__).resolve().parent.parent / "README.md").read_text(encoding="utf-8")
+        start = readme.index("## `delete_plans`")
+        section = " ".join(readme[start : readme.index("\n## ", start + 1)].split())
+
+        self.assertIn("DELETE_DIGEST_ON_COMPLETE", section)
+        self.assertIn("default", section[section.index("DELETE_DIGEST_ON_COMPLETE") :][:400].lower())
+        self.assertIn("only from the `delete-digest` command", section)
+        self.assertIn("bare ids", section)
+
 
 
 if __name__ == "__main__":
