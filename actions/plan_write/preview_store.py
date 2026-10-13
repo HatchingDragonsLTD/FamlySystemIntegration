@@ -380,6 +380,21 @@ def get(preview_id: str) -> StoredPreview | None:
     return stored
 
 
+def latest_for_chain(chain_id: str, chain_index: int) -> StoredPreview | None:
+    """The newest preview stored for one plan of a chain, or None.
+
+    Newest, because an adjusted copy replaces the original under a new id. Goes
+    through `get`, so a pending one past its TTL comes back marked expired.
+    """
+    with _open() as connection:
+        row = connection.execute(
+            "SELECT preview_id FROM previews WHERE chain_id = ? AND chain_index = ? "
+            "ORDER BY created_at DESC LIMIT 1",
+            (chain_id, chain_index),
+        ).fetchone()
+    return get(row["preview_id"]) if row is not None else None
+
+
 def mark(preview_id: str, status: str) -> bool:
     """Set a preview's status. Returns True when a row was updated."""
     with _open() as connection:

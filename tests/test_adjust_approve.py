@@ -19,6 +19,7 @@ from pathlib import Path
 from unittest import mock
 
 from actions.plan_write import approval, preview_store
+from actions.read_child_plans.runner import ChildPlansResult
 from integrations import child_lookup, slack
 
 logging.disable(logging.CRITICAL)
@@ -70,6 +71,19 @@ class AdjustTestCase(unittest.TestCase):
         self.previews = []
         self.posted = []
         self.opened = []
+
+        # The live check reads the child's plans just before a commit. Stubbed
+        # here (never Famly): `self.live_plans` is what the child "has".
+        self.live_plans = []
+        live = mock.patch.object(
+            approval.read_child_plans,
+            "run",
+            lambda child_id, version=3, client=None: ChildPlansResult(
+                child_id=child_id, plans=list(self.live_plans)
+            ),
+        )
+        live.start()
+        self.addCleanup(live.stop)
 
         def fake_preview(
             body, version, client=None, old_plan_id=None, replace_old_plan=False

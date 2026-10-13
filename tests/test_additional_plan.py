@@ -270,6 +270,19 @@ class ApproveThroughCommitTests(unittest.TestCase):
         env.start()
         self.addCleanup(env.stop)
 
+        # The live check reads the child's plans just before a commit. Stubbed
+        # here (never Famly): `self.live_plans` is what the child "has".
+        self.live_plans = []
+        live = mock.patch.object(
+            approval.read_child_plans,
+            "run",
+            lambda child_id, version=3, client=None: ChildPlansResult(
+                child_id=child_id, plans=list(self.live_plans)
+            ),
+        )
+        live.start()
+        self.addCleanup(live.stop)
+
     def test_the_commit_request_carries_old_plan_id_and_replace_old_plan(self):
         preview_store.save(
             "pv-additional",
@@ -280,6 +293,7 @@ class ApproveThroughCommitTests(unittest.TestCase):
             replace_old_plan=False,
         )
 
+        self.live_plans = [Plan(id="existing-plan-1", from_="2026-01-01")]
         client = FakeRest()
         with mock.patch.object(runner, "RestClient", lambda *a, **k: client):
             text = approval.handle_click(

@@ -20,7 +20,7 @@ A row holds:
                 null until that segment's plan has been committed
     next_index  how many segments are committed: the segment at this index is
                 the one awaiting approval (== len(segments) once all are done)
-    status      active | complete | stopped
+    status      active | complete | stopped | expired | cancelled
     created_at  UTC ISO timestamp
 
 At most ONE chain per child can be active, enforced by a unique index in the
@@ -43,6 +43,18 @@ logger = logging.getLogger(__name__)
 STATUS_ACTIVE = "active"
 STATUS_COMPLETE = "complete"
 STATUS_STOPPED = "stopped"
+# The chain's pending preview expired unapproved (see maintenance.py).
+STATUS_EXPIRED = "expired"
+# Closed by an operator with chain-cancel. Nothing in Famly is touched.
+STATUS_CANCELLED = "cancelled"
+
+# Every status a chain leaves `active` for. None of them blocks the child.
+FINISHED_STATUSES = (
+    STATUS_COMPLETE,
+    STATUS_STOPPED,
+    STATUS_EXPIRED,
+    STATUS_CANCELLED,
+)
 
 
 @dataclass
@@ -144,6 +156,43 @@ def get(chain_id: str) -> Chain | None:
     return _row_to_chain(row) if row is not None else None
 
 
+def list_active() -> list[Chain]:
+    """Every active chain, oldest first."""
+    with preview_store.open_store() as connection:
+        rows = connection.execute(
+            "SELECT * FROM chains WHERE status = ? ORDER BY created_at",
+            (STATUS_ACTIVE,),
+        ).fetchall()
+    return [_row_to_chain(row) for row in rows]
+
+
+def note_stuck_notified(chain_id: str, index: int) -> bool:
+    """Record that the stuck-chain notice was posted after segment `index`.
+
+    True only for the call that records it, so a cron that runs every few
+    minutes posts the notice ONCE.
+    """
+    with preview_store.open_store() as connection:
+        row = connection.execute(
+            "SELECT * FROM chains WHERE chain_id = ? AND status = ?",
+            (chain_id, STATUS_ACTIVE),
+        ).fetchone()
+        if row is None:
+            return False
+        chain = _row_to_chain(row)
+        if not 0 <= index < len(chain.segments) or chain.segments[index].get(
+            "stuck_notified"
+        ):
+            return False
+        segments = copy.deepcopy(chain.segments)
+        segments[index]["stuck_notified"] = True
+        cursor = connection.execute(
+            "UPDATE chains SET segments = ? WHERE chain_id = ? AND next_index = ?",
+            (json.dumps(segments), chain_id, chain.next_index),
+        )
+        return cursor.rowcount > 0
+
+
 def find_active(child_id: str) -> Chain | None:
     """The child's active chain, if there is one."""
     if not child_id:
@@ -181,6 +230,9 @@ def mark_committed(chain_id: str, index: int, plan_id: str) -> Chain | None:
 
         segments = copy.deepcopy(chain.segments)
         segments[index]["plan_id"] = plan_id
+        # When the commit was recorded: how chain-sweep tells a chain that is
+        # stuck between "commit recorded" and "next plan posted".
+        segments[index]["committed_at"] = _now()
         cursor = connection.execute(
             "UPDATE chains SET segments = ?, next_index = ? "
             "WHERE chain_id = ? AND status = ? AND next_index = ?",
@@ -198,12 +250,12 @@ def mark_committed(chain_id: str, index: int, plan_id: str) -> Chain | None:
 
 
 def finish(chain_id: str, status: str) -> bool:
-    """Move an ACTIVE chain to `complete` or `stopped`.
+    """Move an ACTIVE chain to any finished status.
 
     Only an active chain moves, so a chain that already finished keeps the
     outcome it had. Returns True when this call changed it.
     """
-    if status not in (STATUS_COMPLETE, STATUS_STOPPED):
+    if status not in FINISHED_STATUSES:
         raise ValueError(f"cannot finish a chain as {status!r}")
     with preview_store.open_store() as connection:
         cursor = connection.execute(
