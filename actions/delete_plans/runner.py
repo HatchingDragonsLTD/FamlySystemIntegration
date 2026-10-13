@@ -35,8 +35,14 @@ calls `_delete_plan`.
 captured Famly request is pasted in, so only `dry_run` works today.
 
 Every outcome is a row in the `delete_log` table of the preview store's SQLite
-file. Slack messages use the child id only, never a name. The backups are
-personal data and live under the gitignored `var/`.
+file. The backups are personal data and live under the gitignored `var/`.
+
+SLACK. There is ONE end-of-run DIGEST (see digest.py), not a message per child.
+Only three things post immediately: an unexpected result that stops a child, a
+tripped pause (the breaker) and a daily-cap stop. Everything else -- deleted,
+nothing to delete, partly deleted, refused, a dry run -- waits for the digest.
+Names appear only in a digest posted from the CLI (`delete-digest`), fetched
+then; they are never fetched during a webhook request and never stored.
 """
 
 import json
@@ -81,7 +87,7 @@ OUTCOMES = {
     "dry_run": "dry_run mode: the plans were listed in Slack and logged. Nothing was deleted.",
     "deleted": "live mode: every plan was deleted, each backed up first and confirmed gone by read-back.",
     "partial": "live mode: every plan that could be deleted was, but at least one was skipped for lacking CanDeletePlan and remains.",
-    "failed": "live mode: the child was stopped by an unexpected result (backup failed, delete failed, read-back failed or unexpected, the pause flag, or the daily cap). See `message`.",
+    "failed": "live mode: the child was stopped (a backup, delete or read-back failure, an unexpected read-back, the pause flag, the daily cap, or _delete_plan not being written yet). See `message`.",
     "error": "an unexpected error (for example Famly could not be read). Reported, never raised.",
 }
 
@@ -367,8 +373,22 @@ def _refuse(result: Result, outcome: str, message: str, *, notify: bool, log: bo
 def run(child_id: str) -> Result:
     """Handle one validated request for one child. Never raises.
 
-    The caller has already checked the request is well formed.
+    The caller has already checked the request is well formed. After each child
+    the digest is posted if every allowlist child now has an unreported row
+    (see digest.py) -- from the webhook, so with ids only: no name is fetched.
     """
+    result = _process(child_id)
+    if result.mode != MODE_OFF:
+        try:
+            from . import digest
+
+            digest.post_if_complete()
+        except Exception:  # noqa: BLE001 - the digest must never fail the request
+            logger.exception("DELETE_PLANS digest check failed")
+    return result
+
+
+def _process(child_id: str) -> Result:
     run_mode = mode()
     result = Result(child_id=child_id, mode=run_mode)
 
@@ -395,7 +415,8 @@ def _run(result: Result) -> Result:
     child_id = result.child_id
 
     if child_id.lower() not in allowlist():
-        return _refuse(result, "not_allowlisted", "this child is not on the allowlist; nothing was done", notify=True)
+        # Refused, and reported in the digest -- not a message of its own.
+        return _refuse(result, "not_allowlisted", "this child is not on the allowlist; nothing was done", notify=False)
 
     plans = read_plans(child_id)
     if not plans:
@@ -413,22 +434,25 @@ def _run(result: Result) -> Result:
 def _dry_run(result: Result, plans: list) -> Result:
     ordered = latest_first(plans)
     result.plans = [plan_row(p) for p in ordered]
-    lines = [
-        f":mag: *delete_plans DRY RUN* — child `{result.child_id}`: {len(plans)} plan(s) "
-        f"would be deleted, latest-starting first. Nothing was changed."
-    ]
-    for row in result.plans:
-        lines.append(
-            f"• `{row['planId']}` — {row['from'] or 'unknown'} to {row['to'] or 'open-ended'} — "
-            f"monthly estimate {row['monthlyEstimate']} — {CAN_DELETE}: "
-            f"{'yes' if row['canDelete'] else 'NO (would be skipped)'}"
-        )
-    slack.post_notice("\n".join(lines))
 
     result.ok = True
     result.outcome = "dry_run"
     result.message = f"dry run: {len(plans)} plan(s) listed; nothing was deleted"
-    log_row(result.child_id, None, MODE_DRY_RUN, "dry_run", f"{len(plans)} plan(s)")
+    # The plans that WOULD be deleted ride in the log row as JSON (no names, only
+    # ids, dates and figures): the digest lists them from there.
+    log_row(
+        result.child_id,
+        None,
+        MODE_DRY_RUN,
+        "dry_run",
+        json.dumps(
+            [
+                {k: row[k] for k in ("planId", "from", "to", "monthlyEstimate", "canDelete")}
+                for row in result.plans
+            ],
+            default=str,
+        ),
+    )
     return result
 
 
@@ -458,6 +482,7 @@ def _live(result: Result, plans: list) -> Result:
     deleted = skipped = 0
     failure: str | None = None
     counts_as_failed = True  # a pause or the daily cap is not a failed child
+    stopped_by = "stopped"  # the terminal log row: stopped (unexpected) or refused (pause, cap)
     current = list(plans)
 
     for plan in latest_first(plans):
@@ -477,6 +502,7 @@ def _live(result: Result, plans: list) -> Result:
             row["result"] = "paused"
             failure = "the delete_plans pause flag is set"
             counts_as_failed = False
+            stopped_by = "refused"
             log_row(child_id, plan.id, MODE_LIVE, "paused", failure)
             break
 
@@ -487,6 +513,12 @@ def _live(result: Result, plans: list) -> Result:
                 failure = f"the daily limit of {max_per_day()} children has been reached"
                 counts_as_failed = False
                 log_row(child_id, plan.id, MODE_LIVE, "cap_reached", failure)
+                # A daily-cap stop is one of the three things that post at once.
+                slack.post_notice(
+                    f":hourglass: *delete_plans daily limit reached* — {max_per_day()} children "
+                    f"today (UTC). Child `{child_id}` was not processed; the rest wait for tomorrow."
+                )
+                stopped_by = "refused"
                 break
             log_row(child_id, None, MODE_LIVE, "started", f"{len(plans)} plan(s)")
 
@@ -536,15 +568,36 @@ def _live(result: Result, plans: list) -> Result:
         result.outcome = "failed"
         result.message = failure
         result.errors = [failure]
+        _terminal_row(child_id, stopped_by, deleted, skipped, failure)
         if counts_as_failed:
             _record_child_result(True, child_id)
-        head = f":x: *delete_plans (live)* — child `{child_id}`: stopped. {failure}"
+            # An unexpected result that stopped a child posts AT ONCE.
+            slack.post_notice(
+                "\n".join(
+                    [f":x: *delete_plans (live)* — child `{child_id}`: stopped. {failure}", *summary]
+                )
+            )
     else:
         result.ok = skipped == 0
         result.outcome = "deleted" if skipped == 0 else "partial"
         result.message = f"{deleted} plan(s) deleted" + (f", {skipped} skipped" if skipped else "")
+        _terminal_row(child_id, "done" if skipped == 0 else "partial", deleted, skipped, result.message)
         _record_child_result(False, child_id)
-        head = f":wastebasket: *delete_plans (live)* — child `{child_id}`: {result.message}."
+        # Routine: reported in the digest, not on its own.
 
-    slack.post_notice("\n".join([head, *summary]))
     return result
+
+
+def _terminal_row(child_id: str, outcome: str, deleted: int, skipped: int, message: str) -> None:
+    """The one row per live child request that says how it ended, for the digest.
+
+    outcome: done | partial | stopped (an unexpected result) | refused (the pause
+    flag or the daily cap). `detail` is JSON: {deleted, skipped, message}.
+    """
+    log_row(
+        child_id,
+        None,
+        MODE_LIVE,
+        outcome,
+        json.dumps({"deleted": deleted, "skipped": skipped, "message": message}),
+    )

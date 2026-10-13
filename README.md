@@ -646,6 +646,36 @@ never pauses the other.
 python main.py delete-resume   # clears the delete_plans pause flag and shows the state
 ```
 
+### Slack: one digest, and three immediate messages
+
+`delete_plans` does **not** post a message per child. Only three things post at
+once: an unexpected result that stops a child, a tripped pause (3 failed children
+in a row) and a daily-cap stop. Everything else -- deleted, nothing to delete,
+partly deleted, refused (including a child stopped by an already-set pause), a
+dry run -- goes in **one end-of-run digest**.
+
+* **When it posts.** After each child is processed, if every child on the
+  allowlist has an unreported `delete_log` row. `python main.py delete-digest`
+  posts whatever is unreported now, listing any allowlist child with no row as
+  **Not received**. `python main.py delete-digest --if-quiet 10` posts only if
+  there are unreported rows and the newest is at least 10 minutes old, so it can
+  run from cron every 5 minutes.
+* **At most once.** `delete_log.reported_at` (added in place) is stamped when a row
+  goes into a digest; a row is posted in one digest only, and a row that arrives
+  after a digest starts the next one.
+* **What it says.** A header with the mode and the counts (deleted, nothing to
+  delete, partly deleted or skipped, failed, refused, not received); a section per
+  category with one line per child -- name, the id in code formatting, the number of
+  plans deleted, the reason for a failure, and in a dry run the plans (from, to,
+  monthly estimate) that would be deleted; and the backup folder at the end. Over
+  Slack's size limit it is split into numbered messages (1/2, 2/2).
+* **Names.** Fetched at digest time with the existing 3-second lookup, falling back
+  to the bare id, and never stored. They are never fetched during a webhook
+  request, so a digest a webhook triggers shows ids only; the `delete-digest`
+  command shows names.
+* The neighbouring plans' end dates after each delete are in the `delete_log` row
+  for that plan (`detail`), not in Slack.
+
 `delete-resume` prints the mode, whether it is paused, the consecutive-failure count,
 how many children were done today, and the last five `delete_log` rows (newest
 first). It clears only the delete_plans flag; `queue-resume` is the plan queue's.
@@ -672,7 +702,12 @@ The `delete_log` table records finer-grained outcomes per plan and child:
 `started` (a live child began, counted against the daily cap), `deleted`,
 `skipped`, `backup_failed`, `delete_failed`, `readback_failed`, `unexpected`,
 `paused`, `cap_reached`, plus the response outcomes `dry_run`, `nothing_to_delete`,
-`not_allowlisted` and `error`.
+`not_allowlisted` and `error`. Each live child request also ends with ONE terminal
+row (no plan) that the digest reads: `done` (all deleted), `partial` (some skipped),
+`stopped` (an unexpected result) or `refused` (the pause flag or the daily cap), its
+`detail` JSON carrying the number deleted and skipped and the message. A dry run's
+`dry_run` row carries the plans that would be deleted. `reported_at` is NULL until
+the row goes into a digest.
 
 ## Reference-data pulls (sessions, groups, products, institution defaults)
 

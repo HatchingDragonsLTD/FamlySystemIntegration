@@ -31,6 +31,9 @@ REAL_DELETE_PLAN = runner._delete_plan  # captured before any test patches it
 
 CHILD = "00000000-0000-0000-0000-0000000000a1"
 OTHER = "00000000-0000-0000-0000-0000000000a2"
+# On the allowlist but never sent a request in most tests: the digest only posts
+# on its own once EVERY allowlist child has reported, so this keeps it quiet.
+NEVER_SENT = "00000000-0000-0000-0000-0000000000a9"
 
 
 def plan_node(plan_id, start, end=None, child=CHILD, deletable=True, estimate=500.0):
@@ -73,7 +76,7 @@ class DeleteTestCase(unittest.TestCase):
         root = Path(self._tmp.name)
 
         self.allowlist_file = root / "allowlist.txt"
-        self.allowlist_file.write_text(f"{CHILD}\n", encoding="utf-8")
+        self.allowlist_file.write_text(f"{CHILD}\n{NEVER_SENT}\n", encoding="utf-8")
         self.backups = root / "backups"
 
         env = mock.patch.dict(
@@ -102,9 +105,17 @@ class DeleteTestCase(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-        # Slack messages carry the child id only: a name lookup is a failure.
-        def no_names(*args, **kwargs):
-            raise AssertionError("delete_plans must not look up a child's name")
+        # A name is NEVER fetched during a webhook request: a lookup there is a
+        # failure. Only a digest posted from the CLI may look names up.
+        self.names_allowed = False
+        self.names = {}
+        self.name_lookups: list[str] = []
+
+        def no_names(child_id, *args, **kwargs):
+            if not self.names_allowed:
+                raise AssertionError("delete_plans must not look up a name during a webhook request")
+            self.name_lookups.append(child_id)
+            return self.names.get(child_id)
 
         patcher = mock.patch.object(child_lookup, "lookup_child_name", no_names)
         patcher.start()
@@ -252,7 +263,7 @@ class MalformedRequestTests(DeleteTestCase):
 
 
 class AllowlistTests(DeleteTestCase):
-    def test_a_child_off_the_allowlist_is_refused_with_a_notice_and_nothing_else(self):
+    def test_a_child_off_the_allowlist_is_refused_and_logged_and_nothing_else(self):
         self.famly.plans = [plan_node("x", "2026-01-01", child=OTHER)]
 
         data, status = self.request(child=OTHER)
@@ -262,9 +273,9 @@ class AllowlistTests(DeleteTestCase):
         self.assertEqual(data["outcome"], "not_allowlisted")
         self.assertEqual(self.famly.gets, 0)  # no further action: the plans were never read
         self.assertEqual(self.delete_calls, [])
-        self.assertEqual(len(self.notices), 1)
-        self.assertIn(OTHER, self.notices[0])
+        self.assertEqual(self.notices, [])  # refused: reported in the digest, not at once
         self.assertEqual(self.outcomes(), ["not_allowlisted"])
+        self.assertEqual(self.log(OTHER)[0]["child_id"], OTHER)
         self.assertFalse(self.backups.exists())
 
     def test_a_missing_file_allows_nothing(self):
@@ -404,22 +415,23 @@ class DryRunTests(DeleteTestCase):
         self.assertEqual(self.delete_calls, [])
         self.assertFalse(self.backups.exists())
 
-    def test_one_slack_message_lists_every_plan(self):
+    def test_a_dry_run_posts_nothing_of_its_own(self):
+        self.three_plans()
+        self.request()
+
+        self.assertEqual(self.notices, [])
+
+    def test_the_plans_that_would_be_deleted_are_in_the_log_row_latest_first(self):
         self.famly.plans = [
             plan_node("plan-a", "2026-01-01", "2026-04-01", estimate=410.5),
             plan_node("plan-b", "2026-04-01", None, deletable=False, estimate=520.0),
         ]
         self.request()
 
-        self.assertEqual(len(self.notices), 1)
-        message = self.notices[0]
-        self.assertIn("DRY RUN", message)
-        self.assertIn(CHILD, message)
-        for fragment in ("`plan-a`", "2026-01-01 to 2026-04-01", "410.5", "`plan-b`", "2026-04-01 to open-ended", "520"):
-            self.assertIn(fragment, message)
-        self.assertIn("CanDeletePlan: yes", message)
-        self.assertIn("CanDeletePlan: NO (would be skipped)", message)
-        self.assertLess(message.index("plan-b"), message.index("plan-a"))  # latest first
+        plans = json.loads(self.log()[0]["detail"])
+        self.assertEqual([p["planId"] for p in plans], ["plan-b", "plan-a"])
+        self.assertEqual(plans[1], {"planId": "plan-a", "from": "2026-01-01", "to": "2026-04-01", "monthlyEstimate": 410.5, "canDelete": True})
+        self.assertEqual(plans[0]["canDelete"], False)
 
     def test_the_response_lists_the_plans(self):
         self.three_plans()
@@ -596,7 +608,7 @@ class LiveDeleteTests(DeleteTestCase):
         self.assertIn("read-back failed", data["message"])
         self.assertIn("readback_failed", self.outcomes())
 
-    def test_the_neighbours_end_dates_are_reported(self):
+    def test_the_neighbours_end_dates_are_reported_in_the_log(self):
         self.three_plans()
 
         def delete_and_extend_the_previous_plan(plan):
@@ -609,15 +621,15 @@ class LiveDeleteTests(DeleteTestCase):
         self.delete_effect = delete_and_extend_the_previous_plan
         self.request()
 
-        message = self.notices[-1]
-        self.assertIn("previous plan `plan-b`: end date 2026-09-01 -> open-ended (changed)", message)
-        self.assertIn("`plan-c` deleted", message)
+        row = next(r for r in self.log(CHILD) if r["outcome"] == "deleted" and r["plan_id"] == "plan-c")
+        self.assertIn("previous plan `plan-b`: end date 2026-09-01 -> open-ended (changed)", row["detail"])
 
     def test_an_unchanged_neighbour_is_reported_as_unchanged(self):
         self.three_plans()
         self.request()
 
-        self.assertIn("previous plan `plan-b`: end date 2026-09-01 -> 2026-09-01 (unchanged)", self.notices[-1])
+        row = next(r for r in self.log(CHILD) if r["outcome"] == "deleted" and r["plan_id"] == "plan-c")
+        self.assertIn("previous plan `plan-b`: end date 2026-09-01 -> 2026-09-01 (unchanged)", row["detail"])
 
     def test_each_live_delete_is_a_log_row(self):
         self.three_plans()
@@ -631,13 +643,11 @@ class LiveDeleteTests(DeleteTestCase):
             self.assertTrue(row["at"])
         self.assertEqual(rows[0]["outcome"], "started")
 
-    def test_one_slack_message_per_child_with_the_id_only(self):
+    def test_a_routine_live_child_posts_nothing_of_its_own(self):
         self.three_plans()
         self.request()
 
-        self.assertEqual(len(self.notices), 1)
-        self.assertIn(CHILD, self.notices[0])
-        self.assertIn("3 plan(s) deleted", self.notices[0])
+        self.assertEqual(self.notices, [])
 
     def test_the_real_delete_plan_raises_until_the_captured_request_is_pasted(self):
         with self.assertRaises(NotImplementedError) as caught:
@@ -695,7 +705,9 @@ class CanDeletePlanTests(DeleteTestCase):
         self.assertTrue(any("plan-b" in w and "CanDeletePlan" in w for w in data["warnings"]))
         self.assertEqual([p["result"] for p in data["plans"]], ["skipped", "deleted"])
         self.assertIn("1 skipped", data["message"])
-        self.assertIn("`plan-b` skipped", self.notices[-1])
+        self.assertEqual(self.notices, [])  # routine: the digest reports it
+        skipped = [r for r in self.log(CHILD) if r["outcome"] == "skipped"]
+        self.assertEqual([r["plan_id"] for r in skipped], ["plan-b"])
         self.assertEqual([p["id"] for p in self.famly.plans], ["plan-b"])
 
     def test_a_skipped_plan_is_not_backed_up_or_deleted(self):
