@@ -485,6 +485,123 @@ Create `actions/<name>/web.py` exposing `ACTION_NAME` and
 `web_registry.ACTIONS`. `server.py` does not change. Handlers are plain
 functions — unit-testable without Flask or a running server.
 
+## The unattended queue (`queue_timeline` + `queue-worker`)
+
+`create_timeline` builds a starter's plans one Slack approval at a time. The queue
+builds the same timelines **unattended**: HubSpot (or anything else) posts the
+request, it is validated and stored at once, and a separate worker process builds
+it later, committing the plans that are clean and holding the ones that are not.
+
+### Accepting a request
+
+`POST /intake` with `"action": "queue_timeline"` and the same payload as
+`create_timeline` (plus `auto_round`). It validates **every** plan with no Famly
+call, stores the allow-listed payload (no names) in the `jobs` table and returns
+the job id straight away. The same child, start date and payload returns the
+existing job instead of making another (a failed or cancelled job does not block
+asking again). It reads nothing from Famly or Slack.
+
+### The worker
+
+```bash
+python main.py queue-worker          # runs until stopped
+python main.py queue-worker --once   # recover, run at most one job, exit
+```
+
+It runs **one job at a time**. For each job it reads the child's plans (the child
+must have none), then for each plan: preview, auto-round, clean-check, commit,
+and the read-back. Commits go through the **existing approval path**
+(`approval._approve`), so `COMMIT_ENABLED`, `COMMIT_ALLOWED_CHILD_IDS`, the atomic
+claim and the live check of the child's plans all apply exactly as they do to a
+human clicking Approve.
+
+`QUEUE_MODE`:
+
+| mode | behaviour |
+|---|---|
+| `off` | the worker does nothing, and `queue_timeline` refuses requests |
+| `dry_run` (**default**) | commits **nothing**. Each plan is previewed on its own (a later plan cannot be chained to one that does not exist yet), rounded and clean-checked, and the result goes in a Slack digest |
+| `auto` | commits clean plans, in order |
+
+A plan is **clean** only if it validated, raised no warning (the flattener's or
+Famly's, apart from the informational funding-limit note), rounding succeeded or
+was not requested, and every period's estimate is above 0 and below
+`QUEUE_MAX_MONTHLY`. A plan that is not clean is **not committed**: the job is
+**held** and the normal Slack approval message is posted for that plan, with the
+reasons. When someone approves it the job goes back on the queue and the worker
+carries on; rejecting it cancels the job. A held plan that expires unanswered
+cancels the job, with a notice.
+
+### Safety rails
+
+| variable | meaning |
+|---|---|
+| `QUEUE_ALLOWED_INSTITUTIONS` | comma-separated codes allowed to commit automatically. **Empty means none**: every plan is held for approval |
+| `QUEUE_MAX_COMMITS_PER_DAY` | commit attempts per UTC day (default 20), checked before **every** commit. The rest of the batch waits for the next UTC day, with a Slack notice |
+| `QUEUE_MAX_MONTHLY` | a plan whose estimate is at or above this is held (default 5000) |
+
+* **Circuit breaker:** after 3 jobs in a row fail, the queue pauses itself and posts to Slack.
+* **Manual pause:** `queue-pause` / `queue-resume`. The flag is checked before every
+  commit, not only at the start of a job, so a pause takes effect mid-job.
+* **Failures:** a commit is **never retried**. After any commit that did not report
+  success the worker reads the child's plans; a plan that is there was written and
+  counts as a success. Reads and previews retry up to 3 times with backoff (30s
+  steps on HTTP 429). On startup a `running` job is resumed by **read-back**,
+  never by replaying.
+
+### Slack
+
+Held and failed jobs post **immediately**, naming the child. Successes go in one
+digest when the queue drains, or every 30 minutes while it is busy.
+
+### Commands
+
+```bash
+python main.py queue-status                 # mode, pause flag, counters, job counts
+python main.py queue-list                   # every job
+python main.py queue-list --status held     # one status
+python main.py queue-cancel <job>           # never deletes anything in Famly
+python main.py queue-pause
+python main.py queue-resume                 # also clears the failure count
+```
+
+### Running it under systemd
+
+The worker is its **own** unit, separate from gunicorn, so restarting the web
+server never interrupts a job (and a worker restart is safe: it resumes by
+read-back).
+
+```ini
+# /etc/systemd/system/famly-queue-worker.service
+[Unit]
+Description=Famly queue worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=famly
+WorkingDirectory=/opt/famly-tool
+EnvironmentFile=/opt/famly-tool/.env
+ExecStart=/opt/famly-tool/.venv/bin/python main.py queue-worker
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now famly-queue-worker
+journalctl -u famly-queue-worker -f
+```
+
+Put `QUEUE_MODE`, `QUEUE_ALLOWED_INSTITUTIONS` and the other variables above in the
+same `.env` the web server reads (the worker shares the preview store file, so
+`PREVIEW_STORE_PATH` must match). Leave `QUEUE_MODE` unset (dry run) until the
+digests look right, then set `auto`.
+
 ## Reference-data pulls (sessions, groups, products, institution defaults)
 
 Four maintenance commands refresh the local JSON reference files that other

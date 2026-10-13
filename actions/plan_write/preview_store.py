@@ -86,6 +86,11 @@ _ADDED_COLUMNS = {
     # segments it is. NULL for every ordinary preview.
     "chain_id": "TEXT",
     "chain_index": "INTEGER",
+    # queue_timeline: which queued job this preview belongs to and which of its
+    # plans it is, so a human approving a HELD plan can release the job. NULL
+    # for every other preview.
+    "job_id": "TEXT",
+    "job_index": "INTEGER",
 }
 
 # create_timeline's chains (see actions/create_timeline/chains.py, which owns
@@ -107,6 +112,42 @@ CREATE TABLE IF NOT EXISTS chains (
 # Columns added to `chains` after it first shipped (none yet; the same in-place
 # pattern as _ADDED_COLUMNS).
 _CHAINS_ADDED_COLUMNS: dict[str, str] = {}
+
+# queue_timeline's jobs (see actions/queue_timeline/jobs.py, which owns the
+# reads and writes) and the queue's small key/value state (paused flag,
+# consecutive failures, commits per day). Same file, same migration path.
+_JOBS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS jobs (
+    job_id      TEXT PRIMARY KEY,
+    job_key     TEXT NOT NULL,
+    child_id    TEXT NOT NULL,
+    payload     TEXT NOT NULL,
+    segments    TEXT NOT NULL,
+    next_index  INTEGER NOT NULL,
+    status      TEXT NOT NULL,
+    detail      TEXT,
+    preview_id  TEXT,
+    digest_sent INTEGER NOT NULL DEFAULT 0,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+)
+"""
+
+_JOBS_ADDED_COLUMNS: dict[str, str] = {}
+
+# A duplicate request returns the existing job -- but only while that job is
+# alive or finished. A failed or cancelled job does not block asking again.
+_JOBS_ONE_LIVE_PER_KEY = """
+CREATE UNIQUE INDEX IF NOT EXISTS jobs_one_live_per_key
+ON jobs (job_key) WHERE status IN ('queued', 'running', 'held', 'done')
+"""
+
+_QUEUE_STATE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS queue_state (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+)
+"""
 
 # A child can have at most ONE active chain. Enforced by the database, not just
 # checked beforehand, so two create_timeline requests arriving together cannot
@@ -142,6 +183,9 @@ class StoredPreview:
     # (0-based). None for an ordinary preview.
     chain_id: str | None = None
     chain_index: int | None = None
+    # queue_timeline: the job and position this preview is for. None otherwise.
+    job_id: str | None = None
+    job_index: int | None = None
 
     @property
     def is_expired(self) -> bool:
@@ -211,8 +255,11 @@ def _connect() -> sqlite3.Connection:
     connection.execute("PRAGMA journal_mode=WAL")
     connection.execute(_SCHEMA)
     connection.execute(_CHAINS_SCHEMA)
+    connection.execute(_JOBS_SCHEMA)
+    connection.execute(_QUEUE_STATE_SCHEMA)
     _migrate(connection)
     connection.execute(_CHAINS_ONE_ACTIVE)
+    connection.execute(_JOBS_ONE_LIVE_PER_KEY)
     connection.commit()
     return connection
 
@@ -227,6 +274,7 @@ def _migrate(connection: sqlite3.Connection) -> None:
     for table, added in (
         ("previews", _ADDED_COLUMNS),
         ("chains", _CHAINS_ADDED_COLUMNS),
+        ("jobs", _JOBS_ADDED_COLUMNS),
     ):
         existing = {
             row["name"] for row in connection.execute(f"PRAGMA table_info({table})")
@@ -272,6 +320,8 @@ def _row_to_preview(row: sqlite3.Row) -> StoredPreview:
         replace_old_plan=bool(_column(row, "replace_old_plan")),
         chain_id=_column(row, "chain_id"),
         chain_index=_column(row, "chain_index"),
+        job_id=_column(row, "job_id"),
+        job_index=_column(row, "job_index"),
     )
 
 
@@ -300,6 +350,8 @@ def save(
     replace_old_plan: bool = False,
     chain_id: str | None = None,
     chain_index: int | None = None,
+    job_id: str | None = None,
+    job_index: int | None = None,
 ) -> None:
     """Record a previewed plan as pending approval.
 
@@ -324,8 +376,9 @@ def save(
             "INSERT OR REPLACE INTO previews "
             "(preview_id, plan_body, child_id, version, created_at, status, "
             "site_code, institution_id, pricing_group_id, monthly_estimate, "
-            "old_plan_id, replace_old_plan, chain_id, chain_index) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "old_plan_id, replace_old_plan, chain_id, chain_index, "
+            "job_id, job_index) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 preview_id,
                 json.dumps(plan_body),
@@ -341,6 +394,8 @@ def save(
                 int(bool(replace_old_plan)),
                 chain_id,
                 chain_index,
+                job_id,
+                job_index,
             ),
         )
 
@@ -470,3 +525,5 @@ def _reset_for_tests() -> None:
     with _open() as connection:
         connection.execute("DELETE FROM previews")
         connection.execute("DELETE FROM chains")
+        connection.execute("DELETE FROM jobs")
+        connection.execute("DELETE FROM queue_state")
