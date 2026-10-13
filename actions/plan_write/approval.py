@@ -53,10 +53,11 @@ from actions.read_child_plans import runner as read_child_plans
 from actions.read_child_plans.runner import current_monthly_estimate
 from core.config import ConfigError, load_config
 from actions.create_timeline import engine as chain_engine
+from actions.queue_timeline import jobs as queue_jobs
 from core.rest_client import RestHTTPError
 from integrations import child_lookup, slack
 
-from . import preview_store, runner
+from . import preview_store, rounding, runner
 
 logger = logging.getLogger(__name__)
 
@@ -136,6 +137,13 @@ def _reject(preview_id: str | None, user: str | None) -> str:
         and stored.status in (preview_store.STATUS_PENDING, preview_store.STATUS_EXPIRED)
     ):
         chain_engine.stop_for_reject(stored, user)
+
+    if (
+        stored is not None
+        and stored.job_id
+        and stored.status in (preview_store.STATUS_PENDING, preview_store.STATUS_EXPIRED)
+    ):
+        queue_jobs.cancel_after_rejection(stored.job_id, stored.job_index, user)
 
     return MSG_REJECTED
 
@@ -298,6 +306,12 @@ def _approve(preview_id: str | None, user: str | None) -> str:
 
     if claimed.chain_id:
         text += _advance_chain(claimed, plan_id, child_id)
+
+    if claimed.job_id:
+        # A queue_timeline plan a human approved while its job was HELD: record
+        # it and put the job back on the queue. A no-op for the worker's own
+        # commits (their job is `running`, not held).
+        queue_jobs.release_after_approval(claimed.job_id, claimed.job_index, plan_id)
 
     return text
 
@@ -507,8 +521,12 @@ def _with_adjustment(plan_body: dict, pricing_group_id: str, value: float) -> di
 
     Copied rather than mutated: the stored original must stay exactly as it was
     previewed, in case the adjustment is abandoned.
+
+    A group never has two entries: an automatic rounding entry for the same
+    pricing group is REPLACED by this one (and the `Auto-rounded:` note line is
+    rewritten to list only the entries that remain).
     """
-    adjusted = copy.deepcopy(plan_body)
+    adjusted = rounding.without_group(plan_body, pricing_group_id)
     parts = adjusted.get("plan", {}).get("planParts")
     if not isinstance(parts, list) or not parts:
         return adjusted

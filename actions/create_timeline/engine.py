@@ -45,6 +45,7 @@ from actions.plan_write import (
     hubspot_flatten,
     hubspot_intake,
     input_schema,
+    rounding,
 )
 from actions.plan_write import web as plan_write_web
 from actions.read_child_plans import runner as read_child_plans
@@ -102,6 +103,7 @@ _PLAN_FIELDS = (
     "fundingHours",
     "maxFundedMinutes",
     "funding_entitlement",
+    "auto_round",
     "site_code",
     "addon_quantity",
 )
@@ -603,6 +605,25 @@ def _find(plans: list, plan_id):
     return next((p for p in plans if plan_id and p.id == plan_id), None)
 
 
+def join_problem(previous, this) -> str | None:
+    """Why `previous` does not meet `this`, or None when it does.
+
+    Famly's end date is EXCLUSIVE, so the previous plan's `to` must EQUAL this
+    plan's `from`; any other value (the day before included) is a gap or an
+    overlap. Shared by the chain read-back and the queue worker.
+    """
+    expected = _day(this.from_)
+    found = _day(previous.to)
+    if expected is not None and found == expected:
+        return None
+    return (
+        f"the previous plan does not meet it (a gap or an overlap). Famly's end "
+        f"date is exclusive: expected previous plan to = "
+        f"{expected.isoformat() if expected else 'unknown'}, "
+        f"found {previous.to or 'open-ended'}."
+    )
+
+
 def _plan_description(chain: chains.Chain, index: int, plan) -> str:
     return (
         f"• {_short_name(chain, index)} `{plan.id}`: "
@@ -668,6 +689,18 @@ def _verify_and_advance(chain: chains.Chain, index: int) -> None:
         )
         return
 
+    # Automatic rounding: each saved period's estimate plus its adjustment must
+    # equal the target. A miss is a WARNING for a human, never a stop -- the
+    # plan is saved and the chain is otherwise sound.
+    off_target = rounding.check_saved(this)
+    if off_target:
+        logger.warning("AUTO-ROUND CHECK chain_id=%s %s: %s", chain.chain_id, name, off_target)
+        slack.post_notice(
+            f":warning: {name} (`{plan_id}`) was auto-rounded but does not add up "
+            f"as saved — {'; '.join(off_target)}. The chain is continuing; please "
+            f"check the plan's adjustments in Famly."
+        )
+
     if index > 0:
         previous_id = chain.segments[index - 1].get("plan_id")
         previous = _find(plans, previous_id)
@@ -679,15 +712,11 @@ def _verify_and_advance(chain: chains.Chain, index: int) -> None:
             )
             return
 
-        expected = _day(this.from_)
-        found = _day(previous.to)
-        if expected is None or found != expected:
+        problem = join_problem(previous, this)
+        if problem:
             stop_chain(
                 chain.chain_id,
-                f"after {name} was committed, the previous plan does not meet it "
-                f"(a gap or an overlap). Famly's end date is exclusive: expected "
-                f"previous plan to = {expected.isoformat() if expected else 'unknown'}, "
-                f"found {previous.to or 'open-ended'}.",
+                f"after {name} was committed, {problem}",
                 extra_lines=[
                     _plan_description(chain, index - 1, previous),
                     _plan_description(chain, index, this),

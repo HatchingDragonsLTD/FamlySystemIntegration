@@ -16,6 +16,14 @@ from dataclasses import asdict, is_dataclass
 
 from actions.create_timeline import chain_cancel, chain_resume, chain_status, chain_sweep
 from actions.plan_write import cli as plan_write
+from actions.queue_timeline import (
+    queue_cancel,
+    queue_list,
+    queue_pause,
+    queue_resume,
+    queue_status,
+    queue_worker,
+)
 from actions.pull_groups import cli as pull_groups
 from actions.pull_institution_defaults import cli as pull_institution_defaults
 from actions.pull_products import cli as pull_products
@@ -45,6 +53,12 @@ ACTIONS = [
     chain_cancel,
     chain_resume,
     chain_sweep,
+    queue_worker,
+    queue_status,
+    queue_list,
+    queue_cancel,
+    queue_pause,
+    queue_resume,
 ]
 
 

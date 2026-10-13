@@ -308,6 +308,7 @@ def build_summary(
     today: date | None = None,
     child_name: str | None = None,
     heading: str | None = None,
+    rounding: list | None = None,
 ) -> str:
     """Format a previewed plan as plain, scannable Slack text for an approver.
 
@@ -329,6 +330,9 @@ def build_summary(
         heading: replaces the first line, e.g. a create_timeline chain's
             "*Plan 2 of 4 (funded, 2026-11-01 to 2026-12-31)*". None keeps
             "*Plan preview awaiting approval*".
+        rounding: the periods automatic rounding adjusted (objects with
+            `from_`, `estimate`, `target`), each shown as
+            "Rounded: 269.03 -> 270.00". None or empty shows nothing.
 
     Either map may be None or empty: an unresolved id is shown as the id
     itself. A readable label is a nicety and must never cost the approver the
@@ -447,6 +451,14 @@ def build_summary(
             if state is not current
         ]
         lines.append(f"• Other periods: {'; '.join(others)}")
+
+    # --- Automatic rounding, only when it was applied ----------------------- #
+    periods = list(rounding or [])
+    for period in periods:
+        line = f"• Rounded: {period.estimate:.2f} -> {period.target:.2f}"
+        if len(periods) > 1:
+            line += f" (from {str(period.from_ or 'unknown')[:10]})"
+        lines.append(line)
 
     # --- Public funding, only when funded ---------------------------------- #
     funding = _current_public_funding(plan, today)

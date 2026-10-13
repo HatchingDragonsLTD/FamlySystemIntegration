@@ -36,7 +36,8 @@ from actions.read_child_plans.runner import (
 )
 from integrations import catalogue, child_lookup, slack
 
-from . import hubspot_intake, preview_store
+from . import auto_round, hubspot_intake, preview_store
+from . import warnings as plan_warnings
 
 logger = logging.getLogger(__name__)
 
@@ -126,6 +127,26 @@ def handle(payload: dict) -> tuple[dict, int]:
     return run_preview_and_post(payload)
 
 
+@dataclasses.dataclass
+class Prepared:
+    """A previewed (and, when valid, stored) plan that has NOT been posted yet.
+
+    `prepare_preview` stops here so a caller that must look at the plan before
+    deciding whether a human sees it -- the queue worker -- can. `post_prepared`
+    does the rest; `run_preview_and_post` is the two back to back.
+    """
+
+    data: dict
+    status: int
+    result: Any = None  # the IntakeResult
+    preview: Any = None  # its ParsedPlanResult
+    warnings: list = dataclasses.field(default_factory=list)  # serialised
+    rounded_periods: list = dataclasses.field(default_factory=list)
+    outcome: Any = None  # the auto_round.Outcome, when auto-rounding was on
+    site: dict = dataclasses.field(default_factory=dict)
+    preview_id: str | None = None
+
+
 def run_preview_and_post(
     payload: dict,
     *,
@@ -135,7 +156,36 @@ def run_preview_and_post(
     chain_index: int | None = None,
     heading: str | None = None,
 ) -> tuple[dict, int]:
-    """Run a dry-run plan preview for a webhook payload, then post it to Slack.
+    """Preview a plan and post it to Slack: `prepare_preview` then `post_prepared`.
+
+    The arguments are those of `prepare_preview`, plus `heading` for the post.
+    Behaviour is exactly what it was before the two steps were separated.
+    """
+    prepared = prepare_preview(
+        payload,
+        old_plan_id=old_plan_id,
+        replace_old_plan=replace_old_plan,
+        chain_id=chain_id,
+        chain_index=chain_index,
+    )
+    if prepared.status != 200:
+        return prepared.data, prepared.status
+
+    post_prepared(prepared, heading=heading)
+    return prepared.data, 200
+
+
+def prepare_preview(
+    payload: dict,
+    *,
+    old_plan_id: str | None = None,
+    replace_old_plan: bool = False,
+    chain_id: str | None = None,
+    chain_index: int | None = None,
+    job_id: str | None = None,
+    job_index: int | None = None,
+) -> Prepared:
+    """Run a dry-run plan preview for a webhook payload and store it. No Slack.
 
     Shared by `handle` (plan_preview, no old plan) and the additional_plan
     action, which calls this directly with `old_plan_id` set to the child's
@@ -164,8 +214,8 @@ def run_preview_and_post(
         chain_id/chain_index: set only by create_timeline. Stored with the
             preview so the approval that commits it can advance the chain.
             None for every other caller, which behaves exactly as before.
-        heading: replaces the Slack message's first line (create_timeline's
-            "Plan 2 of 4 (...)"). None keeps the usual one.
+        job_id/job_index: set only by the queue worker, likewise: so a human
+            approving a HELD plan can release its job.
 
     Returns:
         (data, status). `data` carries `plan`, `previewed`, `preview_id` and
@@ -203,7 +253,31 @@ def run_preview_and_post(
     if not result.ok or preview is None:
         # Validation failures are a client problem (bad payload) -> 422. Nothing
         # is posted to Slack: there is no plan to approve.
-        return data, 422
+        return Prepared(data=data, status=422, result=result, preview=preview, warnings=warnings)
+
+    # Automatic rounding of the monthly totals: the body that is stored, and so
+    # committed, carries the adjustments. When it cannot be applied safely the
+    # plan goes ahead exactly as previewed. See auto_round.py.
+    store_body = result.plan_body or {}
+    rounded_periods: list = []
+    outcome = None
+    if auto_round.enabled(hubspot_intake.unwrap_payload(payload)):
+        outcome = auto_round.apply(
+            store_body,
+            preview,
+            PLAN_VERSION,
+            old_plan_id=old_plan_id,
+            replace_old_plan=replace_old_plan,
+        )
+        store_body = outcome.body
+        rounded_periods = outcome.periods
+        if outcome.reason:
+            # Recorded where the approver reads: the plan's own warnings list.
+            warnings.extend(
+                _serialise_warnings(
+                    [plan_warnings.local_warning(f"Not auto-rounded: {outcome.reason}")]
+                )
+            )
 
     preview_id = str(uuid.uuid4())
     data["preview_id"] = preview_id
@@ -220,7 +294,7 @@ def run_preview_and_post(
     try:
         preview_store.save(
             preview_id,
-            result.plan_body or {},
+            store_body,
             getattr(preview.plan, "child_id", None),
             PLAN_VERSION,
             # Metadata only: recorded with the preview, read by nothing in the
@@ -243,6 +317,8 @@ def run_preview_and_post(
             replace_old_plan=replace_old_plan,
             chain_id=chain_id,
             chain_index=chain_index,
+            job_id=job_id,
+            job_index=job_index,
         )
     except Exception as exc:  # noqa: BLE001 - storing must not break the preview
         logger.warning(
@@ -252,6 +328,31 @@ def run_preview_and_post(
             exc,
         )
 
+    return Prepared(
+        data=data,
+        status=200,
+        result=result,
+        preview=preview,
+        warnings=warnings,
+        rounded_periods=rounded_periods,
+        outcome=outcome,
+        site=site,
+        preview_id=preview_id,
+    )
+
+
+def post_prepared(
+    prepared: Prepared, *, heading: str | None = None, child_name: Any = ...
+) -> bool:
+    """Post a prepared preview to Slack with its Approve/Adjust/Reject buttons.
+
+    Sets `slack_posted` on the prepared data and returns it. `heading` replaces
+    the message's first line (create_timeline's "Plan 2 of 4 (...)"); None keeps
+    the usual one. `child_name` is for a caller that has already looked the name
+    up; left out, it is looked up here.
+    """
+    data, preview, warnings = prepared.data, prepared.preview, prepared.warnings
+
     # Names come from the local catalogue file; the preview response has ids
     # only. No Famly call, so a preview costs exactly one request as before.
     session_titles, product_titles = _catalogue_titles()
@@ -259,7 +360,8 @@ def run_preview_and_post(
     # The child's name, looked up live for THIS message only: never stored
     # (not in the preview store above, not in the response or any log) and a
     # failure or timeout just shows the bare id. See integrations.child_lookup.
-    child_name = child_lookup.lookup_child_name(getattr(preview.plan, "child_id", None))
+    if child_name is ...:
+        child_name = child_lookup.lookup_child_name(getattr(preview.plan, "child_id", None))
 
     data["slack_posted"] = slack.post_preview(
         slack.build_summary(
@@ -267,11 +369,11 @@ def run_preview_and_post(
             warnings,
             session_titles=session_titles,
             product_titles=product_titles,
-            site=site,
+            site=prepared.site,
             child_name=child_name,
             heading=heading,
+            rounding=prepared.rounded_periods,
         ),
-        preview_id,
+        prepared.preview_id,
     )
-
-    return data, 200
+    return data["slack_posted"]

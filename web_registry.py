@@ -21,6 +21,7 @@ from actions.create_timeline import web as create_timeline_web
 from actions.plan_status import web as plan_status_web
 from actions.plan_write import approval as plan_write_approval
 from actions.plan_write import web as plan_write_web
+from actions.queue_timeline import web as queue_timeline_web
 from actions.urn_lookup import web as urn_lookup_web  # TEMPORARY -- see its module docstring
 
 # One line per action. ACTION_NAME -> handler.
@@ -29,6 +30,7 @@ ACTIONS = {
     plan_status_web.ACTION_NAME: plan_status_web.handle,
     additional_plan_web.ACTION_NAME: additional_plan_web.handle,
     create_timeline_web.ACTION_NAME: create_timeline_web.handle,
+    queue_timeline_web.ACTION_NAME: queue_timeline_web.handle,
     urn_lookup_web.ACTION_NAME: urn_lookup_web.handle,  # TEMPORARY backfill utility
 }
 
