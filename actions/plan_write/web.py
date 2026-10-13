@@ -131,6 +131,9 @@ def run_preview_and_post(
     *,
     old_plan_id: str | None = None,
     replace_old_plan: bool = False,
+    chain_id: str | None = None,
+    chain_index: int | None = None,
+    heading: str | None = None,
 ) -> tuple[dict, int]:
     """Run a dry-run plan preview for a webhook payload, then post it to Slack.
 
@@ -158,6 +161,11 @@ def run_preview_and_post(
             is the ordinary plan_preview path, completely unchanged.
         replace_old_plan: only meaningful alongside `old_plan_id`. False for
             additional_plan -- the existing plan is kept, not replaced.
+        chain_id/chain_index: set only by create_timeline. Stored with the
+            preview so the approval that commits it can advance the chain.
+            None for every other caller, which behaves exactly as before.
+        heading: replaces the Slack message's first line (create_timeline's
+            "Plan 2 of 4 (...)"). None keeps the usual one.
 
     Returns:
         (data, status). `data` carries `plan`, `previewed`, `preview_id` and
@@ -233,6 +241,8 @@ def run_preview_and_post(
             # existed.
             old_plan_id=old_plan_id,
             replace_old_plan=replace_old_plan,
+            chain_id=chain_id,
+            chain_index=chain_index,
         )
     except Exception as exc:  # noqa: BLE001 - storing must not break the preview
         logger.warning(
@@ -259,6 +269,7 @@ def run_preview_and_post(
             product_titles=product_titles,
             site=site,
             child_name=child_name,
+            heading=heading,
         ),
         preview_id,
     )

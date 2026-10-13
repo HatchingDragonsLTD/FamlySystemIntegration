@@ -47,6 +47,10 @@ STATUS_EXPIRED = "expired"
 # Replaced by an adjusted copy under a new preview_id. The original must not
 # also be approvable, or the same plan could be committed twice over.
 STATUS_SUPERSEDED = "superseded"
+# A chain preview whose commit failed. Unlike an ordinary preview it is NOT
+# returned to pending: the chain stops there and nothing is retried, so the
+# same Approve button cannot be clicked again into a second write.
+STATUS_FAILED = "failed"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS previews (
@@ -78,7 +82,39 @@ _ADDED_COLUMNS = {
     # stored before these columns existed.
     "old_plan_id": "TEXT",
     "replace_old_plan": "INTEGER",
+    # create_timeline: which chain this preview belongs to, and which of its
+    # segments it is. NULL for every ordinary preview.
+    "chain_id": "TEXT",
+    "chain_index": "INTEGER",
 }
+
+# create_timeline's chains (see actions/create_timeline/chains.py, which owns
+# the reads and writes). The table lives in this file so one connection, one
+# WAL and one migration path serve both. The payload carries no names -- see
+# the engine's allow-list.
+_CHAINS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS chains (
+    chain_id   TEXT PRIMARY KEY,
+    child_id   TEXT NOT NULL,
+    payload    TEXT NOT NULL,
+    segments   TEXT NOT NULL,
+    next_index INTEGER NOT NULL,
+    status     TEXT NOT NULL,
+    created_at TEXT NOT NULL
+)
+"""
+
+# Columns added to `chains` after it first shipped (none yet; the same in-place
+# pattern as _ADDED_COLUMNS).
+_CHAINS_ADDED_COLUMNS: dict[str, str] = {}
+
+# A child can have at most ONE active chain. Enforced by the database, not just
+# checked beforehand, so two create_timeline requests arriving together cannot
+# both start one.
+_CHAINS_ONE_ACTIVE = """
+CREATE UNIQUE INDEX IF NOT EXISTS chains_one_active_per_child
+ON chains (child_id) WHERE status = 'active'
+"""
 
 
 @dataclass
@@ -102,6 +138,10 @@ class StoredPreview:
     # replace_old_plan is only meaningful alongside it.
     old_plan_id: str | None = None
     replace_old_plan: bool = False
+    # create_timeline: the chain this preview is one plan of, and its position
+    # (0-based). None for an ordinary preview.
+    chain_id: str | None = None
+    chain_index: int | None = None
 
     @property
     def is_expired(self) -> bool:
@@ -110,6 +150,16 @@ class StoredPreview:
     @property
     def is_committed(self) -> bool:
         return self.status == STATUS_COMMITTED
+
+
+def open_store():
+    """A connection to the store, committed on success and always closed.
+
+    The same context manager every function here uses, exposed so
+    `actions/create_timeline/chains.py` shares the file, the WAL and the schema
+    rather than opening its own.
+    """
+    return _open()
 
 
 def store_path() -> Path:
@@ -160,7 +210,9 @@ def _connect() -> sqlite3.Connection:
     # Concurrent workers: WAL lets a reader run while another writes.
     connection.execute("PRAGMA journal_mode=WAL")
     connection.execute(_SCHEMA)
+    connection.execute(_CHAINS_SCHEMA)
     _migrate(connection)
+    connection.execute(_CHAINS_ONE_ACTIVE)
     connection.commit()
     return connection
 
@@ -172,15 +224,19 @@ def _migrate(connection: sqlite3.Connection) -> None:
     written before a column existed would break on read. Adding in place keeps
     the pending previews already in it.
     """
-    existing = {
-        row["name"] for row in connection.execute("PRAGMA table_info(previews)")
-    }
-    for column, column_type in _ADDED_COLUMNS.items():
-        if column not in existing:
-            connection.execute(
-                f"ALTER TABLE previews ADD COLUMN {column} {column_type}"
-            )
-            logger.info("Preview store: added column %s", column)
+    for table, added in (
+        ("previews", _ADDED_COLUMNS),
+        ("chains", _CHAINS_ADDED_COLUMNS),
+    ):
+        existing = {
+            row["name"] for row in connection.execute(f"PRAGMA table_info({table})")
+        }
+        for column, column_type in added.items():
+            if column not in existing:
+                connection.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {column} {column_type}"
+                )
+                logger.info("Preview store: added column %s.%s", table, column)
 
 
 def _now() -> str:
@@ -214,6 +270,8 @@ def _row_to_preview(row: sqlite3.Row) -> StoredPreview:
         monthly_estimate=_column(row, "monthly_estimate"),
         old_plan_id=_column(row, "old_plan_id"),
         replace_old_plan=bool(_column(row, "replace_old_plan")),
+        chain_id=_column(row, "chain_id"),
+        chain_index=_column(row, "chain_index"),
     )
 
 
@@ -240,6 +298,8 @@ def save(
     monthly_estimate: float | None = None,
     old_plan_id: str | None = None,
     replace_old_plan: bool = False,
+    chain_id: str | None = None,
+    chain_index: int | None = None,
 ) -> None:
     """Record a previewed plan as pending approval.
 
@@ -254,14 +314,18 @@ def save(
     (see `claim_for_commit`/`approval.py`) so the write uses the SAME params
     the approver's preview used. None/False (the defaults) for an ordinary
     create, unchanged from before these parameters existed.
+
+    `chain_id`/`chain_index`: set when this preview is one plan of a
+    create_timeline chain, so the approval that commits it can advance the
+    chain. An adjusted copy carries them forward. None for everything else.
     """
     with _open() as connection:
         connection.execute(
             "INSERT OR REPLACE INTO previews "
             "(preview_id, plan_body, child_id, version, created_at, status, "
             "site_code, institution_id, pricing_group_id, monthly_estimate, "
-            "old_plan_id, replace_old_plan) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "old_plan_id, replace_old_plan, chain_id, chain_index) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 preview_id,
                 json.dumps(plan_body),
@@ -275,6 +339,8 @@ def save(
                 monthly_estimate,
                 old_plan_id,
                 int(bool(replace_old_plan)),
+                chain_id,
+                chain_index,
             ),
         )
 
@@ -388,3 +454,4 @@ def _reset_for_tests() -> None:
     """Drop every row. Tests only -- never called by the app."""
     with _open() as connection:
         connection.execute("DELETE FROM previews")
+        connection.execute("DELETE FROM chains")

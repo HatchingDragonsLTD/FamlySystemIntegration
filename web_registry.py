@@ -17,6 +17,7 @@ exception it raises.
 """
 
 from actions.additional_plan import web as additional_plan_web
+from actions.create_timeline import web as create_timeline_web
 from actions.plan_status import web as plan_status_web
 from actions.plan_write import approval as plan_write_approval
 from actions.plan_write import web as plan_write_web
@@ -27,6 +28,7 @@ ACTIONS = {
     plan_write_web.ACTION_NAME: plan_write_web.handle,
     plan_status_web.ACTION_NAME: plan_status_web.handle,
     additional_plan_web.ACTION_NAME: additional_plan_web.handle,
+    create_timeline_web.ACTION_NAME: create_timeline_web.handle,
     urn_lookup_web.ACTION_NAME: urn_lookup_web.handle,  # TEMPORARY backfill utility
 }
 

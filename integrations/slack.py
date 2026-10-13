@@ -307,6 +307,7 @@ def build_summary(
     site: dict | None = None,
     today: date | None = None,
     child_name: str | None = None,
+    heading: str | None = None,
 ) -> str:
     """Format a previewed plan as plain, scannable Slack text for an approver.
 
@@ -325,6 +326,9 @@ def build_summary(
             by the CALLER (`integrations.child_lookup`) and passed in, so this
             function stays a pure formatter that does no I/O; None (the
             lookup failed) shows the bare id.
+        heading: replaces the first line, e.g. a create_timeline chain's
+            "*Plan 2 of 4 (funded, 2026-11-01 to 2026-12-31)*". None keeps
+            "*Plan preview awaiting approval*".
 
     Either map may be None or empty: an unresolved id is shown as the id
     itself. A readable label is a nicety and must never cost the approver the
@@ -355,7 +359,7 @@ def build_summary(
     site_label = (site or {}).get("label") if isinstance(site, dict) else None
 
     lines = [
-        "*Plan preview awaiting approval*",
+        heading or "*Plan preview awaiting approval*",
         f"• Site: {site_label or 'unknown'}",
         child_line(child_id, child_name),
         f"• Dates: {date_from} → {date_to}",

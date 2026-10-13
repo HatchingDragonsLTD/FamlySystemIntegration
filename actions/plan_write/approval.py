@@ -14,6 +14,15 @@ load-bearing; read before changing:
   5. `runner.commit` is called with confirm=True, and does its own preview
      before writing.
 
+CHAINS (create_timeline). A preview that belongs to a chain (`chain_id` on the
+stored preview) goes through every guard above exactly like any other. What
+differs is only what happens AFTER the outcome is known: a successful commit
+marks the chain's segment done and, off the request thread, verifies it and
+previews the next plan; a reject or a failed commit STOPS the chain (a failed
+chain commit is not released back to pending -- nothing is retried, so the
+Approve button cannot be clicked into a second write). See
+`actions/create_timeline/engine.py`.
+
 Scope: CREATE, plus adding a SECOND plan alongside an existing one (Famly's
 oldPlanId + replaceOldPlan=false, from `actions.additional_plan` -- see the
 stored preview's `old_plan_id`/`replace_old_plan`, passed straight through to
@@ -37,6 +46,7 @@ from datetime import date
 
 from actions.read_child_plans.runner import current_monthly_estimate
 from core.config import ConfigError, load_config
+from actions.create_timeline import engine as chain_engine
 from core.rest_client import RestHTTPError
 from integrations import child_lookup, slack
 
@@ -54,6 +64,10 @@ MSG_NOT_FOUND = "⚠️ Preview expired or not found — please re-run the previ
 MSG_ALREADY_COMMITTED = "ℹ️ Already committed — no second plan was created"
 MSG_ALREADY_REJECTED = "⚠️ This preview was already rejected — nothing was written"
 MSG_IN_PROGRESS = "⏳ A commit is already in progress for this preview"
+MSG_CHAIN_STOPPED = (
+    "⚠️ This plan's commit failed and its timeline was stopped — "
+    "nothing will be retried"
+)
 MSG_SUPERSEDED = (
     "⚠️ This preview was replaced by an adjusted one "
     "— approve that message instead"
@@ -97,12 +111,26 @@ def handle_click(
 
 def _reject(preview_id: str | None, user: str | None) -> str:
     """Record a rejection. Never calls Famly."""
+    # Read BEFORE marking, so a chain preview's state at the click is known.
+    stored = preview_store.get(preview_id) if preview_id else None
+
     if preview_id:
         preview_store.mark(preview_id, preview_store.STATUS_REJECTED)
 
     logger.info(
         "PLAN REJECTED preview_id=%s user=%s -- nothing written", preview_id, user
     )
+
+    # Rejecting the plan a chain is waiting on ends the chain. Only a preview
+    # that was still awaiting a decision counts: rejecting one that was already
+    # committed, or replaced by an adjusted copy, says nothing about the chain.
+    if (
+        stored is not None
+        and stored.chain_id
+        and stored.status in (preview_store.STATUS_PENDING, preview_store.STATUS_EXPIRED)
+    ):
+        chain_engine.stop_for_reject(stored, user)
+
     return MSG_REJECTED
 
 
@@ -149,6 +177,10 @@ def _approve(preview_id: str | None, user: str | None) -> str:
     if stored.status == preview_store.STATUS_SUPERSEDED:
         # An adjusted copy exists; that one is the approvable plan now.
         return MSG_SUPERSEDED
+
+    if stored.status == preview_store.STATUS_FAILED:
+        # A chain plan whose commit already failed: never clickable again.
+        return MSG_CHAIN_STOPPED
 
     if stored.status == preview_store.STATUS_COMMITTING:
         return MSG_IN_PROGRESS
@@ -209,11 +241,10 @@ def _approve(preview_id: str | None, user: str | None) -> str:
         )
     except runner.PlanCommitRefused as exc:
         # A guard inside the runner stopped it. Nothing was written.
-        preview_store.release_claim(preview_id or "")
+        _after_failed_commit(claimed, preview_id, str(exc))
         logger.warning("COMMIT REFUSED preview_id=%s: %s", preview_id, exc)
         return _commit_refused(str(exc))
     except RestHTTPError as exc:
-        preview_store.release_claim(preview_id or "")
         # Same 4xx/5xx distinction the router draws: a 4xx is a bad plan and
         # will never succeed as-is; a 5xx is worth clicking again.
         if 400 <= exc.status_code < 500:
@@ -223,10 +254,11 @@ def _approve(preview_id: str | None, user: str | None) -> str:
                 f"Famly upstream error (HTTP {exc.status_code}) -- worth "
                 f"trying again. {exc}"
             )
+        _after_failed_commit(claimed, preview_id, detail)
         logger.error("COMMIT FAILED preview_id=%s: %s", preview_id, exc)
         return _commit_failed(detail)
     except Exception as exc:  # noqa: BLE001 - never throw at Slack
-        preview_store.release_claim(preview_id or "")
+        _after_failed_commit(claimed, preview_id, str(exc))
         logger.exception("COMMIT FAILED preview_id=%s", preview_id)
         return _commit_failed(str(exc))
 
@@ -249,7 +281,49 @@ def _approve(preview_id: str | None, user: str | None) -> str:
     if warning_count:
         text += f"\n:warning: committed with {warning_count} warning(s)"
 
+    if claimed.chain_id:
+        text += _advance_chain(claimed, plan_id, child_id)
+
     return text
+
+
+def _after_failed_commit(claimed, preview_id, detail) -> None:
+    """What a failed commit does to the preview it claimed.
+
+    An ordinary preview goes back to pending, so the approver can click again
+    (a Famly error is usually transient or fixable). A CHAIN preview does not:
+    the chain stops there, and the preview is marked failed so the same button
+    cannot be clicked into a second write -- Famly may even have written the
+    plan before the error came back. Nothing is retried automatically.
+    """
+    if not claimed.chain_id:
+        preview_store.release_claim(preview_id or "")
+        return
+
+    preview_store.mark(preview_id or "", preview_store.STATUS_FAILED)
+    chain_engine.stop_for_failure(claimed, detail)
+
+
+def _advance_chain(claimed, plan_id, child_id) -> str:
+    """After a chain plan commits: record it, then verify and present the next.
+
+    Recording is synchronous -- the plan is in Famly now. Everything slower (the
+    read-back, the next preview, the Slack post) runs off the request thread, so
+    the click is acknowledged promptly; see `_spawn`.
+
+    Returns the line to add to the "committed" message.
+    """
+    label = chain_engine.label_for(claimed.chain_id, claimed.chain_index)
+    recorded = chain_engine.record_commit(
+        claimed.chain_id, claimed.chain_index, plan_id, child_id
+    )
+    if recorded:
+        _spawn(
+            lambda: chain_engine.continue_after_commit(
+                claimed.chain_id, claimed.chain_index
+            )
+        )
+    return f"\n_{label}_" if label else ""
 
 
 # --------------------------------------------------------------------------- #
@@ -278,6 +352,8 @@ def _blocking_status(stored) -> str | None:
         return MSG_ALREADY_REJECTED
     if stored.status == preview_store.STATUS_SUPERSEDED:
         return MSG_SUPERSEDED
+    if stored.status == preview_store.STATUS_FAILED:
+        return MSG_CHAIN_STOPPED
     if stored.status == preview_store.STATUS_COMMITTING:
         return MSG_IN_PROGRESS
     return None
@@ -411,6 +487,7 @@ def _adjusted_summary(
     pricing_group_id,
     child_id=None,
     child_name=None,
+    chain_label=None,
 ) -> str:
     """The re-priced message: the base figure, the adjustment, and the real total.
 
@@ -422,6 +499,11 @@ def _adjusted_summary(
     total = total_to_bill(estimate, value)
 
     lines = ["*Adjusted plan — awaiting final confirmation*"]
+
+    # Which plan of a create_timeline chain this is, so a chain approver can
+    # tell the adjusted plans apart.
+    if chain_label:
+        lines.append(f"• {chain_label}")
 
     # Who the money is for, in the same form as the preview: the name (when the
     # live lookup found one) before the id. Omitted if the child is unknown.
@@ -584,6 +666,10 @@ def _complete_adjustment(
             # oldPlanId/replaceOldPlan the original preview used.
             old_plan_id=stored.old_plan_id,
             replace_old_plan=stored.replace_old_plan,
+            # ...and the same place in its chain, so committing the adjusted
+            # plan advances the chain exactly as the original would have.
+            chain_id=stored.chain_id,
+            chain_index=stored.chain_index,
         )
 
         # Only now is the original replaced. Doing it earlier would strand the
@@ -637,6 +723,7 @@ def _complete_adjustment(
             pricing_group_id,
             child_id=stored.child_id,
             child_name=child_name,
+            chain_label=chain_engine.label_for(stored.chain_id, stored.chain_index),
         ),
         new_preview_id,
     ):
