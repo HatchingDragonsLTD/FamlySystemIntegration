@@ -14,6 +14,7 @@ import json
 import sys
 from dataclasses import asdict, is_dataclass
 
+from actions.create_timeline import chain_cancel, chain_resume, chain_status, chain_sweep
 from actions.plan_write import cli as plan_write
 from actions.pull_groups import cli as pull_groups
 from actions.pull_institution_defaults import cli as pull_institution_defaults
@@ -40,6 +41,10 @@ ACTIONS = [
     pull_institution_defaults,
     pull_references,
     pull_roster,
+    chain_status,
+    chain_cancel,
+    chain_resume,
+    chain_sweep,
 ]
 
 

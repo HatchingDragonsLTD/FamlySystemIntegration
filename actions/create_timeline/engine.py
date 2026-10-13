@@ -29,6 +29,7 @@ outcome the approval hands back. Nothing is ever retried automatically.
 
 import logging
 import os
+import time
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 
@@ -48,8 +49,17 @@ logger = logging.getLogger(__name__)
 # Same env var every plan action reads, so they all talk to one plans version.
 PLAN_VERSION = int(os.environ.get("INTAKE_PLAN_VERSION", "3"))
 
+# After a commit the plan is read back. Famly's read model can lag the write, so
+# a plan that is not there YET is looked for again -- this many more times, this
+# many seconds apart -- before the chain stops. Only "not found" is retried; a
+# failed read, a bad trim or a wrong latest plan stop the chain at once.
+READBACK_RETRIES = 3
+READBACK_DELAY_SECONDS = 5
+_sleep = time.sleep
+
 # The advanced-fee discount rides in the LAST of the ten custom discount slots,
 # so it can never collide with the discounts HubSpot fills from slot 1 upwards.
+# It is a FIXED amount in pounds per week (flag "fixed"), never a percentage.
 ADVANCED_FEE_DISCOUNT_TITLE = "Advanced Fee Discount"
 ADVANCED_FEE_DISCOUNT_SLOT = 10
 
@@ -207,8 +217,10 @@ def segment_payload(base: dict, segment: dict, *, is_last: bool) -> dict:
         since add-ons are a non-funded-deal feature.
       * a NON-FUNDED segment gets `funded` false, NO funding settings, and keeps
         `addon_quantity`, so it books the add-on products.
-      * an ADVANCED segment adds the Advanced Fee Discount in slot 10. A slot 10
-        already in use is an error, never overwritten.
+      * an ADVANCED segment adds the Advanced Fee Discount in slot 10, flagged
+        "fixed": `advanced_discount` is POUNDS PER WEEK, so it builds a
+        weekly, non-percentage discount. A slot 10 already in use is an error,
+        never overwritten.
 
     Never mutates `base`.
     """
@@ -235,7 +247,7 @@ def segment_payload(base: dict, segment: dict, *, is_last: bool) -> dict:
             )
         payload[f"discount_{slot}_name"] = ADVANCED_FEE_DISCOUNT_TITLE
         payload[f"discount_{slot}_amount"] = base.get("advanced_discount")
-        payload.pop(f"discount_{slot}_flag", None)  # percent, the slot default
+        payload[f"discount_{slot}_flag"] = "fixed"  # pounds per week, not a percent
 
     return payload
 
@@ -248,9 +260,25 @@ def validate_segments(base: dict, segments: list[dict]) -> list[str]:
     ever posted. A bad Advanced Fee Discount is an error here even though a bad
     discount slot is only advisory in an ordinary preview: dropping it would
     quietly bill the family too much.
+
+    The advanced fee is a FIXED amount in pounds per week. Besides the fixed
+    range the discount builder enforces (above 0, at most 5000), an amount
+    BELOW 1 is refused as "looks like a fraction": a percentage sent by mistake
+    (0.05) would otherwise become a 5p weekly discount.
     """
     errors: list[str] = []
     total = len(segments)
+
+    if any(segment["advanced"] for segment in segments):
+        try:
+            amount = float(_text(base.get("advanced_discount")))
+        except ValueError:
+            amount = None  # the discount builder reports a non-number below
+        if amount is not None and 0 < amount < 1:
+            errors.append(
+                f"advanced_discount {base.get('advanced_discount')!r} looks like a "
+                f"fraction, expected £ per week (a fixed amount of at least £1)"
+            )
 
     for index, segment in enumerate(segments):
         label = f"Plan {index + 1} of {total}"
@@ -272,6 +300,8 @@ def validate_segments(base: dict, segments: list[dict]) -> list[str]:
                 isinstance(d, dict)
                 and d.get("title") == ADVANCED_FEE_DISCOUNT_TITLE
                 and d.get("ordering") == slot - 1
+                and d.get("isPercent") is False
+                and d.get("period") == "WEEKLY"
                 for part in plan_input.plan_parts
                 for d in part.discounts
             )
@@ -323,6 +353,7 @@ def stop_message(
     *,
     uncertain_index: int | None = None,
     extra_lines: list[str] | None = None,
+    title: str = "Timeline stopped",
 ) -> str:
     """What Slack is told when a chain stops: why, what exists, what does not.
 
@@ -332,7 +363,7 @@ def stop_message(
     its successor.
     """
     lines = [
-        f":octagonal_sign: *Timeline stopped* — child `{chain.child_id}`, "
+        f":octagonal_sign: *{title}* — child `{chain.child_id}`, "
         f"chain `{chain.chain_id}`",
         f"Reason: {reason}",
     ]
@@ -378,21 +409,29 @@ def stop_chain(
     *,
     uncertain_index: int | None = None,
     extra_lines: list[str] | None = None,
+    status: str = chains.STATUS_STOPPED,
+    title: str = "Timeline stopped",
 ) -> bool:
-    """Stop an active chain and tell Slack. Returns True when this call stopped it.
+    """Finish an active chain and tell Slack. True when this call finished it.
+
+    `status`/`title` let expiry and cancellation reuse the same message.
 
     A chain that is already stopped or complete is left alone and Slack is not
     told twice. Never raises.
     """
     try:
-        if not chains.finish(chain_id, chains.STATUS_STOPPED):
+        if not chains.finish(chain_id, status):
             return False
         chain = chains.get(chain_id)
         logger.warning("CHAIN STOPPED chain_id=%s: %s", chain_id, reason)
         if chain is not None:
             slack.post_notice(
                 stop_message(
-                    chain, reason, uncertain_index=uncertain_index, extra_lines=extra_lines
+                    chain,
+                    reason,
+                    uncertain_index=uncertain_index,
+                    extra_lines=extra_lines,
+                    title=title,
                 )
             )
         return True
@@ -565,11 +604,19 @@ def _verify_and_advance(chain: chains.Chain, index: int) -> None:
     plans = read_child_plans.run(chain.child_id, version=PLAN_VERSION).plans
 
     this = _find(plans, plan_id)
+    for _attempt in range(READBACK_RETRIES):
+        if this is not None:
+            break
+        _sleep(READBACK_DELAY_SECONDS)
+        plans = read_child_plans.run(chain.child_id, version=PLAN_VERSION).plans
+        this = _find(plans, plan_id)
+
     if this is None:
         stop_chain(
             chain.chain_id,
             f"{name} was committed (plan `{plan_id}`) but is not in the child's "
-            f"plans when read back, so it could not be verified.",
+            f"plans when read back (looked {READBACK_RETRIES + 1} times, "
+            f"{READBACK_DELAY_SECONDS}s apart), so it could not be verified.",
         )
         return
 

@@ -21,11 +21,11 @@ import logging
 import sqlite3
 import tempfile
 import unittest
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
-from actions.create_timeline import chains, engine
+from actions.create_timeline import chains, engine, maintenance
 from actions.create_timeline import web as create_timeline_web
 from actions.plan_write import approval, preview_store, runner
 from actions.read_child_plans import runner as read_child_plans
@@ -237,6 +237,12 @@ class ChainTestCase(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
+        # The read-back retry never really waits; the delays are recorded.
+        self.sleeps: list[float] = []
+        patcher = mock.patch.object(engine, "_sleep", self.sleeps.append)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
         # The background work an approval hands off runs inline.
         patcher = mock.patch.object(approval, "_spawn", lambda work: work())
         patcher.start()
@@ -250,6 +256,23 @@ class ChainTestCase(unittest.TestCase):
         return approval.handle_click(
             slack.ACTION_APPROVE, preview_id or self.last_preview_id(), "drew"
         )
+
+    def approve_then(self, change, preview_id=None):
+        """Approve, running `change()` the moment Famly has written the plan.
+
+        The live check reads the child's plans BEFORE the write, so anything
+        meant to go wrong in the read-back has to happen after it.
+        """
+        real_post = self.famly.post
+
+        def post(path, params=None, json_body=None):
+            node = real_post(path, params, json_body)
+            if (params or {}).get("preview") == "false":
+                change()
+            return node
+
+        with mock.patch.object(self.famly, "post", post):
+            return self.approve(preview_id)
 
     def reject(self, preview_id=None):
         return approval.handle_click(
@@ -291,6 +314,11 @@ class ChainTestCase(unittest.TestCase):
         return {
             b["fundable"] for b in self.sent(call)["planParts"][0]["sessionBookings"]
         }
+
+    def add_surprise_plan(self):
+        self.famly.plans.append(
+            {"id": "surprise", "childId": CHILD, "from": "2030-01-01", "to": None}
+        )
 
     def notices_text(self):
         return "\n".join(self.notices)
@@ -423,7 +451,7 @@ class OverlapTests(ChainTestCase):
             has_advanced_fee="true",
             advanced_start="2026-10-01",
             advanced_end="2026-11-30",
-            advanced_discount="0.1",
+            advanced_discount="40",
         )
 
     def test_five_plans_with_the_right_flags_and_headings(self):
@@ -471,8 +499,39 @@ class OverlapTests(ChainTestCase):
 
         discount = advanced_discounts(self.famly.commits[1])[0]
         self.assertEqual(discount["ordering"], 9)  # slot 10
-        self.assertEqual(discount["amount"], 0.1)
-        self.assertIs(discount["isPercent"], True)
+        self.assertEqual(discount["amount"], 40)
+        self.assertIs(discount["isPercent"], False)
+        self.assertEqual(discount["period"], "WEEKLY")
+
+    def test_a_fixed_40_gives_a_fixed_discount_in_every_advanced_segment(self):
+        self.run_all(self.body())
+
+        advanced_commits = [self.famly.commits[i] for i in (1, 2)]
+        for call in advanced_commits:
+            fixed = [
+                d
+                for d in self.sent(call)["planParts"][0]["discounts"]
+                if d["title"] == engine.ADVANCED_FEE_DISCOUNT_TITLE
+            ]
+            self.assertEqual(len(fixed), 1)
+            self.assertEqual(fixed[0]["amount"], 40)
+            self.assertIs(fixed[0]["isPercent"], False)
+            self.assertEqual(fixed[0]["period"], "WEEKLY")
+
+    def test_the_slack_summary_shows_the_fee_in_pounds(self):
+        from actions.read_child_plans.runner import Plan
+
+        self.run_all(self.body())
+        built = [
+            d
+            for d in self.sent(self.famly.commits[1])["planParts"][0]["discounts"]
+            if d["title"] == engine.ADVANCED_FEE_DISCOUNT_TITLE
+        ]
+
+        summary = slack.build_summary(Plan(id="p", child_id=CHILD, discounts=built), [])
+
+        self.assertIn("Advanced Fee Discount — £40.00", summary)
+        self.assertNotIn("4000%", summary)
 
     def test_a_funded_advanced_plan_is_both(self):
         self.run_all(self.body())
@@ -506,7 +565,7 @@ class AdvancedAtTheEndTests(ChainTestCase):
             has_advanced_fee="true",
             advanced_start="2027-03-01",
             advanced_end="2027-07-31",
-            advanced_discount="0.05",
+            advanced_discount="40",
         )
         data, _ = self.start(body)
         self.assertEqual(len(data["segments"]), 4)
@@ -710,10 +769,38 @@ class InvalidInputTests(ChainTestCase):
                 has_advanced_fee="true",
                 advanced_start="2026-10-01",
                 advanced_end="2026-10-31",
-                advanced_discount="5",
+                advanced_discount="6000",
             ),
             "Advanced Fee Discount invalid",
         )
+
+    def test_a_fraction_is_rejected_as_a_probable_percentage(self):
+        for amount in ("0.05", "0.5", "0.99"):
+            with self.subTest(amount=amount):
+                self.assert_refused_without_famly(
+                    payload(
+                        has_advanced_fee="true",
+                        advanced_start="2026-10-01",
+                        advanced_end="2026-10-31",
+                        advanced_discount=amount,
+                    ),
+                    "looks like a fraction, expected £ per week",
+                )
+
+    def test_the_limits_of_the_fixed_range(self):
+        for amount, accepted in (("1", True), ("5000", True), ("5000.01", False), ("0", False), ("-40", False)):
+            with self.subTest(amount=amount):
+                data, status = self.start(
+                    payload(
+                        has_advanced_fee="true",
+                        advanced_start="2026-10-01",
+                        advanced_end="2026-10-31",
+                        advanced_discount=amount,
+                    )
+                )
+                self.assertEqual(status == 200, accepted, data["errors"])
+                if data["chain_id"]:
+                    chains.finish(data["chain_id"], chains.STATUS_CANCELLED)
 
     def test_slot_10_already_in_use(self):
         self.assert_refused_without_famly(
@@ -721,7 +808,7 @@ class InvalidInputTests(ChainTestCase):
                 has_advanced_fee="true",
                 advanced_start="2026-10-01",
                 advanced_end="2026-10-31",
-                advanced_discount="0.1",
+                advanced_discount="40",
                 discount_10_name="Sibling",
                 discount_10_amount="0.05",
             ),
@@ -937,26 +1024,24 @@ class VerificationTests(ChainTestCase):
         self.assertEqual(self.chain(data).status, chains.STATUS_STOPPED)
         self.assertIn("could not be verified", self.notices[-1])
         self.assertEqual(len(self.previews_posted), 1)
+        self.assertEqual(self.sleeps, [5, 5, 5])  # three retries, 5s apart
 
     def test_a_failed_read_back_stops_the_chain_instead_of_raising(self):
         data, _ = self.start(with_funding())
 
-        def boom(*args, **kwargs):
-            raise RestHTTPError("Famly down", 503, "")
+        def read_fails():
+            self.famly.get = boom
 
-        with mock.patch.object(self.famly, "get", boom):
-            self.approve()  # must not raise
+        self.approve_then(read_fails)  # must not raise
 
         self.assertEqual(self.chain(data).status, chains.STATUS_STOPPED)
+        self.assertIn("RestHTTPError", self.notices[-1])
         self.assertEqual(len(self.previews_posted), 1)
 
     def test_a_later_starting_plan_stops_the_chain(self):
         data, _ = self.start(with_funding())
-        self.famly.plans.append(
-            {"id": "surprise", "childId": CHILD, "from": "2030-01-01", "to": None}
-        )
 
-        self.approve()
+        self.approve_then(self.add_surprise_plan)
 
         self.assertEqual(self.chain(data).status, chains.STATUS_STOPPED)
         self.assertIn("latest-starting", self.notices[-1])
@@ -1176,7 +1261,7 @@ class SegmentPayloadTests(unittest.TestCase):
             has_advanced_fee="true",
             advanced_start="2026-11-01",
             advanced_end="2026-12-31",
-            advanced_discount="0.1",
+            advanced_discount="40",
             discount_1_name="Sibling",
             discount_1_amount="0.05",
         )
@@ -1218,8 +1303,8 @@ class SegmentPayloadTests(unittest.TestCase):
         built = engine.segment_payload(self.BASE, self.segment(False, True), is_last=False)
 
         self.assertEqual(built["discount_10_name"], "Advanced Fee Discount")
-        self.assertEqual(built["discount_10_amount"], "0.1")
-        self.assertNotIn("discount_10_flag", built)
+        self.assertEqual(built["discount_10_amount"], "40")
+        self.assertEqual(built["discount_10_flag"], "fixed")
         self.assertEqual(built["discount_1_name"], "Sibling")
 
     def test_a_segment_that_is_not_advanced_has_no_slot_10(self):
@@ -1257,6 +1342,462 @@ class LabelTests(unittest.TestCase):
             engine.heading_text(self.SEGMENTS, 2),
             "Plan 3 of 3 (base, advanced, 2027-01-01 onwards)",
         )
+
+
+# --------------------------------------------------------------------------- #
+# Hardening: read-back retry, expiry, commands, restarts
+# --------------------------------------------------------------------------- #
+def boom(*args, **kwargs):
+    raise RestHTTPError("Famly down", 503, "")
+
+
+class ReadBackRetryTests(ChainTestCase):
+    def hide_new_plan_for(self, reads):
+        """Make `reads` plan reads AFTER the live check's come back empty.
+
+        The live check just before the write is read number 1 and must see the
+        child's real plans; the read-back is read 2 onwards.
+        """
+        real_get = self.famly.get
+        counter = {"n": 0}
+
+        def get(path, params=None):
+            counter["n"] += 1
+            if 1 < counter["n"] <= reads + 1:
+                return {"plans": []}
+            return real_get(path, params)
+
+        return mock.patch.object(self.famly, "get", get), counter
+
+    def test_a_plan_that_shows_up_on_the_last_retry_lets_the_chain_carry_on(self):
+        data, _ = self.start(with_funding())
+        hide, counter = self.hide_new_plan_for(3)
+        with hide:
+            self.approve()
+
+        self.assertEqual(counter["n"], 5)  # live check, the read, then 3 retries
+        self.assertEqual(self.sleeps, [5, 5, 5])
+        self.assertEqual(self.chain(data).status, chains.STATUS_ACTIVE)
+        self.assertEqual(len(self.previews_posted), 2)  # plan 2 was posted
+
+    def test_a_plan_that_shows_up_on_the_first_retry_waits_once(self):
+        self.start(with_funding())
+        hide, _ = self.hide_new_plan_for(1)
+        with hide:
+            self.approve()
+
+        self.assertEqual(self.sleeps, [5])
+        self.assertEqual(len(self.previews_posted), 2)
+
+    def test_never_showing_up_stops_after_exactly_three_retries(self):
+        data, _ = self.start(with_funding())
+        hide, counter = self.hide_new_plan_for(99)
+        with hide:
+            self.approve()
+
+        self.assertEqual(counter["n"], 5)
+        self.assertEqual(self.sleeps, [5, 5, 5])
+        self.assertEqual(self.chain(data).status, chains.STATUS_STOPPED)
+        self.assertEqual(len(self.previews_posted), 1)
+
+    def test_a_plan_found_first_time_never_sleeps(self):
+        self.start(with_funding())
+        self.approve()
+
+        self.assertEqual(self.sleeps, [])
+
+    def test_a_bad_trim_stops_immediately_without_retrying(self):
+        self.famly.trim = False
+        self.start(with_funding())
+        self.approve()
+        self.approve()
+
+        self.assertEqual(self.sleeps, [])
+        self.assertIn("did not end the previous plan", self.notices[-1])
+
+    def test_a_failed_read_is_not_retried(self):
+        self.start(with_funding())
+
+        def read_fails():
+            self.famly.get = boom
+
+        self.approve_then(read_fails)
+
+        self.assertEqual(self.sleeps, [])
+
+    def test_a_later_starting_plan_is_not_retried(self):
+        self.start(with_funding())
+        self.approve_then(self.add_surprise_plan)
+
+        self.assertEqual(self.sleeps, [])
+
+
+class SweepTestCase(ChainTestCase):
+    def age(self, preview_id, hours=25):
+        """Make a stored preview older than its TTL."""
+        old = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+        with preview_store.open_store() as connection:
+            connection.execute(
+                "UPDATE previews SET created_at = ? WHERE preview_id = ?", (old, preview_id)
+            )
+
+    def in_minutes(self, minutes):
+        return datetime.now(timezone.utc) + timedelta(minutes=minutes)
+
+    def commit_without_continuing(self):
+        """Approve the pending plan but lose the hand-off, as a restart would."""
+        with mock.patch.object(approval, "_spawn", lambda work: None):
+            self.approve()
+
+
+class ExpiryTests(SweepTestCase):
+    def test_an_expired_pending_plan_expires_the_chain_and_tells_slack(self):
+        data, _ = self.start(with_funding())
+        self.approve()  # plan 1 committed, plan 2 pending
+        self.age(self.last_preview_id())
+
+        expired = maintenance.expire_stale_chains()
+
+        self.assertEqual(expired, [data["chain_id"]])
+        self.assertEqual(self.chain(data).status, chains.STATUS_EXPIRED)
+        notice = self.notices[-1]
+        self.assertIn("Timeline expired", notice)
+        exists, _, missing = notice.partition("Plans NOT created")
+        self.assertIn("plan `plan-1`", exists)
+        self.assertIn("Plan 2 of 3", missing)
+        self.assertIn("Plan 3 of 3", missing)
+        self.assertIn("open-ended", notice)
+
+    def test_a_fresh_pending_plan_is_left_alone(self):
+        data, _ = self.start(with_funding())
+
+        self.assertEqual(maintenance.expire_stale_chains(), [])
+        self.assertEqual(self.chain(data).status, chains.STATUS_ACTIVE)
+        self.assertEqual(self.notices, [])
+
+    def test_expiry_is_announced_once(self):
+        self.start(with_funding())
+        self.age(self.last_preview_id())
+
+        maintenance.expire_stale_chains()
+        maintenance.expire_stale_chains()
+
+        self.assertEqual(len(self.notices), 1)
+
+    def test_create_timeline_frees_a_child_whose_first_plan_expired(self):
+        old, _ = self.start(with_funding())
+        self.age(self.last_preview_id())
+
+        data, status = self.start(with_funding())
+
+        self.assertEqual(status, 200)
+        self.assertNotEqual(data["chain_id"], old["chain_id"])
+        self.assertEqual(chains.get(old["chain_id"]).status, chains.STATUS_EXPIRED)
+        self.assertEqual(chains.find_active(CHILD).chain_id, data["chain_id"])
+        self.assertTrue(any("Timeline expired" in n for n in self.notices))
+
+    def test_create_timeline_expires_any_childs_chain_not_only_its_own(self):
+        other = "00000000-0000-0000-0000-0000000000c2"
+        chains.create(
+            "other-chain",
+            other,
+            {},
+            [{"from": "2026-09-01", "to": None, "funded": False, "advanced": False}],
+        )
+        preview_store.save("p", {"plan": {}}, other, 3, chain_id="other-chain", chain_index=0)
+        self.age("p")
+
+        self.start()
+
+        self.assertEqual(chains.get("other-chain").status, chains.STATUS_EXPIRED)
+
+    def test_an_expired_chain_with_a_committed_plan_still_refuses_over_existing_plans(self):
+        data, _ = self.start(with_funding())
+        self.approve()
+        self.age(self.last_preview_id())
+
+        _, status = self.start(with_funding())
+
+        self.assertEqual(status, 409)  # plan 1 exists; the chain itself is freed
+        self.assertEqual(self.chain(data).status, chains.STATUS_EXPIRED)
+
+    def test_a_fresh_adjusted_copy_keeps_the_chain_alive(self):
+        data, _ = self.start(with_funding())
+        original = self.last_preview_id()
+        approval.handle_adjust_submission(original, "0.50", "drew", spawn=lambda w: w())
+        self.age(original)  # the superseded original is old; its copy is not
+
+        self.assertEqual(maintenance.expire_stale_chains(), [])
+        self.assertEqual(self.chain(data).status, chains.STATUS_ACTIVE)
+
+
+class SweepTests(SweepTestCase):
+    def test_sweep_expires_and_reports(self):
+        data, _ = self.start(with_funding())
+        self.age(self.last_preview_id())
+
+        result = maintenance.sweep()
+
+        self.assertEqual(result, {"expired": [data["chain_id"]], "stuck_notified": []})
+
+    def test_a_chain_stuck_after_a_recorded_commit_gets_one_notice(self):
+        data, _ = self.start(with_funding())
+        self.commit_without_continuing()
+        self.assertEqual(len(self.previews_posted), 1)  # plan 2 never posted
+
+        first = maintenance.notify_stuck_chains(self.in_minutes(11))
+        second = maintenance.notify_stuck_chains(self.in_minutes(30))
+
+        self.assertEqual(first, [data["chain_id"]])
+        self.assertEqual(second, [])
+        stuck = [n for n in self.notices if "Timeline stuck" in n]
+        self.assertEqual(len(stuck), 1)
+        self.assertIn(CHILD, stuck[0])
+        self.assertIn(f"chain-resume {CHILD}", stuck[0])
+        self.assertIn(f"chain-cancel {CHILD}", stuck[0])
+        self.assertIn("Plan 2 of 3", stuck[0])
+
+    def test_it_waits_the_full_ten_minutes(self):
+        self.start(with_funding())
+        self.commit_without_continuing()
+
+        self.assertEqual(maintenance.notify_stuck_chains(self.in_minutes(9)), [])
+        self.assertEqual(len(maintenance.notify_stuck_chains(self.in_minutes(10.5))), 1)
+
+    def test_a_chain_with_a_preview_waiting_on_an_approver_is_not_stuck(self):
+        self.start(with_funding())
+        self.approve()  # plan 2 is posted and pending
+
+        self.assertEqual(maintenance.notify_stuck_chains(self.in_minutes(60)), [])
+
+    def test_a_chain_with_nothing_committed_is_not_stuck(self):
+        self.start(with_funding())
+
+        self.assertEqual(maintenance.notify_stuck_chains(self.in_minutes(60)), [])
+
+    def test_all_plans_committed_but_never_completed_is_stuck(self):
+        data, _ = self.start(payload())  # one plan
+        self.commit_without_continuing()
+
+        self.assertEqual(
+            maintenance.notify_stuck_chains(self.in_minutes(11)), [data["chain_id"]]
+        )
+        self.assertIn("never completed", self.notices[-1])
+
+    def test_sweep_includes_stuck_notices(self):
+        data, _ = self.start(with_funding())
+        self.commit_without_continuing()
+
+        result = maintenance.sweep(self.in_minutes(11))
+
+        self.assertEqual(result["stuck_notified"], [data["chain_id"]])
+
+
+class ChainStatusTests(SweepTestCase):
+    def test_lists_active_chains_with_where_they_are(self):
+        data, _ = self.start(with_funding())
+        self.approve()
+
+        result = maintenance.status()
+
+        self.assertEqual(result["count"], 1)
+        row = result["chains"][0]
+        self.assertEqual(row["chainId"], data["chain_id"])
+        self.assertEqual(row["childId"], CHILD)
+        self.assertEqual((row["committed"], row["total"]), (1, 3))
+        self.assertIn("Plan 2 of 3", row["waitingOn"])
+        self.assertEqual(row["pendingPreviewId"], self.last_preview_id())
+        self.assertEqual(row["planIds"], ["plan-1"])
+
+    def test_filters_by_child_and_hides_finished_chains(self):
+        data, _ = self.start(with_funding())
+
+        self.assertEqual(maintenance.status("somebody-else")["count"], 0)
+        self.assertEqual(maintenance.status(CHILD)["count"], 1)
+        chains.finish(data["chain_id"], chains.STATUS_STOPPED)
+        self.assertEqual(maintenance.status()["count"], 0)
+
+
+class ChainCancelTests(SweepTestCase):
+    def test_no_active_chain(self):
+        result = maintenance.cancel(CHILD)
+
+        self.assertFalse(result["cancelled"])
+        self.assertEqual(self.notices, [])
+
+    def test_cancel_closes_the_record_posts_what_exists_and_deletes_nothing(self):
+        data, _ = self.start(with_funding())
+        self.approve()
+        plans_before = [dict(p) for p in self.famly.plans]
+        posts_before = len(self.famly.posts)
+
+        result = maintenance.cancel(CHILD)
+
+        self.assertTrue(result["cancelled"])
+        self.assertEqual(self.chain(data).status, chains.STATUS_CANCELLED)
+        self.assertEqual(self.famly.plans, plans_before)  # nothing deleted or changed
+        self.assertEqual(len(self.famly.posts), posts_before)  # nothing written
+        notice = self.notices[-1]
+        self.assertIn("Timeline cancelled", notice)
+        self.assertIn("Plans in Famly for this child right now", notice)
+        self.assertIn("`plan-1`: from 2026-09-01 to open-ended", notice)
+        self.assertIn("open-ended", notice.split("Plans NOT created")[1])
+
+    def test_the_pending_preview_can_no_longer_be_approved(self):
+        self.start(with_funding())
+        self.approve()
+        pending = self.last_preview_id()
+        commits_before = len(self.famly.commits)
+
+        maintenance.cancel(CHILD)
+
+        self.assertEqual(self.approve(pending), approval.MSG_ALREADY_REJECTED)
+        self.assertEqual(len(self.famly.commits), commits_before)
+
+    def test_it_frees_the_child(self):
+        self.start(with_funding())
+        maintenance.cancel(CHILD)
+
+        _, status = self.start(with_funding())
+
+        self.assertEqual(status, 200)
+
+    def test_a_famly_read_failure_does_not_stop_the_cancel(self):
+        data, _ = self.start(with_funding())
+
+        with mock.patch.object(self.famly, "get", boom):
+            result = maintenance.cancel(CHILD)
+
+        self.assertTrue(result["cancelled"])
+        self.assertEqual(self.chain(data).status, chains.STATUS_CANCELLED)
+        self.assertIn("Could not read", self.notices[-1])
+
+
+class ChainResumeTests(SweepTestCase):
+    def stuck_after_plan_1(self):
+        data, _ = self.start(with_funding())
+        self.commit_without_continuing()
+        return data
+
+    def test_it_posts_the_next_plan_through_the_normal_path(self):
+        data = self.stuck_after_plan_1()
+
+        result = maintenance.resume(CHILD)
+
+        self.assertTrue(result["resumed"])
+        self.assertEqual(result["index"], 1)
+        self.assertEqual(
+            self.heading(), "*Plan 2 of 3 (funded, 2026-11-01 to 2026-12-31)*"
+        )
+        stored = preview_store.get(self.last_preview_id())
+        self.assertEqual((stored.chain_id, stored.chain_index), (data["chain_id"], 1))
+        self.assertEqual(stored.old_plan_id, "plan-1")
+        self.assertFalse(stored.replace_old_plan)
+
+    def test_the_resumed_chain_runs_to_the_end(self):
+        data = self.stuck_after_plan_1()
+        maintenance.resume(CHILD)
+
+        self.approve()
+        self.approve()
+
+        self.assertEqual(self.chain(data).status, chains.STATUS_COMPLETE)
+        self.assertEqual(
+            [self.sent(c)["to"] for c in self.famly.commits], [None, None, "2027-07-31"]
+        )
+
+    def test_refuses_when_the_next_preview_is_already_pending(self):
+        self.start(with_funding())
+        self.approve()  # plan 2 posted normally
+        posted = len(self.previews_posted)
+
+        result = maintenance.resume(CHILD)
+
+        self.assertFalse(result["resumed"])
+        self.assertIn("already pending", result["reason"])
+        self.assertEqual(len(self.previews_posted), posted)
+
+    def test_an_expired_next_preview_is_not_pending(self):
+        self.start(with_funding())
+        self.approve()
+        self.age(self.last_preview_id())
+
+        self.assertTrue(maintenance.resume(CHILD)["resumed"])
+
+    def test_refuses_when_the_last_plan_is_missing_from_famly(self):
+        self.stuck_after_plan_1()
+        self.famly.plans.clear()
+        posted = len(self.previews_posted)
+
+        result = maintenance.resume(CHILD)
+
+        self.assertFalse(result["resumed"])
+        self.assertIn("not in the child's plans", result["reason"])
+        self.assertEqual(len(self.previews_posted), posted)
+
+    def test_refuses_when_the_last_plan_is_not_the_latest_starting(self):
+        self.stuck_after_plan_1()
+        self.famly.plans.append(
+            {"id": "surprise", "childId": CHILD, "from": "2030-01-01", "to": None}
+        )
+        posted = len(self.previews_posted)
+
+        result = maintenance.resume(CHILD)
+
+        self.assertFalse(result["resumed"])
+        self.assertIn("latest-starting", result["reason"])
+        self.assertEqual(len(self.previews_posted), posted)
+
+    def test_refuses_with_no_active_chain(self):
+        self.assertFalse(maintenance.resume(CHILD)["resumed"])
+
+    def test_refuses_when_nothing_has_been_committed(self):
+        self.start(with_funding())
+        self.age(self.last_preview_id())  # not pending any more, but nothing exists
+
+        result = maintenance.resume(CHILD)
+
+        self.assertFalse(result["resumed"])
+        self.assertIn("no plan has been committed", result["reason"])
+
+    def test_it_writes_nothing_to_famly_itself(self):
+        self.stuck_after_plan_1()
+        commits = len(self.famly.commits)
+
+        maintenance.resume(CHILD)
+
+        self.assertEqual(len(self.famly.commits), commits)
+
+    def test_with_every_plan_committed_it_completes_the_chain(self):
+        data, _ = self.start(payload())
+        self.commit_without_continuing()
+
+        result = maintenance.resume(CHILD)
+
+        self.assertTrue(result["completed"])
+        self.assertEqual(self.chain(data).status, chains.STATUS_COMPLETE)
+
+
+class CommandWiringTests(unittest.TestCase):
+    def test_the_commands_are_registered_with_main(self):
+        import main
+
+        parser = main.build_parser()
+        for argv, expected in (
+            (["chain-status"], None),
+            (["chain-status", "child-1"], "child-1"),
+            (["chain-cancel", "child-1"], "child-1"),
+            (["chain-resume", "child-1"], "child-1"),
+        ):
+            self.assertEqual(parser.parse_args(argv).child_id, expected)
+        self.assertEqual(parser.parse_args(["chain-sweep"]).action, "chain-sweep")
+
+    def test_cancel_and_resume_require_a_child(self):
+        import main
+
+        for command in ("chain-cancel", "chain-resume"):
+            with self.assertRaises(SystemExit):
+                main.build_parser().parse_args([command])
 
 
 if __name__ == "__main__":

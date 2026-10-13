@@ -11,7 +11,12 @@ load-bearing; read before changing:
   4. The child must be in COMMIT_ALLOWED_CHILD_IDS. `runner.commit` enforces
      this itself and is not weakened here -- the check below only produces a
      clearer message before we bother claiming.
-  5. `runner.commit` is called with confirm=True, and does its own preview
+  5. LIVE CHECK, just before the write, against the child's plans as Famly has
+     them RIGHT NOW (`_live_check`): a plan with no `old_plan_id` commits only
+     if the child has no plans; a plan with one commits only if the child's
+     latest-starting plan is exactly that plan. Anything else -- or a check
+     that cannot be made -- means nothing is written.
+  6. `runner.commit` is called with confirm=True, and does its own preview
      before writing.
 
 CHAINS (create_timeline). A preview that belongs to a chain (`chain_id` on the
@@ -44,6 +49,7 @@ import threading
 import uuid
 from datetime import date
 
+from actions.read_child_plans import runner as read_child_plans
 from actions.read_child_plans.runner import current_monthly_estimate
 from core.config import ConfigError, load_config
 from actions.create_timeline import engine as chain_engine
@@ -227,6 +233,15 @@ def _approve(preview_id: str | None, user: str | None) -> str:
         user,
     )
 
+    # Guard 5: the live check. Nothing has been written yet, so a failure here
+    # is handled like a refused commit: an ordinary preview goes back to
+    # pending, a chain preview is marked failed and its chain stops.
+    refusal = _live_check(claimed)
+    if refusal is not None:
+        _after_failed_commit(claimed, preview_id, refusal)
+        logger.warning("COMMIT REFUSED (live check) preview_id=%s: %s", preview_id, refusal)
+        return _commit_refused(refusal)
+
     try:
         result = runner.commit(
             claimed.plan_body,
@@ -285,6 +300,69 @@ def _approve(preview_id: str | None, user: str | None) -> str:
         text += _advance_chain(claimed, plan_id, child_id)
 
     return text
+
+
+def _start_day(value) -> date | None:
+    if not isinstance(value, str) or len(value.strip()) < 10:
+        return None
+    try:
+        return date.fromisoformat(value.strip()[:10])
+    except ValueError:
+        return None
+
+
+def _live_check(claimed) -> str | None:
+    """Why this plan must NOT be written right now, or None when it may be.
+
+    Reads the child's plans fresh from Famly -- the preview may be hours old
+    and the child's plans can have changed since:
+
+      * no `old_plan_id`: the plan is a first plan, so the child must have no
+        plans at all;
+      * an `old_plan_id`: the child's latest-starting plan must be exactly that
+        one. If two plans share the latest start date, which one a new plan
+        follows is ambiguous, so that is refused too.
+
+    A check that cannot be made (the read failed) is a refusal, never a pass.
+    """
+    child_id = claimed.child_id
+    try:
+        plans = read_child_plans.run(child_id, version=claimed.version).plans
+    except Exception as exc:  # noqa: BLE001 - an unmade check must block the write
+        logger.exception("LIVE CHECK FAILED preview_id=%s", claimed.preview_id)
+        return (
+            f"the live check of the child's plans could not be made "
+            f"({type(exc).__name__}: {exc}), so nothing was written"
+        )
+
+    old_plan_id = claimed.old_plan_id
+    if not old_plan_id:
+        if plans:
+            ids = ", ".join(p.id or "unknown" for p in plans)
+            return (
+                f"this plan has no old plan, but the child already has "
+                f"{len(plans)} plan(s) in Famly ({ids}), so nothing was written"
+            )
+        return None
+
+    dated = [(_start_day(p.from_), p) for p in plans]
+    if not dated or any(day is None for day, _ in dated):
+        return (
+            f"the child's plans could not be ordered by start date, so it "
+            f"cannot be confirmed that `{old_plan_id}` is the latest-starting "
+            f"one; nothing was written"
+        )
+
+    newest = max(day for day, _ in dated)
+    latest = [p for day, p in dated if day == newest]
+    if len(latest) == 1 and latest[0].id == old_plan_id:
+        return None
+
+    names = ", ".join(f"`{p.id}`" for p in latest)
+    return (
+        f"the child's latest-starting plan is {names} (starts {newest.isoformat()}), "
+        f"not exactly the expected `{old_plan_id}`, so nothing was written"
+    )
 
 
 def _after_failed_commit(claimed, preview_id, detail) -> None:

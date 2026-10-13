@@ -37,7 +37,7 @@ from actions.plan_write.hubspot_intake import unwrap_payload
 from actions.read_child_plans import runner as read_child_plans
 from integrations import slack
 
-from . import chains, engine
+from . import chains, engine, maintenance
 
 logger = logging.getLogger(__name__)
 
@@ -127,6 +127,10 @@ def handle(payload: dict) -> tuple[dict, int]:
     if problems:
         data["errors"] = problems
         return data, 422
+
+    # Free any child whose chain is waiting on a preview that has expired, this
+    # one included, before deciding whether a chain is in the way.
+    maintenance.expire_stale_chains()
 
     active = chains.find_active(child_id)
     if active is not None:
