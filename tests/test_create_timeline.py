@@ -470,7 +470,7 @@ class OverlapTests(ChainTestCase):
             has_advanced_fee="true",
             advanced_start="2026-10-01",
             advanced_end="2026-11-30",
-            advanced_discount="40",
+            advanced_discount="0.05",
         )
 
     def test_five_plans_with_the_right_flags_and_headings(self):
@@ -518,26 +518,26 @@ class OverlapTests(ChainTestCase):
 
         discount = advanced_discounts(self.famly.commits[1])[0]
         self.assertEqual(discount["ordering"], 9)  # slot 10
-        self.assertEqual(discount["amount"], 40)
-        self.assertIs(discount["isPercent"], False)
+        self.assertEqual(discount["amount"], 0.05)
+        self.assertIs(discount["isPercent"], True)
         self.assertEqual(discount["period"], "WEEKLY")
 
-    def test_a_fixed_40_gives_a_fixed_discount_in_every_advanced_segment(self):
+    def test_a_0_05_fee_gives_a_percent_discount_in_every_advanced_segment(self):
         self.run_all(self.body())
 
         advanced_commits = [self.famly.commits[i] for i in (1, 2)]
         for call in advanced_commits:
-            fixed = [
+            fee = [
                 d
                 for d in self.sent(call)["planParts"][0]["discounts"]
                 if d["title"] == engine.ADVANCED_FEE_DISCOUNT_TITLE
             ]
-            self.assertEqual(len(fixed), 1)
-            self.assertEqual(fixed[0]["amount"], 40)
-            self.assertIs(fixed[0]["isPercent"], False)
-            self.assertEqual(fixed[0]["period"], "WEEKLY")
+            self.assertEqual(len(fee), 1)
+            self.assertEqual(fee[0]["amount"], 0.05)
+            self.assertIs(fee[0]["isPercent"], True)
+            self.assertEqual(fee[0]["ordering"], 9)
 
-    def test_the_slack_summary_shows_the_fee_in_pounds(self):
+    def test_the_slack_summary_shows_the_fee_as_a_percentage(self):
         from actions.read_child_plans.runner import Plan
 
         self.run_all(self.body())
@@ -549,8 +549,8 @@ class OverlapTests(ChainTestCase):
 
         summary = slack.build_summary(Plan(id="p", child_id=CHILD, discounts=built), [])
 
-        self.assertIn("Advanced Fee Discount — £40.00", summary)
-        self.assertNotIn("4000%", summary)
+        self.assertIn("Advanced Fee Discount — 5%", summary)
+        self.assertNotIn("£", summary.split("Advanced Fee Discount")[1].splitlines()[0])
 
     def test_a_funded_advanced_plan_is_both(self):
         self.run_all(self.body())
@@ -584,7 +584,7 @@ class AdvancedAtTheEndTests(ChainTestCase):
             has_advanced_fee="true",
             advanced_start="2027-03-01",
             advanced_end="2027-07-31",
-            advanced_discount="40",
+            advanced_discount="0.05",
         )
         data, _ = self.start(body)
         self.assertEqual(len(data["segments"]), 4)
@@ -782,6 +782,42 @@ class InvalidInputTests(ChainTestCase):
             "advanced_discount",
         )
 
+    def test_5_is_rejected_because_percent_amounts_are_fractions(self):
+        self.assert_refused_without_famly(
+            payload(
+                has_advanced_fee="true",
+                advanced_start="2026-10-01",
+                advanced_end="2026-10-31",
+                advanced_discount="5",
+            ),
+            "percent amounts are fractions, 5% is 0.05",
+        )
+
+    def test_40_is_rejected_because_percent_amounts_are_fractions(self):
+        self.assert_refused_without_famly(
+            payload(
+                has_advanced_fee="true",
+                advanced_start="2026-10-01",
+                advanced_end="2026-10-31",
+                advanced_discount="40",
+            ),
+            "percent amounts are fractions, 5% is 0.05",
+        )
+
+    def test_the_error_is_reported_once_however_many_plans_are_advanced(self):
+        data, status = self.start(
+            with_funding(
+                has_advanced_fee="true",
+                advanced_start="2026-09-01",
+                advanced_end="2027-07-31",
+                advanced_discount="5",
+            )
+        )
+
+        self.assertEqual(status, 422)
+        self.assertEqual(len([e for e in data["errors"] if "fractions" in e]), 1)
+        self.assertFalse(any("Advanced Fee Discount invalid" in e for e in data["errors"]))
+
     def test_an_out_of_range_advanced_discount_is_a_hard_error_not_a_dropped_discount(self):
         self.assert_refused_without_famly(
             payload(
@@ -790,24 +826,20 @@ class InvalidInputTests(ChainTestCase):
                 advanced_end="2026-10-31",
                 advanced_discount="6000",
             ),
-            "Advanced Fee Discount invalid",
+            "percent amounts are fractions",
         )
 
-    def test_a_fraction_is_rejected_as_a_probable_percentage(self):
-        for amount in ("0.05", "0.5", "0.99"):
-            with self.subTest(amount=amount):
-                self.assert_refused_without_famly(
-                    payload(
-                        has_advanced_fee="true",
-                        advanced_start="2026-10-01",
-                        advanced_end="2026-10-31",
-                        advanced_discount=amount,
-                    ),
-                    "looks like a fraction, expected £ per week",
-                )
-
-    def test_the_limits_of_the_fixed_range(self):
-        for amount, accepted in (("1", True), ("5000", True), ("5000.01", False), ("0", False), ("-40", False)):
+    def test_the_limits_of_the_percent_range(self):
+        for amount, accepted in (
+            ("0.05", True),
+            ("0.01", True),
+            ("0.5", True),
+            ("1", True),
+            ("1.01", False),
+            ("0", False),
+            ("-0.05", False),
+            ("abc", False),
+        ):
             with self.subTest(amount=amount):
                 data, status = self.start(
                     payload(
@@ -821,13 +853,27 @@ class InvalidInputTests(ChainTestCase):
                 if data["chain_id"]:
                     chains.finish(data["chain_id"], chains.STATUS_CANCELLED)
 
+    def test_small_fractions_are_no_longer_rejected(self):
+        for amount in ("0.05", "0.5", "0.99"):
+            with self.subTest(amount=amount):
+                data, status = self.start(
+                    payload(
+                        has_advanced_fee="true",
+                        advanced_start="2026-10-01",
+                        advanced_end="2026-10-31",
+                        advanced_discount=amount,
+                    )
+                )
+                self.assertEqual(status, 200, data["errors"])
+                chains.finish(data["chain_id"], chains.STATUS_CANCELLED)
+
     def test_slot_10_already_in_use(self):
         self.assert_refused_without_famly(
             payload(
                 has_advanced_fee="true",
                 advanced_start="2026-10-01",
                 advanced_end="2026-10-31",
-                advanced_discount="40",
+                advanced_discount="0.05",
                 discount_10_name="Sibling",
                 discount_10_amount="0.05",
             ),
@@ -1281,7 +1327,7 @@ class SegmentPayloadTests(unittest.TestCase):
             has_advanced_fee="true",
             advanced_start="2026-11-01",
             advanced_end="2026-12-31",
-            advanced_discount="40",
+            advanced_discount="0.05",
             discount_1_name="Sibling",
             discount_1_amount="0.05",
         )
@@ -1333,8 +1379,8 @@ class SegmentPayloadTests(unittest.TestCase):
         built = engine.segment_payload(self.BASE, self.segment(False, True), is_last=False)
 
         self.assertEqual(built["discount_10_name"], "Advanced Fee Discount")
-        self.assertEqual(built["discount_10_amount"], "40")
-        self.assertEqual(built["discount_10_flag"], "fixed")
+        self.assertEqual(built["discount_10_amount"], "0.05")
+        self.assertNotIn("discount_10_flag", built)
         self.assertEqual(built["discount_1_name"], "Sibling")
 
     def test_a_segment_that_is_not_advanced_has_no_slot_10(self):
@@ -1926,7 +1972,7 @@ class BookedDaysDiscountChainTests(ChainTestCase):
             has_advanced_fee="true",
             advanced_start="2027-01-01",
             advanced_end="2027-07-31",
-            advanced_discount="40",
+            advanced_discount="0.05",
             **BOOKED_DAYS,
         )
         self.run_all(body)
@@ -1945,7 +1991,7 @@ class BookedDaysDiscountChainTests(ChainTestCase):
             has_advanced_fee="true",
             advanced_start="2027-01-01",
             advanced_end="2027-03-31",
-            advanced_discount="40",
+            advanced_discount="0.05",
             **BOOKED_DAYS,
         )
         self.run_all(body)
@@ -2053,7 +2099,7 @@ class ServerSideFundingTests(ChainTestCase):
         self.write_rules(rules)
         body = with_funding(
             "2026-09-01", "2026-10-31", has_advanced_fee="true",
-            advanced_start="2026-11-01", advanced_end="2026-11-30", advanced_discount="40",
+            advanced_start="2026-11-01", advanced_end="2026-11-30", advanced_discount="0.05",
         )
 
         data, _ = self.start(body)
