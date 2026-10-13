@@ -164,15 +164,21 @@ _JOBS_OLD_KEY_INDEXES = ("jobs_one_live_per_key", "jobs_job_key_unique")
 # the mode and the outcome. Written by that action only.
 _DELETE_LOG_SCHEMA = """
 CREATE TABLE IF NOT EXISTS delete_log (
-    id       INTEGER PRIMARY KEY AUTOINCREMENT,
-    child_id TEXT NOT NULL,
-    plan_id  TEXT,
-    at       TEXT NOT NULL,
-    mode     TEXT NOT NULL,
-    outcome  TEXT NOT NULL,
-    detail   TEXT
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    child_id    TEXT NOT NULL,
+    plan_id     TEXT,
+    at          TEXT NOT NULL,
+    mode        TEXT NOT NULL,
+    outcome     TEXT NOT NULL,
+    detail      TEXT,
+    reported_at TEXT
 )
 """
+
+# `reported_at` is when a row went into a delete_plans Slack digest (NULL until
+# then): a row is posted in at most one digest. Added in place to a log that
+# predates it.
+_DELETE_LOG_ADDED_COLUMNS = {"reported_at": "TEXT"}
 
 _QUEUE_STATE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS queue_state (
@@ -297,6 +303,7 @@ def _schema_version() -> int:
             sorted(_ADDED_COLUMNS.items()),
             sorted(_CHAINS_ADDED_COLUMNS.items()),
             sorted(_JOBS_ADDED_COLUMNS.items()),
+            sorted(_DELETE_LOG_ADDED_COLUMNS.items()),
         )
     )
     return (zlib.crc32(definitions.encode("utf-8")) & 0x7FFFFFFF) or 1
@@ -377,6 +384,7 @@ def _migrate(connection: sqlite3.Connection) -> None:
         ("previews", _ADDED_COLUMNS),
         ("chains", _CHAINS_ADDED_COLUMNS),
         ("jobs", _JOBS_ADDED_COLUMNS),
+        ("delete_log", _DELETE_LOG_ADDED_COLUMNS),
     ):
         existing = {
             row["name"] for row in connection.execute(f"PRAGMA table_info({table})")

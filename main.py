@@ -15,7 +15,7 @@ import sys
 from dataclasses import asdict, is_dataclass
 
 from actions.create_timeline import chain_cancel, chain_resume, chain_status, chain_sweep
-from actions.delete_plans import delete_resume
+from actions.delete_plans import delete_digest, delete_resume
 from actions.plan_write import cli as plan_write
 from actions.queue_timeline import (
     queue_cancel,
@@ -61,6 +61,7 @@ ACTIONS = [
     queue_pause,
     queue_resume,
     delete_resume,
+    delete_digest,
 ]
 
 
