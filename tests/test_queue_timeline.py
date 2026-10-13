@@ -354,7 +354,8 @@ class DryRunTests(QueueTestCase):
 
         self.assertEqual(self.famly.commits, [])
         self.assertEqual(self.famly.commit_attempts, 0)
-        self.assertEqual(self.job(data).status, jobs.STATUS_DONE)
+        # dry_done, not done: a rehearsal must not hold the idempotency key.
+        self.assertEqual(self.job(data).status, jobs.STATUS_DRY_DONE)
         self.assertEqual(self.job(data).next_index, 0)
 
     def test_each_segment_is_previewed_on_its_own_with_no_old_plan(self):
@@ -900,7 +901,7 @@ class DailyCapTests(QueueTestCase):
             data = self.queue()
             self.run_all()
 
-        self.assertEqual(self.job(data).status, jobs.STATUS_DONE)
+        self.assertEqual(self.job(data).status, jobs.STATUS_DRY_DONE)
 
 
 class CircuitBreakerTests(QueueTestCase):
@@ -1368,6 +1369,214 @@ class ApprovalHooksTests(QueueTestCase):
 # --------------------------------------------------------------------------- #
 def child_id(n: int) -> str:
     return f"00000000-0000-0000-0000-00000000e{n:03d}"
+
+
+class DryDoneKeyTests(QueueTestCase):
+    """A dry run must NOT hold its idempotency key.
+
+    A dry run commits nothing, so the identical request has to be able to come
+    back and be run for real. A job that genuinely committed still blocks a
+    repeat -- that is the whole point of the key.
+    """
+
+    def dry_run_a_job(self):
+        """Queue a job and run it to completion in dry_run mode."""
+        with mock.patch.dict("os.environ", {"QUEUE_MODE": "dry_run"}):
+            data = self.queue()
+            self.run_all()
+        return data
+
+    def test_a_dry_run_finishes_as_dry_done(self):
+        data = self.dry_run_a_job()
+
+        self.assertEqual(self.job(data).status, jobs.STATUS_DRY_DONE)
+        self.assertIn("dry run", self.job(data).detail or "")
+
+    def test_an_identical_request_after_a_dry_run_creates_a_new_job(self):
+        first = self.dry_run_a_job()
+
+        again = self.queue()
+
+        self.assertFalse(again["already_queued"])
+        self.assertNotEqual(again["job_id"], first["job_id"])
+        # Same key, two jobs: the dry run simply stopped holding it.
+        self.assertEqual(self.job(first).job_key, self.job(again).job_key)
+        self.assertEqual(self.job(first).status, jobs.STATUS_DRY_DONE)
+        self.assertEqual(self.job(again).status, jobs.STATUS_QUEUED)
+
+    def test_the_rerun_actually_commits(self):
+        # The point of rehearsing: the same request then runs for real.
+        self.dry_run_a_job()
+
+        again = self.queue()
+        self.run_all()
+
+        self.assertEqual(self.job(again).status, jobs.STATUS_DONE)
+        self.assertEqual(len(self.famly.commits), 3)
+
+    def test_a_real_done_job_still_returns_already_queued(self):
+        first = self.queue()
+        jobs.set_status(first["job_id"], jobs.STATUS_DONE, "committed 3 plan(s)")
+
+        again = self.queue()
+
+        self.assertTrue(again["already_queued"])
+        self.assertEqual(again["job_id"], first["job_id"])
+        self.assertEqual(len(jobs.list_jobs()), 1)
+
+    def test_find_live_by_key_ignores_a_dry_run(self):
+        data = self.dry_run_a_job()
+        key = self.job(data).job_key
+
+        self.assertIsNone(jobs.find_live_by_key(key))
+
+    def test_dry_done_is_terminal(self):
+        data = self.dry_run_a_job()
+
+        # Nothing moves a finished job, including a cancel.
+        self.assertFalse(
+            jobs.set_status(data["job_id"], jobs.STATUS_CANCELLED, "nope")
+        )
+        self.assertEqual(self.job(data).status, jobs.STATUS_DRY_DONE)
+
+    def test_cancelling_a_dry_run_says_why_it_cannot(self):
+        data = self.dry_run_a_job()
+
+        outcome = worker.cancel(data["job_id"])
+
+        self.assertFalse(outcome["cancelled"])
+        self.assertIn("dry_done", outcome["reason"])
+        self.assertIn("cannot be cancelled", outcome["reason"])
+
+    def test_the_one_active_job_per_child_rule_is_unchanged(self):
+        # A dry run is finished, so it is not active and does not block the
+        # child -- but a live job for the same child still does.
+        self.dry_run_a_job()
+        second = self.queue()
+        self.assertFalse(second["already_queued"])
+
+        third = self.queue(self.body(startDate="2027-01-04"))
+
+        self.assertTrue(third.get("active_conflict") or third.get("already_queued"))
+        self.assertEqual(
+            len([j for j in jobs.list_jobs() if j.status == jobs.STATUS_QUEUED]), 1
+        )
+
+    def test_status_counts_report_dry_runs_separately(self):
+        self.dry_run_a_job()
+
+        counts = worker.status()["jobs"]
+
+        self.assertEqual(counts[jobs.STATUS_DRY_DONE], 1)
+        self.assertEqual(counts[jobs.STATUS_DONE], 0)
+
+    def test_queue_list_accepts_the_new_status(self):
+        data = self.dry_run_a_job()
+
+        listed = worker.list_jobs(jobs.STATUS_DRY_DONE)
+
+        self.assertEqual(listed["count"], 1)
+        self.assertEqual(listed["jobs"][0]["jobId"], data["job_id"])
+        self.assertEqual(listed["jobs"][0]["status"], jobs.STATUS_DRY_DONE)
+        # And it is still a valid filter rather than an error.
+        self.assertNotIn("error", listed)
+
+    def test_the_digest_includes_dry_runs(self):
+        data = self.dry_run_a_job()
+
+        # The digest posts as the queue drains, so it has already gone out.
+        digest = next(n for n in self.notices if "Queue digest" in n)
+        self.assertIn("DRY RUN: nothing was committed", digest)
+        self.assertIn("(dry run)", digest)
+        self.assertIn(data["job_id"], digest)
+        # ...and the job is marked as reported, so it is not repeated.
+        self.assertEqual(jobs.undigested_done(), [])
+
+    def test_a_dry_run_is_picked_up_by_the_digest_query(self):
+        with mock.patch.dict("os.environ", {"QUEUE_MODE": "dry_run"}):
+            data = self.queue()
+            self.run_all()
+
+        # Reset the flag to show the query itself selects dry_done, not just
+        # that the drain happened to post one.
+        with preview_store.open_store() as connection:
+            connection.execute("UPDATE jobs SET digest_sent = 0")
+
+        self.assertEqual(
+            [(j.job_id, j.status) for j in jobs.undigested_done()],
+            [(data["job_id"], jobs.STATUS_DRY_DONE)],
+        )
+
+
+class DryDoneMigrationTests(unittest.TestCase):
+    """Dry runs finished as `done` before dry_done existed, holding their keys."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.db = Path(self._tmp.name) / "old.sqlite3"
+
+        # A store written by the old code, with the old key index.
+        connection = sqlite3.connect(self.db)
+        connection.execute(
+            "CREATE TABLE jobs (job_id TEXT PRIMARY KEY, job_key TEXT NOT NULL, "
+            "child_id TEXT NOT NULL, payload TEXT NOT NULL, segments TEXT NOT NULL, "
+            "next_index INTEGER NOT NULL, status TEXT NOT NULL, detail TEXT, "
+            "preview_id TEXT, digest_sent INTEGER NOT NULL DEFAULT 0, "
+            "created_at TEXT NOT NULL, updated_at TEXT NOT NULL)"
+        )
+        connection.execute(
+            "CREATE UNIQUE INDEX jobs_live_job_key ON jobs (job_key) "
+            "WHERE status IN ('queued', 'running', 'held', 'done')"
+        )
+        for job_id, key, child, status, detail in (
+            ("j-dry", "k-dry", "c1", "done", "dry run: nothing was committed"),
+            ("j-real", "k-real", "c2", "done", "committed 3 plan(s)"),
+            ("j-fail", "k-fail", "c3", "failed", "it broke"),
+            ("j-dry2", "k-dry2", "c4", "done", "dry run: 2 segment(s) checked"),
+        ):
+            connection.execute(
+                "INSERT INTO jobs VALUES (?, ?, ?, '{}', '[]', 0, ?, ?, NULL, 0, "
+                "'2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+                (job_id, key, child, status, detail),
+            )
+        connection.commit()
+        connection.close()
+
+        env = mock.patch.dict("os.environ", {"PREVIEW_STORE_PATH": str(self.db)})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def statuses(self):
+        return {j.job_id: j.status for j in jobs.list_jobs()}
+
+    def test_old_dry_runs_become_dry_done(self):
+        statuses = self.statuses()
+
+        self.assertEqual(statuses["j-dry"], jobs.STATUS_DRY_DONE)
+        self.assertEqual(statuses["j-dry2"], jobs.STATUS_DRY_DONE)
+
+    def test_real_and_failed_jobs_are_left_alone(self):
+        statuses = self.statuses()
+
+        self.assertEqual(statuses["j-real"], jobs.STATUS_DONE)
+        self.assertEqual(statuses["j-fail"], jobs.STATUS_FAILED)
+
+    def test_the_migrated_rows_release_their_keys(self):
+        self.assertIsNone(jobs.find_live_by_key("k-dry"))
+        self.assertIsNone(jobs.find_live_by_key("k-dry2"))
+
+    def test_a_real_done_job_keeps_holding_its_key(self):
+        held = jobs.find_live_by_key("k-real")
+
+        self.assertIsNotNone(held)
+        self.assertEqual(held.job_id, "j-real")
+
+    def test_the_migration_is_idempotent(self):
+        first = self.statuses()
+        jobs.list_jobs()  # opens the store again, re-running the migration
+
+        self.assertEqual(self.statuses(), first)
 
 
 class ConcurrentEnqueueTests(QueueTestCase):

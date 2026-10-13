@@ -14,7 +14,7 @@ A job row:
     payload      the allow-listed request (no names -- see engine.ALLOWED_FIELDS)
     segments     [{from, to, funded, advanced, plan_id, committed_at, dry_run}]
     next_index   how many plans are committed: the plan at this index is next
-    status       queued | running | done | held | failed | cancelled
+    status       queued | running | done | dry_done | held | failed | cancelled
     detail       the last reason: why held / failed / cancelled
     preview_id   the stored preview a HELD job waits on a human for
     digest_sent  whether a Slack digest has already reported it
@@ -24,15 +24,15 @@ decides races (see the two unique indexes in preview_store.py):
 
     * the idempotency key is unique among LIVE jobs (queued, running, held, done):
       an identical request while one is active or finished is the same job
-      (`already_queued`). A failed or cancelled job does not hold its key, so
-      the same request can be sent again and makes a new job;
+      (`already_queued`). A failed, cancelled or DRY-RUN job does not hold its
+      key, so the same request can be sent again and makes a new job;
     * a child can have ONE active job (queued, running or held): a different
       request for a child that has one is refused (`active_conflict`).
 
 Jobs are taken OLDEST FIRST: by `created_at` (stamped by SQLite inside the INSERT,
 so it follows the order the inserts really happened in), then by row.
 
-A job moves:  queued -> running -> done | held | failed | cancelled, and
+A job moves:  queued -> running -> done | dry_done | held | failed | cancelled, and
 held -> queued when a human approves the held plan. `running` is only ever the
 state of the single worker's current job; a worker that finds one on startup
 resumes it by READ-BACK, never by replaying (see worker.recover).
@@ -59,6 +59,11 @@ logger = logging.getLogger(__name__)
 STATUS_QUEUED = "queued"
 STATUS_RUNNING = "running"
 STATUS_DONE = "done"
+# A dry run finished: every segment was previewed and checked, and NOTHING was
+# committed. Terminal like `done`, but deliberately NOT a live key holder -- a
+# dry run is a rehearsal, so the same request must be able to come back and be
+# run for real. See `find_live_by_key` and the jobs_live_job_key index.
+STATUS_DRY_DONE = "dry_done"
 STATUS_HELD = "held"
 STATUS_FAILED = "failed"
 STATUS_CANCELLED = "cancelled"
@@ -66,12 +71,17 @@ ALL_STATUSES = (
     STATUS_QUEUED,
     STATUS_RUNNING,
     STATUS_DONE,
+    STATUS_DRY_DONE,
     STATUS_HELD,
     STATUS_FAILED,
     STATUS_CANCELLED,
 )
 # Statuses that end a job: nothing more will happen to it.
-FINISHED = (STATUS_DONE, STATUS_FAILED, STATUS_CANCELLED)
+FINISHED = (STATUS_DONE, STATUS_DRY_DONE, STATUS_FAILED, STATUS_CANCELLED)
+
+# Statuses that HOLD the idempotency key. `dry_done` is absent on purpose, and
+# must stay absent: it is what lets a rehearsed request be sent again for real.
+KEY_HOLDING = (STATUS_QUEUED, STATUS_RUNNING, STATUS_HELD, STATUS_DONE)
 
 
 @dataclass
@@ -205,14 +215,20 @@ def get(job_id: str) -> Job | None:
 
 
 def find_live_by_key(key: str) -> Job | None:
-    """The queued, running, held or done job for an idempotency key, if any.
+    """The job holding an idempotency key, if any (see KEY_HOLDING).
 
     A failed or cancelled job is not returned: it no longer holds its key.
+    NEITHER IS A DRY RUN -- `dry_done` committed nothing, so the same request
+    has to be able to come back and be run for real.
+
+    The statuses here mirror the jobs_live_job_key partial index exactly; the
+    index is what actually decides a race, and this only reports who won.
     """
+    marks = ", ".join("?" for _ in KEY_HOLDING)
     with preview_store.open_store() as connection:
         row = connection.execute(
-            "SELECT * FROM jobs WHERE job_key = ? AND status IN (?, ?, ?, ?)",
-            (key, STATUS_QUEUED, STATUS_RUNNING, STATUS_HELD, STATUS_DONE),
+            f"SELECT * FROM jobs WHERE job_key = ? AND status IN ({marks})",
+            (key, *KEY_HOLDING),
         ).fetchone()
     return _row_to_job(row) if row is not None else None
 
@@ -340,11 +356,16 @@ def mark_digested(job_ids: list[str]) -> None:
 
 
 def undigested_done() -> list[Job]:
+    """Finished jobs not yet reported in a digest -- dry runs included.
+
+    A dry run is exactly what someone wants to read in the digest: it says what
+    WOULD have happened. Excluding it would make the rehearsal invisible.
+    """
     with preview_store.open_store() as connection:
         rows = connection.execute(
-            "SELECT * FROM jobs WHERE status = ? AND digest_sent = 0 "
+            "SELECT * FROM jobs WHERE status IN (?, ?) AND digest_sent = 0 "
             "ORDER BY created_at, rowid",
-            (STATUS_DONE,),
+            (STATUS_DONE, STATUS_DRY_DONE),
         ).fetchall()
     return [_row_to_job(r) for r in rows]
 

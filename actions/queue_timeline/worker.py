@@ -224,8 +224,13 @@ def fail(job_id: str, reason: str) -> None:
         )
 
 
-def finish(job_id: str, detail: str | None = None) -> None:
-    if jobs.set_status(job_id, jobs.STATUS_DONE, detail):
+def finish(job_id: str, detail: str | None = None, *, status: str | None = None) -> None:
+    """End a job. `status` defaults to `done`; a dry run passes `dry_done`.
+
+    The difference matters: `done` holds the job's idempotency key, `dry_done`
+    does not, so the same request can be sent again and run for real.
+    """
+    if jobs.set_status(job_id, status or jobs.STATUS_DONE, detail):
         jobs.state_set("consecutive_failures", "0")
 
 
@@ -463,7 +468,13 @@ def _run_dry(job: jobs.Job) -> None:
                 ],
             },
         )
-    finish(job.job_id, "dry run: nothing was committed")
+    # dry_done, not done: nothing was committed, so the request must stay
+    # repeatable -- the same payload can come back and be run for real.
+    finish(
+        job.job_id,
+        "dry run: nothing was committed",
+        status=jobs.STATUS_DRY_DONE,
+    )
 
 
 def _do_segment(job: jobs.Job) -> bool:
@@ -604,7 +615,8 @@ def expire_held() -> list[str]:
 
 
 def _digest_lines(job: jobs.Job) -> list[str]:
-    lines = [f"• {_child_line(job.child_id)} — job `{job.job_id}`"]
+    label = " (dry run)" if job.status == jobs.STATUS_DRY_DONE else ""
+    lines = [f"• {_child_line(job.child_id)} — job `{job.job_id}`{label}"]
     for index, segment in enumerate(job.segments):
         dry = segment.get("dry_run")
         if dry is not None:
@@ -631,9 +643,16 @@ def post_digest(now: datetime | None = None, *, drained: bool = False) -> bool:
         if (now - datetime.fromisoformat(last)).total_seconds() < DIGEST_INTERVAL_SECONDS:
             return False
 
+    # Report what the jobs themselves were, not just the mode now: a digest can
+    # carry dry runs and real ones together after the mode was switched over.
+    dry_count = sum(1 for j in pending if j.status == jobs.STATUS_DRY_DONE)
     heading = (
         f":white_check_mark: *Queue digest* ({mode()}) — {len(pending)} job(s) finished"
-        + (" (DRY RUN: nothing was committed)" if mode() == MODE_DRY_RUN else "")
+        + (
+            f" ({dry_count} DRY RUN: nothing was committed)"
+            if dry_count
+            else ""
+        )
     )
     lines = [heading]
     for job in pending:
@@ -731,7 +750,10 @@ def cancel(job_id: str) -> dict:
     if job is None:
         return {"cancelled": False, "reason": f"no job {job_id}"}
     if not jobs.set_status(job_id, jobs.STATUS_CANCELLED, "cancelled by an operator (queue-cancel)"):
-        return {"cancelled": False, "reason": f"job is already {job.status}"}
+        # A finished job (including a dry run) never moves again. Say so plainly
+        # rather than just naming the status.
+        finished = " and cannot be cancelled" if job.status in jobs.FINISHED else ""
+        return {"cancelled": False, "reason": f"job is already {job.status}{finished}"}
     if job.preview_id:
         stored = preview_store.get(job.preview_id)
         if stored is not None and stored.status in (
