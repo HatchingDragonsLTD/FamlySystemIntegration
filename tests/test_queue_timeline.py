@@ -12,8 +12,13 @@ NOTHING here touches Famly or Slack. Commits go through the REAL approval path
 
 import json
 import logging
+import sqlite3
+import tempfile
+import threading
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from unittest import mock
 
 try:  # `python -m unittest tests.test_queue_timeline`
@@ -145,7 +150,7 @@ class QueueRequestTests(QueueTestCase):
         data = self.queue()
 
         self.assertEqual(data["status"], jobs.STATUS_QUEUED)
-        self.assertFalse(data["duplicate"])
+        self.assertFalse(data["already_queued"])
         self.assertEqual(len(data["segments"]), 3)
         self.assertEqual((self.famly.posts, self.famly.gets), ([], 0))
         self.assertEqual((self.previews_posted, self.notices), ([], []))
@@ -155,7 +160,8 @@ class QueueRequestTests(QueueTestCase):
         second = self.queue()
 
         self.assertEqual(second["job_id"], first["job_id"])
-        self.assertTrue(second["duplicate"])
+        self.assertTrue(second["already_queued"])
+        self.assertFalse(first["already_queued"])
         self.assertEqual(len(jobs.list_jobs()), 1)
 
     def test_the_key_ignores_names_and_other_unlisted_fields(self):
@@ -164,14 +170,17 @@ class QueueRequestTests(QueueTestCase):
 
         self.assertEqual(second["job_id"], first["job_id"])
 
-    def test_a_different_payload_is_a_different_job(self):
+    def test_a_different_payload_is_a_different_job_once_the_first_is_out_of_the_way(self):
         first = self.queue()
+        worker.cancel(first["job_id"])
         second = self.queue(self.body(addon_quantity="1"))
 
         self.assertNotEqual(second["job_id"], first["job_id"])
+        self.assertFalse(second["already_queued"])
 
-    def test_a_different_start_date_is_a_different_job(self):
+    def test_a_different_start_date_is_a_different_job_once_the_first_is_out_of_the_way(self):
         first = self.queue()
+        worker.cancel(first["job_id"])
         second = self.queue(self.body(start_date="2026-09-02"))
 
         self.assertNotEqual(second["job_id"], first["job_id"])
@@ -188,20 +197,21 @@ class QueueRequestTests(QueueTestCase):
             jobs.job_key("other-child", "2026-09-01", job.payload),
         )
 
-    def test_a_failed_or_cancelled_job_does_not_block_asking_again(self):
-        first = self.queue()
-        worker.cancel(first["job_id"])
+    def test_an_identical_request_finds_the_job_whatever_became_of_it(self):
+        # The idempotency key is UNIQUE outright: a cancelled, failed or finished
+        # job is still THE job for that request. To ask again, change the request.
+        for status in (jobs.STATUS_DONE, jobs.STATUS_CANCELLED, jobs.STATUS_FAILED):
+            with self.subTest(status=status):
+                jobs.state_set("x", None)
+                first = self.queue()
+                jobs.set_status(first["job_id"], status, "ended")
 
-        second = self.queue()
+                again = self.queue()
 
-        self.assertNotEqual(second["job_id"], first["job_id"])
-        self.assertFalse(second["duplicate"])
-
-    def test_a_finished_job_is_still_a_duplicate(self):
-        first = self.queue()
-        jobs.set_status(first["job_id"], jobs.STATUS_DONE)
-
-        self.assertTrue(self.queue()["duplicate"])
+                self.assertEqual(again["job_id"], first["job_id"])
+                self.assertTrue(again["already_queued"])
+                with preview_store.open_store() as connection:
+                    connection.execute("DELETE FROM jobs")
 
     def test_the_stored_payload_is_allow_listed_with_no_names(self):
         data = self.queue(self.body(child_name="Alex Smith", parent_name="Pat Smith"))
@@ -1206,7 +1216,7 @@ class CommandTests(QueueTestCase):
 
     def test_list_filters_by_status(self):
         self.queue()
-        self.queue(self.body(addon_quantity="1"))
+        self.queue(self.body(childId="00000000-0000-0000-0000-0000000000c2"))
         jobs.set_status(jobs.list_jobs()[0].job_id, jobs.STATUS_HELD, "why")
 
         self.assertEqual(worker.list_jobs("held")["count"], 1)
@@ -1295,6 +1305,252 @@ class ApprovalHooksTests(QueueTestCase):
         self.assertFalse(jobs.release_after_approval(job.job_id, 0, "plan-x"))
         self.assertFalse(jobs.cancel_after_rejection(job.job_id, 0, "drew"))
         self.assertEqual(self.job(data).status, jobs.STATUS_QUEUED)
+
+
+# --------------------------------------------------------------------------- #
+# Concurrency-safe enqueueing
+# --------------------------------------------------------------------------- #
+def child_id(n: int) -> str:
+    return f"00000000-0000-0000-0000-00000000e{n:03d}"
+
+
+class ConcurrentEnqueueTests(QueueTestCase):
+    def race(self, bodies):
+        """Send every body at once, from as many threads, through the real handler."""
+        barrier = threading.Barrier(len(bodies))
+        results = [None] * len(bodies)
+        errors = []
+
+        def send(index, body):
+            try:
+                barrier.wait(timeout=10)
+                results[index] = queue_web.handle(body)
+            except Exception as exc:  # noqa: BLE001 - surfaced by the assertion below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=send, args=(i, b)) for i, b in enumerate(bodies)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+        self.assertEqual(errors, [])
+        return results
+
+    def test_two_threads_enqueuing_the_identical_payload_create_one_job(self):
+        results = self.race([self.body(), self.body()])
+
+        self.assertEqual([status for _, status in results], [200, 200])
+        ids = {data["job_id"] for data, _ in results}
+        self.assertEqual(len(ids), 1)
+        self.assertEqual(sorted(data["already_queued"] for data, _ in results), [False, True])
+        self.assertEqual(len(jobs.list_jobs()), 1)
+        self.assertEqual(self.notices, [])
+
+    def test_many_threads_with_the_identical_payload_still_make_one_job(self):
+        results = self.race([self.body() for _ in range(8)])
+
+        self.assertEqual({data["job_id"] for data, _ in results}, {jobs.list_jobs()[0].job_id})
+        self.assertEqual(len(jobs.list_jobs()), 1)
+        self.assertEqual(sum(not data["already_queued"] for data, _ in results), 1)
+
+    def test_two_different_payloads_for_one_child_give_one_active_job_and_a_409(self):
+        results = self.race([self.body(), self.body(addon_quantity="1")])
+
+        statuses = sorted(status for _, status in results)
+        self.assertEqual(statuses, [200, 409])
+        self.assertEqual(len(jobs.list_jobs()), 1)
+        winner = jobs.list_jobs()[0]
+        loser_data = next(data for data, status in results if status == 409)
+        self.assertEqual(loser_data["job_id"], winner.job_id)  # the EXISTING job's id
+        self.assertFalse(loser_data["already_queued"])
+
+    def test_the_conflict_posts_a_notice_with_the_cancel_command(self):
+        first = self.queue()
+
+        data, status = queue_web.handle(self.body(addon_quantity="1"))
+
+        self.assertEqual(status, 409)
+        self.assertEqual(data["job_id"], first["job_id"])
+        self.assertEqual(len(self.notices), 1)
+        notice = self.notices[0]
+        self.assertIn("already has an active job", notice)
+        self.assertIn(first["job_id"], notice)
+        self.assertIn(f"queue-cancel {first['job_id']}", notice)
+        self.assertEqual(data["errors"], [notice])
+
+    def test_a_held_or_running_job_also_blocks(self):
+        for status in (jobs.STATUS_RUNNING, jobs.STATUS_HELD):
+            with self.subTest(status=status):
+                first = self.queue()
+                jobs.set_status(first["job_id"], status, "x")
+
+                _, code = queue_web.handle(self.body(addon_quantity="1"))
+
+                self.assertEqual(code, 409)
+                jobs.set_status(first["job_id"], jobs.STATUS_CANCELLED)
+                with preview_store.open_store() as connection:
+                    connection.execute("DELETE FROM jobs")
+
+    def test_a_finished_job_does_not_block_a_different_request_for_the_child(self):
+        for status in (jobs.STATUS_DONE, jobs.STATUS_FAILED, jobs.STATUS_CANCELLED):
+            with self.subTest(status=status):
+                first = self.queue()
+                jobs.set_status(first["job_id"], status, "ended")
+
+                data, code = queue_web.handle(self.body(addon_quantity="1"))
+
+                self.assertEqual(code, 200)
+                self.assertNotEqual(data["job_id"], first["job_id"])
+                with preview_store.open_store() as connection:
+                    connection.execute("DELETE FROM jobs")
+
+    def test_the_identical_request_wins_over_the_active_job_rule(self):
+        first = self.queue()
+
+        data, status = queue_web.handle(self.body())
+
+        self.assertEqual((status, data["already_queued"]), (200, True))
+        self.assertEqual(data["job_id"], first["job_id"])
+        self.assertEqual(self.notices, [])
+
+    def test_the_database_itself_enforces_both_rules(self):
+        segments = [{"from": "2026-09-01", "to": None, "funded": False, "advanced": False}]
+
+        first = jobs.create(CHILD, "2026-09-01", {"a": 1}, segments)
+        same = jobs.create(CHILD, "2026-09-01", {"a": 1}, segments)
+        other = jobs.create(CHILD, "2026-09-01", {"a": 2}, segments)
+        elsewhere = jobs.create("another", "2026-09-01", {"a": 2}, segments)
+
+        self.assertEqual(first.outcome, jobs.CREATED)
+        self.assertEqual((same.outcome, same.job.job_id), (jobs.ALREADY_QUEUED, first.job.job_id))
+        self.assertEqual((other.outcome, other.job.job_id), (jobs.ACTIVE_CONFLICT, first.job.job_id))
+        self.assertEqual(elsewhere.outcome, jobs.CREATED)
+
+        with preview_store.open_store() as connection:
+            with self.assertRaises(sqlite3.IntegrityError):  # a raw second INSERT is refused too
+                connection.execute(
+                    "INSERT INTO jobs (job_id, job_key, child_id, payload, segments, next_index, "
+                    "status, created_at, updated_at) VALUES ('x', ?, 'c', '{}', '[]', 0, 'done', 't', 't')",
+                    (first.job.job_key,),
+                )
+
+    def test_the_indexes_exist_and_the_old_one_is_gone(self):
+        jobs.state_get("x")
+        with preview_store.open_store() as connection:
+            names = {r["name"] for r in connection.execute("SELECT name FROM sqlite_master WHERE type='index'")}
+        self.assertIn("jobs_job_key_unique", names)
+        self.assertIn("jobs_one_active_per_child", names)
+        self.assertNotIn("jobs_one_live_per_key", names)
+
+    def test_an_older_store_is_migrated_to_the_new_indexes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "old.sqlite3"
+            connection = sqlite3.connect(path)
+            connection.execute(
+                "CREATE TABLE jobs (job_id TEXT PRIMARY KEY, job_key TEXT NOT NULL, child_id TEXT NOT NULL, "
+                "payload TEXT NOT NULL, segments TEXT NOT NULL, next_index INTEGER NOT NULL, "
+                "status TEXT NOT NULL, detail TEXT, preview_id TEXT, digest_sent INTEGER NOT NULL DEFAULT 0, "
+                "created_at TEXT NOT NULL, updated_at TEXT NOT NULL)"
+            )
+            connection.execute(
+                "CREATE UNIQUE INDEX jobs_one_live_per_key ON jobs (job_key) "
+                "WHERE status IN ('queued', 'running', 'held', 'done')"
+            )
+            connection.commit()
+            connection.close()
+
+            with mock.patch.dict("os.environ", {"PREVIEW_STORE_PATH": str(path)}):
+                segments = [{"from": "2026-09-01", "to": None, "funded": False, "advanced": False}]
+                self.assertEqual(jobs.create("c", "2026-09-01", {}, segments).outcome, jobs.CREATED)
+                with preview_store.open_store() as store:
+                    names = {r["name"] for r in store.execute("SELECT name FROM sqlite_master WHERE type='index'")}
+
+        self.assertNotIn("jobs_one_live_per_key", names)
+        self.assertIn("jobs_job_key_unique", names)
+
+    def test_ten_different_children_enqueue_concurrently_and_are_processed_in_order(self):
+        children = [child_id(n) for n in range(10)]
+        bodies = [self.body(funded=False, childId=c) for c in children]
+        with mock.patch.dict("os.environ", {"COMMIT_ALLOWED_CHILD_IDS": ",".join(children)}):
+            results = self.race(bodies)
+            self.assertEqual([status for _, status in results], [200] * 10)
+            self.assertEqual(len({data["job_id"] for data, _ in results}), 10)
+
+            order = [j.child_id for j in jobs.list_jobs()]  # oldest first
+            self.assertEqual(sorted(order), sorted(children))
+
+            self.run_all()
+
+        self.assertEqual(
+            [c["body"]["plan"]["childId"] for c in self.famly.commits], order
+        )
+        self.assertEqual({j.status for j in jobs.list_jobs()}, {jobs.STATUS_DONE})
+
+    def test_the_worker_takes_jobs_oldest_first(self):
+        first = self.queue(self.body(funded=False, childId=child_id(1)))
+        second = self.queue(self.body(funded=False, childId=child_id(2)))
+        third = self.queue(self.body(funded=False, childId=child_id(3)))
+
+        claimed = [jobs.claim_next().job_id for _ in range(3)]
+
+        self.assertEqual(claimed, [first["job_id"], second["job_id"], third["job_id"]])
+        self.assertIsNone(jobs.claim_next())
+
+    def test_created_at_is_stamped_in_the_insert_so_it_follows_insertion_order(self):
+        segments = [{"from": "2026-09-01", "to": None, "funded": False, "advanced": False}]
+        made = [jobs.create(f"child-{n}", "2026-09-01", {"n": n}, segments).job for n in range(5)]
+
+        self.assertEqual([j.job_id for j in jobs.list_jobs()], [j.job_id for j in made])
+        stamps = [j.created_at for j in made]
+        self.assertEqual(stamps, sorted(stamps))
+
+    def test_the_handler_makes_no_network_calls(self):
+        def forbidden(*args, **kwargs):
+            raise AssertionError("the enqueue path made a network call")
+
+        self.queue()  # a first job, so every outcome below is exercised
+        with mock.patch("socket.socket.connect", forbidden), mock.patch(
+            "requests.sessions.Session.request", forbidden
+        ), mock.patch("requests.post", forbidden), mock.patch("requests.get", forbidden):
+            created = queue_web.handle(self.body(childId=child_id(7)))
+            again = queue_web.handle(self.body(childId=child_id(7)))
+            conflict = queue_web.handle(self.body(childId=child_id(7), addon_quantity="1"))
+            refused = queue_web.handle(self.body(start_date=""))
+
+        self.assertEqual([c[1] for c in (created, again, conflict, refused)], [200, 200, 409, 422])
+        self.assertEqual((self.famly.posts, self.famly.gets), ([], 0))
+
+    def test_the_handler_does_not_look_up_the_childs_name(self):
+        calls = []
+        with mock.patch.object(child_lookup, "lookup_child_name", lambda *a, **k: calls.append(a)):
+            first = self.queue()
+            queue_web.handle(self.body(addon_quantity="1"))  # the 409, which posts a notice
+
+        self.assertEqual(calls, [])
+
+    def test_a_store_that_is_busy_waits_instead_of_failing(self):
+        # A held write lock makes the enqueue wait (the store's busy timeout)
+        # rather than raise at once.
+        segments = [{"from": "2026-09-01", "to": None, "funded": False, "advanced": False}]
+        holder = sqlite3.connect(preview_store.store_path(), timeout=10, check_same_thread=False)
+        holder.execute("PRAGMA journal_mode=WAL")
+        holder.execute("BEGIN IMMEDIATE")
+        released = threading.Timer(0.5, lambda: (holder.rollback(), holder.close()))
+        released.start()
+        try:
+            started = time.monotonic()
+            result = jobs.create(CHILD, "2026-09-01", {"busy": 1}, segments)
+            waited = time.monotonic() - started
+        finally:
+            released.join()
+
+        self.assertEqual(result.outcome, jobs.CREATED)
+        self.assertGreaterEqual(waited, 0.3)
+
+    def test_the_store_runs_in_wal_mode_with_a_busy_timeout(self):
+        with preview_store.open_store() as connection:
+            self.assertEqual(connection.execute("PRAGMA journal_mode").fetchone()[0].lower(), "wal")
+            self.assertGreaterEqual(connection.execute("PRAGMA busy_timeout").fetchone()[0], 10000)
 
 
 if __name__ == "__main__":
