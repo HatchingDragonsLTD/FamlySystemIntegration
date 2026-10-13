@@ -67,7 +67,8 @@ _sleep = time.sleep
 
 # The advanced-fee discount rides in the LAST of the ten custom discount slots,
 # so it can never collide with the discounts HubSpot fills from slot 1 upwards.
-# It is a FIXED amount in pounds per week (flag "fixed"), never a percentage.
+# It is a PERCENTAGE given as a fraction (0.05 means 5%): the slot's flag is left
+# unset, which defaults to percent, exactly like HubSpot's own discount slots.
 ADVANCED_FEE_DISCOUNT_TITLE = "Advanced Fee Discount"
 ADVANCED_FEE_DISCOUNT_SLOT = 10
 
@@ -239,10 +240,10 @@ def segment_payload(base: dict, segment: dict, *, is_last: bool) -> dict:
       * a NON-FUNDED segment gets `funded` false, NO funding settings, and keeps
         `addon_quantity` (so it books the add-on products) and the booked-days
         discount in slot 9.
-      * an ADVANCED segment adds the Advanced Fee Discount in slot 10, flagged
-        "fixed": `advanced_discount` is POUNDS PER WEEK, so it builds a
-        weekly, non-percentage discount. A slot 10 already in use is an error,
-        never overwritten.
+      * an ADVANCED segment adds the Advanced Fee Discount in slot 10.
+        `advanced_discount` is a PERCENTAGE AS A FRACTION (0.05 is 5%), so no
+        flag is set and the slot defaults to percent. A slot 10 already in use
+        is an error, never overwritten.
 
     Never mutates `base`.
     """
@@ -281,7 +282,7 @@ def segment_payload(base: dict, segment: dict, *, is_last: bool) -> dict:
             )
         payload[f"discount_{slot}_name"] = ADVANCED_FEE_DISCOUNT_TITLE
         payload[f"discount_{slot}_amount"] = base.get("advanced_discount")
-        payload[f"discount_{slot}_flag"] = "fixed"  # pounds per week, not a percent
+        payload.pop(f"discount_{slot}_flag", None)  # unset: percent, the slot default
 
     return payload
 
@@ -295,10 +296,10 @@ def validate_segments(base: dict, segments: list[dict]) -> list[str]:
     discount slot is only advisory in an ordinary preview: dropping it would
     quietly bill the family too much.
 
-    The advanced fee is a FIXED amount in pounds per week. Besides the fixed
-    range the discount builder enforces (above 0, at most 5000), an amount
-    BELOW 1 is refused as "looks like a fraction": a percentage sent by mistake
-    (0.05) would otherwise become a 5p weekly discount.
+    The advanced fee is a PERCENTAGE AS A FRACTION: valid is above 0 and at
+    most 1 (0.05 is 5%). Anything above 1 is a hard error -- a whole-number
+    percentage typed by mistake (5, meaning 5%) would otherwise be a 500%
+    discount.
     """
     errors: list[str] = []
     total = len(segments)
@@ -306,16 +307,19 @@ def validate_segments(base: dict, segments: list[dict]) -> list[str]:
     # Funding rules are the same for every funded plan, so a gap is reported
     # once, not once per plan.
     reported_funding: set[str] = set()
+    too_large = False  # already reported above; not repeated per plan
 
     if any(segment["advanced"] for segment in segments):
         try:
             amount = float(_text(base.get("advanced_discount")))
         except ValueError:
             amount = None  # the discount builder reports a non-number below
-        if amount is not None and 0 < amount < 1:
+        if amount is not None and amount > 1:
+            too_large = True
             errors.append(
-                f"advanced_discount {base.get('advanced_discount')!r} looks like a "
-                f"fraction, expected £ per week (a fixed amount of at least £1)"
+                f"advanced_discount {base.get('advanced_discount')!r} is out of "
+                f"range: percent amounts are fractions, 5% is 0.05 (above 0, at "
+                f"most 1)"
             )
 
     for index, segment in enumerate(segments):
@@ -343,12 +347,12 @@ def validate_segments(base: dict, segments: list[dict]) -> list[str]:
                 isinstance(d, dict)
                 and d.get("title") == ADVANCED_FEE_DISCOUNT_TITLE
                 and d.get("ordering") == slot - 1
-                and d.get("isPercent") is False
+                and d.get("isPercent") is True
                 and d.get("period") == "WEEKLY"
                 for part in plan_input.plan_parts
                 for d in part.discounts
             )
-            if problems or not booked:
+            if not too_large and (problems or not booked):
                 detail = "; ".join(problems) or "it was not built"
                 errors.append(f"{label}: {ADVANCED_FEE_DISCOUNT_TITLE} invalid: {detail}")
 
