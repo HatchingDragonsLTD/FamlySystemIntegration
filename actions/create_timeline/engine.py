@@ -40,7 +40,7 @@ from actions.plan_write import (
 )
 from actions.plan_write import web as plan_write_web
 from actions.read_child_plans import runner as read_child_plans
-from integrations import slack
+from integrations import funding_rules, slack
 
 from . import chains
 
@@ -62,6 +62,10 @@ _sleep = time.sleep
 # It is a FIXED amount in pounds per week (flag "fixed"), never a percentage.
 ADVANCED_FEE_DISCOUNT_TITLE = "Advanced Fee Discount"
 ADVANCED_FEE_DISCOUNT_SLOT = 10
+
+# Slot 9 is reserved for HubSpot's booked-days discount, which is a NON-FUNDED
+# feature: a funded segment never carries it (see `segment_payload`).
+BOOKED_DAYS_DISCOUNT_SLOT = 9
 
 # --------------------------------------------------------------------------- #
 # What the chain keeps of the original request.
@@ -88,6 +92,7 @@ _PLAN_FIELDS = (
     "fundingMethod",
     "fundingHours",
     "maxFundedMinutes",
+    "funding_entitlement",
     "site_code",
     "addon_quantity",
 )
@@ -119,6 +124,10 @@ _FUNDING_SETTING_FIELDS = ("fundingMethod", "fundingHours", "maxFundedMinutes")
 
 class PayloadError(ValueError):
     """A segment's payload cannot be built."""
+
+
+class FundingPayloadError(PayloadError):
+    """A funded segment's funding settings cannot be resolved from the rules."""
 
 
 @dataclass
@@ -212,11 +221,16 @@ def segment_payload(base: dict, segment: dict, *, is_last: bool) -> dict:
       * `from` is the segment's start. `to` is left EMPTY for every segment but
         the last (Famly trims the previous plan when the next one arrives); the
         last gets the leave date, or none when there is no leave date.
-      * a FUNDED segment keeps the funding settings and hours and books the
-        funded session variants (`funded` true); it books no add-on products,
-        since add-ons are a non-funded-deal feature.
+      * a FUNDED segment books the funded session variants (`funded` true) and
+        gets its three funding settings -- method, weekly hours and the cap --
+        from the SERVER's per-institution rules (`integrations.funding_rules`),
+        using the payload's `institution`, `funding_entitlement` and
+        `termTimeOnly`. Anything HubSpot sent for them is overridden. It books
+        no add-on products and carries NO booked-days discount (slot 9): both
+        are non-funded features.
       * a NON-FUNDED segment gets `funded` false, NO funding settings, and keeps
-        `addon_quantity`, so it books the add-on products.
+        `addon_quantity` (so it books the add-on products) and the booked-days
+        discount in slot 9.
       * an ADVANCED segment adds the Advanced Fee Discount in slot 10, flagged
         "fixed": `advanced_discount` is POUNDS PER WEEK, so it builds a
         weekly, non-percentage discount. A slot 10 already in use is an error,
@@ -231,6 +245,18 @@ def segment_payload(base: dict, segment: dict, *, is_last: bool) -> dict:
     if segment["funded"]:
         payload["funded"] = "true"
         payload.pop("addon_quantity", None)
+        for part in ("name", "amount", "flag"):
+            payload.pop(f"discount_{BOOKED_DAYS_DISCOUNT_SLOT}_{part}", None)
+        try:
+            payload.update(
+                funding_rules.resolve_funding(
+                    _text(base.get("institution")),
+                    base.get("funding_entitlement"),
+                    hubspot_flatten._as_bool(base.get("termTimeOnly")),
+                )
+            )
+        except funding_rules.FundingRulesError as exc:
+            raise FundingPayloadError(str(exc)) from exc
     else:
         payload["funded"] = "false"
         for name in _FUNDING_SETTING_FIELDS:
@@ -269,6 +295,10 @@ def validate_segments(base: dict, segments: list[dict]) -> list[str]:
     errors: list[str] = []
     total = len(segments)
 
+    # Funding rules are the same for every funded plan, so a gap is reported
+    # once, not once per plan.
+    reported_funding: set[str] = set()
+
     if any(segment["advanced"] for segment in segments):
         try:
             amount = float(_text(base.get("advanced_discount")))
@@ -284,6 +314,11 @@ def validate_segments(base: dict, segments: list[dict]) -> list[str]:
         label = f"Plan {index + 1} of {total}"
         try:
             payload = segment_payload(base, segment, is_last=index == total - 1)
+        except FundingPayloadError as exc:
+            if str(exc) not in reported_funding:
+                reported_funding.add(str(exc))
+                errors.append(f"{label}: {exc}")
+            continue
         except PayloadError as exc:
             errors.append(f"{label}: {exc}")
             continue

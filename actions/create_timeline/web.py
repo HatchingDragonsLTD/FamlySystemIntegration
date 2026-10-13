@@ -12,7 +12,7 @@ Approve click, behind every guard that click already has.
 Request body: the flat HubSpot payload plan_preview accepts, plus
 
     start_date, leave_date (optional)
-    has_funding,      funding_start,  funding_end
+    has_funding,      funding_start,  funding_end,  funding_entitlement ("30"/"15")
     has_advanced_fee, advanced_start, advanced_end, advanced_discount
 
 Decision tree (each refusal posts a Slack notice and creates nothing):
