@@ -1,0 +1,14 @@
+{
+  "fundingMethod": "ASSISTED",
+  "institutions": {
+    "HDCW": {
+      "maxFundedMinutes": 660,
+      "fundedWeeklyHours": {
+        "30": {"all_year_round": 24.58823529, "term_only": 33},
+        "15": {"all_year_round": 12.29411765, "term_only": 16.5}
+      }
+    },
+    "HDCITY": {"maxFundedMinutes": 660, "fundedWeeklyHours": null},
+    "HDWEST": {"maxFundedMinutes": 600, "fundedWeeklyHours": null}
+  }
+}

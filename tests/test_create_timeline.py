@@ -87,6 +87,20 @@ INSTITUTION_DEFAULTS = {
 }
 
 
+FUNDING_RULES = {
+    "fundingMethod": "ASSISTED",
+    "institutions": {
+        INSTITUTION: {
+            "maxFundedMinutes": 660,
+            "fundedWeeklyHours": {
+                "30": {"all_year_round": 24.5, "term_only": 33},
+                "15": {"all_year_round": 12.25, "term_only": 16.5},
+            },
+        }
+    },
+}
+
+
 def payload(**overrides) -> dict:
     """A flat HubSpot payload for a starter, with the timeline fields."""
     body = {
@@ -99,8 +113,9 @@ def payload(**overrides) -> dict:
         "has_meals": "true",
         "has_activities": "true",
         "fundingMethod": "STRETCHED",
-        "fundingHours": 15,
+        "fundingHours": 15,  # HubSpot's figure: ignored, the server's rules win
         "maxFundedMinutes": 900,
+        "funding_entitlement": "30",
         "addon_quantity": "2",
         "note": "Starter",
         "start_date": "2026-09-01",
@@ -196,6 +211,8 @@ class ChainTestCase(unittest.TestCase):
 
         (root / "sessions.json").write_text(json.dumps(SESSION_CATALOGUE), encoding="utf-8")
         (root / "defaults.json").write_text(json.dumps(INSTITUTION_DEFAULTS), encoding="utf-8")
+        (root / "funding.json").write_text(json.dumps(FUNDING_RULES), encoding="utf-8")
+        self.funding_file = root / "funding.json"
 
         env = mock.patch.dict(
             "os.environ",
@@ -207,6 +224,7 @@ class ChainTestCase(unittest.TestCase):
                 "COMMIT_ALLOWED_CHILD_IDS": CHILD,
                 "SESSION_CATALOGUE_FILE": str(root / "sessions.json"),
                 "INSTITUTION_DEFAULTS_FILE": str(root / "defaults.json"),
+                "FUNDING_RULES_FILE": str(root / "funding.json"),
             },
         )
         env.start()
@@ -398,8 +416,9 @@ class FundedInTheMiddleTests(ChainTestCase):
         self.assertEqual(self.fundable_flags(funded), {True})
         self.assertEqual(self.sent(funded)["planParts"][0]["productBookings"], [])
         settings = self.sent(funded)["publicFundingSettings"]
-        self.assertEqual(settings["method"], "STRETCHED")
-        self.assertEqual(settings["hours"], 15)
+        self.assertEqual(settings["method"], "ASSISTED")  # the server's, not HubSpot's
+        self.assertEqual(settings["hours"], 24.5)  # not the 15 HubSpot sent
+        self.assertEqual(settings["maxFundedMinutes"], 660)
 
         for plan in (base_first, base_last):
             self.assertEqual(self.session_ids(plan), {NON_FUNDED_SESSION})
@@ -1267,6 +1286,15 @@ class SegmentPayloadTests(unittest.TestCase):
         )
     )
 
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "funding.json"
+        path.write_text(json.dumps(FUNDING_RULES), encoding="utf-8")
+        env = mock.patch.dict("os.environ", {"FUNDING_RULES_FILE": str(path)})
+        env.start()
+        self.addCleanup(env.stop)
+
     def segment(self, funded, advanced, start="2026-11-01", end="2026-12-31"):
         return {"from": start, "to": end, "funded": funded, "advanced": advanced}
 
@@ -1287,8 +1315,9 @@ class SegmentPayloadTests(unittest.TestCase):
         built = engine.segment_payload(self.BASE, self.segment(True, False), is_last=False)
 
         self.assertEqual(built["funded"], "true")
-        self.assertEqual(built["fundingMethod"], "STRETCHED")
-        self.assertEqual(built["fundingHours"], 15)
+        self.assertEqual(built["fundingMethod"], "ASSISTED")
+        self.assertEqual(built["fundingHours"], 24.5)
+        self.assertEqual(built["maxFundedMinutes"], 660)
         self.assertNotIn("addon_quantity", built)
 
     def test_a_non_funded_segment_has_no_funding_settings_and_keeps_add_ons(self):
@@ -1798,6 +1827,253 @@ class CommandWiringTests(unittest.TestCase):
         for command in ("chain-cancel", "chain-resume"):
             with self.assertRaises(SystemExit):
                 main.build_parser().parse_args([command])
+
+# --------------------------------------------------------------------------- #
+# Booked-days discount (slot 9) is non-funded only
+# --------------------------------------------------------------------------- #
+BOOKED_DAYS = {
+    "discount_9_name": "Booked days",
+    "discount_9_amount": "2.5",
+    "discount_9_flag": "fixed",
+}
+
+
+def discount_titles(call):
+    return sorted(d["title"] for d in call["body"]["plan"]["planParts"][0]["discounts"])
+
+
+class BookedDaysDiscountPayloadTests(unittest.TestCase):
+    BASE = engine.clean_payload(payload(**BOOKED_DAYS))
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "funding.json"
+        path.write_text(json.dumps(FUNDING_RULES), encoding="utf-8")
+        env = mock.patch.dict("os.environ", {"FUNDING_RULES_FILE": str(path)})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def build(self, funded, advanced=False):
+        segment = {"from": "2026-11-01", "to": "2026-12-31", "funded": funded, "advanced": advanced}
+        return engine.segment_payload(self.BASE, segment, is_last=False)
+
+    def test_a_funded_segment_drops_all_three_slot_9_fields(self):
+        built = self.build(funded=True)
+
+        for part in ("name", "amount", "flag"):
+            self.assertNotIn(f"discount_9_{part}", built)
+
+    def test_a_non_funded_segment_keeps_them(self):
+        built = self.build(funded=False)
+
+        self.assertEqual(built["discount_9_name"], "Booked days")
+        self.assertEqual(built["discount_9_amount"], "2.5")
+        self.assertEqual(built["discount_9_flag"], "fixed")
+
+    def test_the_stored_base_is_untouched(self):
+        self.build(funded=True)
+
+        self.assertEqual(self.BASE["discount_9_name"], "Booked days")
+
+    def test_other_slots_are_not_touched_on_a_funded_segment(self):
+        base = {**self.BASE, "discount_1_name": "Sibling", "discount_1_amount": "0.05"}
+        segment = {"from": "2026-11-01", "to": None, "funded": True, "advanced": False}
+
+        built = engine.segment_payload(base, segment, is_last=False)
+
+        self.assertEqual(built["discount_1_name"], "Sibling")
+
+    def test_an_advanced_non_funded_segment_keeps_slots_9_and_10(self):
+        base = {**self.BASE, "advanced_discount": "40"}
+        segment = {"from": "2026-11-01", "to": None, "funded": False, "advanced": True}
+
+        built = engine.segment_payload(base, segment, is_last=False)
+
+        self.assertEqual(built["discount_9_name"], "Booked days")
+        self.assertEqual(built["discount_10_name"], "Advanced Fee Discount")
+
+    def test_an_advanced_funded_segment_keeps_only_slot_10(self):
+        base = {**self.BASE, "advanced_discount": "40"}
+        segment = {"from": "2026-11-01", "to": None, "funded": True, "advanced": True}
+
+        built = engine.segment_payload(base, segment, is_last=False)
+
+        self.assertNotIn("discount_9_name", built)
+        self.assertEqual(built["discount_10_name"], "Advanced Fee Discount")
+
+
+class BookedDaysDiscountChainTests(ChainTestCase):
+    def test_a_base_funded_base_timeline_has_it_on_plans_1_and_3_only(self):
+        self.run_all(with_funding(**BOOKED_DAYS))
+
+        first, funded, last = self.famly.commits
+        self.assertEqual(discount_titles(first), ["Booked days"])
+        self.assertEqual(discount_titles(funded), [])
+        self.assertEqual(discount_titles(last), ["Booked days"])
+
+    def test_it_is_built_in_slot_9_as_a_fixed_discount(self):
+        self.start(payload(**BOOKED_DAYS))
+        discount = self.sent(self.famly.previews[0])["planParts"][0]["discounts"][0]
+
+        self.assertEqual(discount["ordering"], 8)
+        self.assertIs(discount["isPercent"], False)
+        self.assertEqual(discount["amount"], 2.5)
+
+    def test_an_advanced_non_funded_plan_has_both_slots(self):
+        body = with_funding(
+            has_advanced_fee="true",
+            advanced_start="2027-01-01",
+            advanced_end="2027-07-31",
+            advanced_discount="40",
+            **BOOKED_DAYS,
+        )
+        self.run_all(body)
+
+        last = self.famly.commits[-1]  # base + advanced, after the funded plan
+        discounts = self.sent(last)["planParts"][0]["discounts"]
+        self.assertEqual(
+            sorted((d["ordering"], d["title"]) for d in discounts),
+            [(8, "Booked days"), (9, "Advanced Fee Discount")],
+        )
+
+    def test_a_funded_advanced_plan_has_only_the_advanced_fee(self):
+        body = with_funding(
+            "2026-11-01",
+            "2027-07-31",
+            has_advanced_fee="true",
+            advanced_start="2027-01-01",
+            advanced_end="2027-03-31",
+            advanced_discount="40",
+            **BOOKED_DAYS,
+        )
+        self.run_all(body)
+
+        funded_advanced = self.famly.commits[2]
+        self.assertEqual(discount_titles(funded_advanced), ["Advanced Fee Discount"])
+
+
+# --------------------------------------------------------------------------- #
+# Funding settings come from the server, per institution
+# --------------------------------------------------------------------------- #
+class ServerSideFundingTests(ChainTestCase):
+    def write_rules(self, rules):
+        self.funding_file.write_text(json.dumps(rules), encoding="utf-8")
+
+    def funded_settings(self, call):
+        return self.sent(call)["publicFundingSettings"]
+
+    def test_hubspots_funding_hours_are_ignored(self):
+        self.run_all(
+            with_funding(fundingHours=999, maxFundedMinutes=1, fundingMethod="WHATEVER")
+        )
+
+        settings = self.funded_settings(self.famly.commits[1])
+        self.assertEqual(settings["hours"], 24.5)
+        self.assertEqual(settings["maxFundedMinutes"], 660)
+        self.assertEqual(settings["method"], "ASSISTED")
+
+    def test_a_term_time_only_plan_uses_the_term_only_hours(self):
+        self.run_all(with_funding(termTimeOnly="true"))
+
+        self.assertEqual(self.funded_settings(self.famly.commits[1])["hours"], 33)
+
+    def test_the_entitlement_picks_the_row(self):
+        self.run_all(with_funding(funding_entitlement="15"))
+
+        self.assertEqual(self.funded_settings(self.famly.commits[1])["hours"], 12.25)
+
+    def test_every_funded_plan_gets_the_rules(self):
+        body = with_funding("2026-09-01", "2026-10-31")  # funded first plan
+        self.start(body)
+
+        self.assertEqual(self.funded_settings(self.famly.previews[0])["hours"], 24.5)
+
+    def test_a_null_entry_is_a_hard_error_before_plan_1_with_no_famly_calls(self):
+        rules = json.loads(json.dumps(FUNDING_RULES))
+        rules["institutions"][INSTITUTION]["fundedWeeklyHours"] = None
+        self.write_rules(rules)
+
+        data, status = self.start(with_funding())
+
+        self.assertEqual(status, 422)
+        self.assertEqual(
+            [e for e in data["errors"] if "funding_rules" in e],
+            [f"Plan 2 of 3: funding_rules: no fundedWeeklyHours for {INSTITUTION} > 30 > all_year_round"],
+        )
+        self.assertEqual(self.famly.posts, [])
+        self.assertEqual(self.famly.gets, 0)
+        self.assertEqual(self.previews_posted, [])
+        self.assertIsNone(chains.find_active(CHILD))
+
+    def test_the_error_for_term_time_only_names_term_only(self):
+        rules = json.loads(json.dumps(FUNDING_RULES))
+        del rules["institutions"][INSTITUTION]["fundedWeeklyHours"]["30"]["term_only"]
+        self.write_rules(rules)
+
+        data, status = self.start(with_funding(termTimeOnly="true"))
+
+        self.assertEqual(status, 422)
+        self.assertTrue(
+            any(f"{INSTITUTION} > 30 > term_only" in e for e in data["errors"]), data["errors"]
+        )
+
+    def test_a_site_missing_from_the_file_never_borrows_another(self):
+        rules = json.loads(json.dumps(FUNDING_RULES))
+        rules["institutions"] = {"HDOTHER": rules["institutions"][INSTITUTION]}
+        self.write_rules(rules)
+
+        data, status = self.start(with_funding())
+
+        self.assertEqual(status, 422)
+        self.assertTrue(any(f"no institution {INSTITUTION}" in e for e in data["errors"]))
+        self.assertEqual(self.famly.posts, [])
+
+    def test_a_missing_entitlement_is_a_hard_error(self):
+        body = with_funding()
+        del body["funding_entitlement"]
+
+        data, status = self.start(body)
+
+        self.assertEqual(status, 422)
+        self.assertTrue(any("funding_entitlement" in e for e in data["errors"]))
+        self.assertEqual(self.famly.posts, [])
+
+    def test_a_timeline_with_no_funded_plan_needs_no_funding_rules(self):
+        self.funding_file.unlink()
+
+        data, status = self.start(payload())
+
+        self.assertEqual(status, 200)
+
+    def test_the_gap_is_reported_once_not_once_per_funded_plan(self):
+        rules = json.loads(json.dumps(FUNDING_RULES))
+        rules["institutions"][INSTITUTION]["fundedWeeklyHours"] = None
+        self.write_rules(rules)
+        body = with_funding(
+            "2026-09-01", "2026-10-31", has_advanced_fee="true",
+            advanced_start="2026-11-01", advanced_end="2026-11-30", advanced_discount="40",
+        )
+
+        data, _ = self.start(body)
+
+        self.assertEqual(len([e for e in data["errors"] if "funding_rules" in e]), 1)
+
+    def test_a_rules_edit_between_plans_takes_effect_without_a_restart(self):
+        self.start(with_funding())  # plan 2 is the funded one, built later
+
+        rules = json.loads(json.dumps(FUNDING_RULES))
+        rules["institutions"][INSTITUTION]["fundedWeeklyHours"]["30"]["all_year_round"] = 26
+        self.write_rules(rules)
+        self.approve()  # plan 1 commits; plan 2 is now built and previewed
+
+        self.assertEqual(self.funded_settings(self.famly.previews[-1])["hours"], 26)
+
+    def test_funding_entitlement_is_an_allowed_stored_field(self):
+        data, _ = self.start(with_funding())
+
+        self.assertEqual(self.chain(data).payload["funding_entitlement"], "30")
+        self.assertIn("funding_entitlement", engine.ALLOWED_FIELDS)
 
 
 if __name__ == "__main__":
