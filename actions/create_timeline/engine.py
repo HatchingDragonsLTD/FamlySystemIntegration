@@ -16,10 +16,18 @@ The pieces, in the order a chain lives:
                           tell Slack exactly what exists
 
 HOW THE PLANS JOIN. Every plan except the last is created with NO end date, and
-Famly trims the previous plan's end to the day before the new plan's start
-(confirmed by manual test). Only the final plan gets an explicit end: the leave
-date, if there is one. That is why a stopped chain always leaves its last
+Famly sets the previous plan's `to` EQUAL to the new plan's `from`: Famly's end
+date is EXCLUSIVE (the first day NOT covered), so "Plan 1 to 2026-09-01" ends
+the day before 2026-09-01 and meets Plan 2 starting that day with no gap and no
+overlap. Confirmed by a real run. Only the final plan gets an explicit end: the
+leave date, if there is one. That is why a stopped chain always leaves its last
 committed plan open-ended, and why every stop message says so.
+
+TWO DATE CONVENTIONS. The segments (`plan_write/timeline.py`), the chain record
+and the Slack headings are INCLUSIVE: a segment "2026-09-01 to 2026-10-31"
+includes 31 October. Famly's own `to` is exclusive. The only place the two meet
+is the read-back check below, which compares Famly's `to` with the next
+segment's start.
 
 THE COMMIT PATH IS UNTOUCHED. Nothing here writes to Famly. Every plan is
 committed by the ordinary Slack Approve click (`plan_write/approval.py`) with
@@ -31,7 +39,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field
-from datetime import date, timedelta
+from datetime import date
 
 from actions.plan_write import (
     hubspot_flatten,
@@ -52,7 +60,7 @@ PLAN_VERSION = int(os.environ.get("INTAKE_PLAN_VERSION", "3"))
 # After a commit the plan is read back. Famly's read model can lag the write, so
 # a plan that is not there YET is looked for again -- this many more times, this
 # many seconds apart -- before the chain stops. Only "not found" is retried; a
-# failed read, a bad trim or a wrong latest plan stop the chain at once.
+# failed read, a bad join or a wrong latest plan stop the chain at once.
 READBACK_RETRIES = 3
 READBACK_DELAY_SECONDS = 5
 _sleep = time.sleep
@@ -604,8 +612,9 @@ def continue_after_commit(chain_id: str, index: int) -> None:
     Reads the child's plans back (ONE read, no retry) and checks that:
 
       * the plan just committed is there;
-      * if there is a previous plan, its `to` is the day before this plan's
-        `from` -- the trim Famly is expected to do;
+      * if there is a previous plan, its `to` EQUALS this plan's `from` --
+        Famly's end date is exclusive, so that is the trim it does. Strict: any
+        other value, the day before included, means a gap or an overlap;
       * this plan is the child's latest-starting plan, which is what the NEXT
         segment will name as its `oldPlanId`.
 
@@ -666,14 +675,15 @@ def _verify_and_advance(chain: chains.Chain, index: int) -> None:
             )
             return
 
-        this_start = _day(this.from_)
-        expected = this_start - timedelta(days=1) if this_start else None
-        if expected is None or _day(previous.to) != expected:
-            wanted = f" (expected to = {expected.isoformat()})" if expected else ""
+        expected = _day(this.from_)
+        found = _day(previous.to)
+        if expected is None or found != expected:
             stop_chain(
                 chain.chain_id,
-                f"after {name} was committed, Famly did not end the previous plan "
-                f"on the day before it starts{wanted}.",
+                f"after {name} was committed, the previous plan does not meet it "
+                f"(a gap or an overlap). Famly's end date is exclusive: expected "
+                f"previous plan to = {expected.isoformat() if expected else 'unknown'}, "
+                f"found {previous.to or 'open-ended'}.",
                 extra_lines=[
                     _plan_description(chain, index - 1, previous),
                     _plan_description(chain, index, this),
