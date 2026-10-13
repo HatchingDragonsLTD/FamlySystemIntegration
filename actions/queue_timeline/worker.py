@@ -288,6 +288,11 @@ def _prepare(job: jobs.Job, index: int, old_plan_id, *, store_job: bool):
     payload = engine.segment_payload(
         job.payload, job.segments[index], is_last=index == job.last_index
     )
+    # A request without a site_code gets one from its institution -- the codes
+    # are the same -- rather than being held for the "no site" warning. An
+    # institution that is not a known site still raises that warning.
+    if not str(payload.get("site_code") or "").strip() and job.institution:
+        payload["site_code"] = job.institution
     prepared = retrying(
         lambda: plan_write_web.prepare_preview(
             payload,

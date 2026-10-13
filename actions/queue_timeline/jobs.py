@@ -9,7 +9,7 @@ A job row:
 
     job_id       uuid4
     job_key      sha256 of child id + start date + a hash of the allow-listed
-                 payload: the idempotency key (UNIQUE)
+                 payload: the idempotency key (unique among live jobs)
     child_id
     payload      the allow-listed request (no names -- see engine.ALLOWED_FIELDS)
     segments     [{from, to, funded, advanced, plan_id, committed_at, dry_run}]
@@ -22,8 +22,10 @@ A job row:
 ENQUEUEING is a single atomic INSERT, and the database -- not a check made first --
 decides races (see the two unique indexes in preview_store.py):
 
-    * the idempotency key is UNIQUE: an identical request is the same job, in
-      whatever state it has reached (`already_queued`);
+    * the idempotency key is unique among LIVE jobs (queued, running, held, done):
+      an identical request while one is active or finished is the same job
+      (`already_queued`). A failed or cancelled job does not hold its key, so
+      the same request can be sent again and makes a new job;
     * a child can have ONE active job (queued, running or held): a different
       request for a child that has one is refused (`active_conflict`).
 
@@ -153,9 +155,9 @@ def create(child_id: str, start: str, payload: dict, segments: list[dict]) -> En
 
     No read comes first: the INSERT either succeeds or violates a unique index.
 
-      * the idempotency-key index  -> the existing job, outcome ALREADY_QUEUED
-        (checked first: an identical request is the same job whatever else is
-        true);
+      * the idempotency-key index  -> the existing LIVE job, outcome
+        ALREADY_QUEUED (checked first: an identical request is the same job
+        whatever else is true);
       * the one-active-job-per-child index -> the child's active job, outcome
         ACTIVE_CONFLICT -- nothing was created.
 
@@ -180,7 +182,7 @@ def create(child_id: str, start: str, payload: dict, segments: list[dict]) -> En
                      STATUS_QUEUED, now),
                 )
         except sqlite3.IntegrityError:
-            existing = find_by_key(key)
+            existing = find_live_by_key(key)
             if existing is not None:
                 return Enqueued(existing, ALREADY_QUEUED)
             active = find_active_for_child(child_id)
@@ -202,10 +204,16 @@ def get(job_id: str) -> Job | None:
     return _row_to_job(row) if row is not None else None
 
 
-def find_by_key(key: str) -> Job | None:
-    """The job for an idempotency key, in whatever state it is in."""
+def find_live_by_key(key: str) -> Job | None:
+    """The queued, running, held or done job for an idempotency key, if any.
+
+    A failed or cancelled job is not returned: it no longer holds its key.
+    """
     with preview_store.open_store() as connection:
-        row = connection.execute("SELECT * FROM jobs WHERE job_key = ?", (key,)).fetchone()
+        row = connection.execute(
+            "SELECT * FROM jobs WHERE job_key = ? AND status IN (?, ?, ?, ?)",
+            (key, STATUS_QUEUED, STATUS_RUNNING, STATUS_HELD, STATUS_DONE),
+        ).fetchone()
     return _row_to_job(row) if row is not None else None
 
 

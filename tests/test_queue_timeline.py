@@ -197,14 +197,43 @@ class QueueRequestTests(QueueTestCase):
             jobs.job_key("other-child", "2026-09-01", job.payload),
         )
 
-    def test_an_identical_request_finds_the_job_whatever_became_of_it(self):
-        # The idempotency key is UNIQUE outright: a cancelled, failed or finished
-        # job is still THE job for that request. To ask again, change the request.
-        for status in (jobs.STATUS_DONE, jobs.STATUS_CANCELLED, jobs.STATUS_FAILED):
+    def test_a_failed_job_can_be_resubmitted_unchanged_and_gets_a_new_job(self):
+        first = self.queue()
+        jobs.set_status(first["job_id"], jobs.STATUS_FAILED, "it broke")
+
+        again = self.queue()
+
+        self.assertNotEqual(again["job_id"], first["job_id"])
+        self.assertFalse(again["already_queued"])
+        self.assertEqual(self.job(again).status, jobs.STATUS_QUEUED)
+        self.assertEqual(self.job(first).status, jobs.STATUS_FAILED)  # the record stays
+        self.assertEqual(self.job(first).job_key, self.job(again).job_key)
+
+    def test_a_cancelled_job_can_be_resubmitted_unchanged_and_gets_a_new_job(self):
+        first = self.queue()
+        worker.cancel(first["job_id"])
+
+        again = self.queue()
+
+        self.assertNotEqual(again["job_id"], first["job_id"])
+        self.assertFalse(again["already_queued"])
+        self.assertEqual(self.job(first).status, jobs.STATUS_CANCELLED)
+
+    def test_a_done_job_returns_already_queued(self):
+        first = self.queue()
+        jobs.set_status(first["job_id"], jobs.STATUS_DONE)
+
+        again = self.queue()
+
+        self.assertEqual(again["job_id"], first["job_id"])
+        self.assertTrue(again["already_queued"])
+        self.assertEqual(len(jobs.list_jobs()), 1)
+
+    def test_a_queued_running_or_held_job_returns_already_queued(self):
+        for status in (jobs.STATUS_QUEUED, jobs.STATUS_RUNNING, jobs.STATUS_HELD):
             with self.subTest(status=status):
-                jobs.state_set("x", None)
                 first = self.queue()
-                jobs.set_status(first["job_id"], status, "ended")
+                jobs.set_status(first["job_id"], status, "x")
 
                 again = self.queue()
 
@@ -212,6 +241,33 @@ class QueueRequestTests(QueueTestCase):
                 self.assertTrue(again["already_queued"])
                 with preview_store.open_store() as connection:
                     connection.execute("DELETE FROM jobs")
+
+    def test_a_resubmission_can_happen_repeatedly(self):
+        for attempt in range(3):
+            data = self.queue()
+            self.assertFalse(data["already_queued"], attempt)
+            jobs.set_status(data["job_id"], jobs.STATUS_FAILED, "again")
+
+        self.assertEqual(len(jobs.list_jobs(jobs.STATUS_FAILED)), 3)
+
+    def test_the_resubmitted_job_runs(self):
+        first = self.queue()
+        jobs.set_status(first["job_id"], jobs.STATUS_FAILED, "it broke")
+        again = self.queue()
+
+        self.run_all()
+
+        self.assertEqual(self.job(again).status, jobs.STATUS_DONE)
+        self.assertEqual(len(self.famly.commits), 3)
+
+    def test_a_resubmission_is_still_one_active_job_per_child(self):
+        first = self.queue()
+        jobs.set_status(first["job_id"], jobs.STATUS_FAILED, "it broke")
+        self.queue()
+
+        data, status = queue_web.handle(self.body(addon_quantity="1"))
+
+        self.assertEqual(status, 409)
 
     def test_the_stored_payload_is_allow_listed_with_no_names(self):
         data = self.queue(self.body(child_name="Alex Smith", parent_name="Pat Smith"))
@@ -637,7 +693,7 @@ class CleanCheckTests(QueueTestCase):
         self.assertEqual(len(self.famly.commits), 0)
 
     def test_a_flattener_warning_holds_it(self):
-        self.queue(harness.payload())  # no site_code: the flattener warns
+        self.queue(harness.with_funding(site_code="NOT-A-SITE"))  # the flattener warns
         self.run_all()
 
         self.held_for("warning:")
@@ -1434,15 +1490,41 @@ class ConcurrentEnqueueTests(QueueTestCase):
                     (first.job.job_key,),
                 )
 
-    def test_the_indexes_exist_and_the_old_one_is_gone(self):
+    def test_the_indexes_exist_and_the_old_ones_are_gone(self):
         jobs.state_get("x")
         with preview_store.open_store() as connection:
             names = {r["name"] for r in connection.execute("SELECT name FROM sqlite_master WHERE type='index'")}
-        self.assertIn("jobs_job_key_unique", names)
+        self.assertIn("jobs_live_job_key", names)
         self.assertIn("jobs_one_active_per_child", names)
         self.assertNotIn("jobs_one_live_per_key", names)
+        self.assertNotIn("jobs_job_key_unique", names)
 
-    def test_an_older_store_is_migrated_to_the_new_indexes(self):
+    def test_the_key_index_is_partial_over_the_live_statuses(self):
+        with preview_store.open_store() as connection:
+            sql = connection.execute(
+                "SELECT sql FROM sqlite_master WHERE name = 'jobs_live_job_key'"
+            ).fetchone()["sql"]
+        self.assertIn("UNIQUE", sql.upper())
+        for status in ("queued", "running", "held", "done"):
+            self.assertIn(f"'{status}'", sql)
+        self.assertNotIn("'failed'", sql)
+        self.assertNotIn("'cancelled'", sql)
+
+    def test_the_database_lets_a_failed_or_cancelled_duplicate_in(self):
+        with preview_store.open_store() as connection:
+            insert = (
+                "INSERT INTO jobs (job_id, job_key, child_id, payload, segments, next_index, "
+                "status, created_at, updated_at) VALUES (?, 'k', ?, '{}', '[]', 0, ?, 't', 't')"
+            )
+            connection.execute(insert, ("a", "c1", "failed"))
+            connection.execute(insert, ("b", "c2", "cancelled"))
+            connection.execute(insert, ("c", "c3", "failed"))
+            connection.execute(insert, ("d", "c4", "done"))  # the one live holder of 'k'
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute(insert, ("e", "c5", "queued"))
+
+    def migrated_names(self, old_index_sql, old_name):
+        """Build a store carrying an OLDER key index, open it, list its indexes."""
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "old.sqlite3"
             connection = sqlite3.connect(path)
@@ -1452,21 +1534,39 @@ class ConcurrentEnqueueTests(QueueTestCase):
                 "status TEXT NOT NULL, detail TEXT, preview_id TEXT, digest_sent INTEGER NOT NULL DEFAULT 0, "
                 "created_at TEXT NOT NULL, updated_at TEXT NOT NULL)"
             )
-            connection.execute(
-                "CREATE UNIQUE INDEX jobs_one_live_per_key ON jobs (job_key) "
-                "WHERE status IN ('queued', 'running', 'held', 'done')"
-            )
+            connection.execute(old_index_sql)
             connection.commit()
             connection.close()
 
             with mock.patch.dict("os.environ", {"PREVIEW_STORE_PATH": str(path)}):
                 segments = [{"from": "2026-09-01", "to": None, "funded": False, "advanced": False}]
-                self.assertEqual(jobs.create("c", "2026-09-01", {}, segments).outcome, jobs.CREATED)
+                first = jobs.create("c", "2026-09-01", {}, segments)
+                self.assertEqual(first.outcome, jobs.CREATED)
+                jobs.set_status(first.job.job_id, jobs.STATUS_FAILED, "x")
+                again = jobs.create("c", "2026-09-01", {}, segments)  # the new rule
+                self.assertEqual(again.outcome, jobs.CREATED)
                 with preview_store.open_store() as store:
-                    names = {r["name"] for r in store.execute("SELECT name FROM sqlite_master WHERE type='index'")}
+                    return {r["name"] for r in store.execute("SELECT name FROM sqlite_master WHERE type='index'")}
+
+    def test_a_store_with_the_first_live_key_index_is_migrated(self):
+        names = self.migrated_names(
+            "CREATE UNIQUE INDEX jobs_one_live_per_key ON jobs (job_key) "
+            "WHERE status IN ('queued', 'running', 'held', 'done')",
+            "jobs_one_live_per_key",
+        )
 
         self.assertNotIn("jobs_one_live_per_key", names)
-        self.assertIn("jobs_job_key_unique", names)
+        self.assertIn("jobs_live_job_key", names)
+
+    def test_a_store_with_the_outright_unique_key_index_is_migrated(self):
+        # The previous version: UNIQUE on the key regardless of status.
+        names = self.migrated_names(
+            "CREATE UNIQUE INDEX jobs_job_key_unique ON jobs (job_key)", "jobs_job_key_unique"
+        )
+
+        self.assertNotIn("jobs_job_key_unique", names)
+        self.assertIn("jobs_live_job_key", names)
+        self.assertIn("jobs_one_active_per_child", names)
 
     def test_ten_different_children_enqueue_concurrently_and_are_processed_in_order(self):
         children = [child_id(n) for n in range(10)]
@@ -1551,6 +1651,69 @@ class ConcurrentEnqueueTests(QueueTestCase):
         with preview_store.open_store() as connection:
             self.assertEqual(connection.execute("PRAGMA journal_mode").fetchone()[0].lower(), "wal")
             self.assertGreaterEqual(connection.execute("PRAGMA busy_timeout").fetchone()[0], 10000)
+
+
+class SiteCodeFromInstitutionTests(QueueTestCase):
+    def site_codes_stored(self):
+        with preview_store.open_store() as connection:
+            return {r["site_code"] for r in connection.execute("SELECT site_code FROM previews")}
+
+    def no_site(self, **overrides):
+        return harness.with_funding(**overrides)  # no site_code at all
+
+    def test_a_missing_site_code_is_taken_from_the_institution_not_held(self):
+        data = self.queue(self.no_site())
+        self.run_all()
+
+        self.assertEqual(self.job(data).status, jobs.STATUS_DONE)
+        self.assertEqual(len(self.famly.commits), 3)
+        self.assertEqual(self.site_codes_stored(), {harness.INSTITUTION})
+        self.assertEqual(self.previews_posted, [])  # nothing needed a human
+
+    def test_a_blank_site_code_is_treated_as_missing(self):
+        data = self.queue(self.no_site(site_code="  "))
+        self.run_all()
+
+        self.assertEqual(self.job(data).status, jobs.STATUS_DONE)
+
+    def test_a_site_code_that_is_sent_is_left_alone(self):
+        data = self.queue(self.no_site(site_code="HDCW"))
+        self.run_all()
+
+        self.assertEqual(self.job(data).status, jobs.STATUS_DONE)
+        self.assertEqual(self.site_codes_stored(), {"HDCW"})
+
+    def test_an_institution_that_is_not_a_known_site_is_still_held(self):
+        site_file = Path(self._tmp.name) / "catalogue.json"
+        site_file.write_text(json.dumps({"sites": {"HDOTHER": {"label": "Other"}}}), encoding="utf-8")
+        with mock.patch.dict("os.environ", {"FAMLY_CATALOGUE_FILE": str(site_file)}):
+            data = self.queue(self.no_site())
+            self.run_all()
+
+        job = self.job(data)
+        self.assertEqual(job.status, jobs.STATUS_HELD)
+        self.assertIn("warning:", job.detail)
+        self.assertEqual(self.famly.commits, [])
+
+    def test_the_stored_payload_is_not_rewritten(self):
+        data = self.queue(self.no_site())
+
+        self.assertNotIn("site_code", self.job(data).payload)
+
+    def test_a_request_with_and_without_site_code_are_different_requests(self):
+        with_site = self.queue(self.body())
+        worker.cancel(with_site["job_id"])
+        without = self.queue(self.no_site())
+
+        self.assertFalse(without["already_queued"])
+        self.assertNotEqual(with_site["job_id"], without["job_id"])
+
+    def test_the_dry_run_uses_it_too(self):
+        with mock.patch.dict("os.environ", {"QUEUE_MODE": "dry_run"}):
+            data = self.queue(self.no_site())
+            self.run_all()
+
+        self.assertTrue(all(s["dry_run"]["clean"] for s in self.job(data).segments))
 
 
 if __name__ == "__main__":
