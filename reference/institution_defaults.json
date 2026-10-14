@@ -97,7 +97,9 @@
       },
       "addonProducts": {
         "mealsProductId": "2ac668e6-2de1-4fa6-8f92-24aed2ce0d6b",
-        "activitiesProductId": "5284ce7c-927c-413f-a175-c2c410072ba5"
+        "activitiesProductId": "5284ce7c-927c-413f-a175-c2c410072ba5",
+        "halfMealsProductId": "01063efa-7ee2-4e33-812c-b40270295b2e",
+        "halfActivitiesProductId": "8131def1-d114-4b4e-9189-976903398654"
       }
     }
   }

@@ -63,7 +63,19 @@
         "2ea02335-76ee-4bcd-af95-e09050ef3141": "(F) Morning",
         "44e887a1-3349-46ec-be44-d33ced6e6f9f": "Afternoon",
         "1ffb7cc0-2571-4e94-8f9e-fa8d0697df9b": "Full Day",
-        "e745450c-67c1-40bb-99dc-e9c5cd0e8f1a": "Morning"
+        "e745450c-67c1-40bb-99dc-e9c5cd0e8f1a": "Morning",
+        "b7ced102-f8e5-4803-adc2-05f5d973fecf": "(F) Afternoon",
+        "ffeae87c-881e-4c23-a386-5742ba4a2e63": "(F) Full Day",
+        "352c00a7-9d93-4117-b0b6-5ae9147b2dbb": "(F) Morning",
+        "516612ce-3cf6-42bb-a128-0feb73cee815": "(FNA) Afternoon",
+        "fe2e4b22-aff9-4c05-ae64-c33edcfa19d1": "(FNA) Full Day",
+        "0cd9b685-88d3-4360-ae03-ab66cbef450c": "(FNA) Morning",
+        "1ff532a8-fba3-4a43-8ee2-b79c479022d5": "(FNE) Afternoon",
+        "c97e0a02-4105-4414-8256-b25c9f07b9c5": "(FNE) Full Day",
+        "ecb73905-19d7-4f30-8f6d-c128f758ee36": "(FNE) Morning",
+        "8404eb30-8378-45f9-bc62-1ce65bfeafaa": "(FNM) Afternoon",
+        "b0c493ba-8f84-4656-8269-a76036118665": "(FNM) Full Day",
+        "3dd24328-f963-480c-9109-bed4057b0bba": "(FNM) Morning"
       }
     }
   }
