@@ -11,9 +11,19 @@
 # `ChildCursor`. `siteIds` is REQUIRED and accepts every institutionId this
 # backfill should cover in one call -- confirmed live that passing several at
 # once returns every matching child across all of them, not just the first.
-query UrnLookupChildren($siteIds: [SiteId!]!, $next: ChildCursor) {
+#
+# TIME RANGE (found 2026-10-14): `listBySiteIds` lists ONLY children enrolled
+# today unless `timeRange` is given ("by default neither past nor future
+# children are listed"). A child who has left, or who starts later, was simply
+# absent from this roster, so their urn never matched. `timeRange` is passed
+# from pull_roster's ROSTER_TIME_RANGE, the one place the range is defined.
+query UrnLookupChildren(
+  $siteIds: [SiteId!]!
+  $next: ChildCursor
+  $timeRange: NonEmptyLocalDateRangeInput
+) {
   children {
-    listBySiteIds(siteIds: $siteIds, nextToken: $next) {
+    listBySiteIds(siteIds: $siteIds, nextToken: $next, timeRange: $timeRange) {
       result {
         id
         externalId
