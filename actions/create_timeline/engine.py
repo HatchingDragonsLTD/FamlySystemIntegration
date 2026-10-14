@@ -125,6 +125,12 @@ TIMELINE_FIELDS = (
     "advanced_start",
     "advanced_end",
     "advanced_discount",
+    # The deal is fully funded: a funded plan may legitimately price at 0.
+    # Read by the QUEUE (see queue_timeline.worker.clean_reasons) to decide
+    # whether a zero estimate is acceptable; it is NOT plan content, so it
+    # lives here and is stripped from every per-segment payload -- the
+    # flattener never sees it and Famly is never sent it.
+    "fully_funded",
 )
 
 ALLOWED_FIELDS = frozenset(_PLAN_FIELDS + _DISCOUNT_FIELDS + TIMELINE_FIELDS)
