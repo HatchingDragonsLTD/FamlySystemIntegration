@@ -8,7 +8,19 @@
         "15": {"all_year_round": 12.29411765, "term_only": 16.5}
       }
     },
-    "HDCITY": {"maxFundedMinutes": 660, "fundedWeeklyHours": null},
-    "HDWEST": {"maxFundedMinutes": 600, "fundedWeeklyHours": null}
+    "HDCITY": {
+      "maxFundedMinutes": 630, 
+      "fundedWeeklyHours": {
+        "30": {"all_year_round": 23.47058824, "term_only": 31.5},
+        "15": {"all_year_round": 11.73529412, "term_only": 15.75}
+      }
+    },
+    "HDWEST": {
+      "maxFundedMinutes": 600, 
+      "fundedWeeklyHours": {
+        "30": {"all_year_round": 22.35294118, "term_only": 30},
+        "15": {"all_year_round": 11.17647059, "term_only": 15}
+      }
+    }
   }
 }
