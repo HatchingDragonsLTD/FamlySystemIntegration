@@ -56,24 +56,24 @@
     "HDWEST": {
       "funded": {
         "with_meals_and_activities": {
-          "morning": "2ea02335-76ee-4bcd-af95-e09050ef3141",
-          "afternoon": "e6b22db3-7a47-47bd-8baa-50ea0839cc18",
-          "full_day": "0636fb46-687f-4833-a7d3-70e30ce0f8e2"
+          "morning": "352c00a7-9d93-4117-b0b6-5ae9147b2dbb",
+          "afternoon": "b7ced102-f8e5-4803-adc2-05f5d973fecf",
+          "full_day": "ffeae87c-881e-4c23-a386-5742ba4a2e63"
         },
         "no_meals": {
-          "morning": "",
-          "afternoon": "",
-          "full_day": ""
+          "morning": "3dd24328-f963-480c-9109-bed4057b0bba",
+          "afternoon": "8404eb30-8378-45f9-bc62-1ce65bfeafaa",
+          "full_day": "b0c493ba-8f84-4656-8269-a76036118665"
         },
         "no_activities": {
-          "morning": "",
-          "afternoon": "",
-          "full_day": ""
+          "morning": "0cd9b685-88d3-4360-ae03-ab66cbef450c",
+          "afternoon": "516612ce-3cf6-42bb-a128-0feb73cee815",
+          "full_day": "fe2e4b22-aff9-4c05-ae64-c33edcfa19d1"
         },
         "neither": {
-          "morning": "",
-          "afternoon": "",
-          "full_day": ""
+          "morning": "ecb73905-19d7-4f30-8f6d-c128f758ee36",
+          "afternoon": "1ff532a8-fba3-4a43-8ee2-b79c479022d5",
+          "full_day": "c97e0a02-4105-4414-8256-b25c9f07b9c5"
         }
       },
       "non_funded": {
