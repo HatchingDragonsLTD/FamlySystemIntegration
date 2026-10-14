@@ -43,7 +43,9 @@
       },
       "addonProducts": {
         "mealsProductId": "3b128632-ef11-4f8b-8b44-93ea00e00dd6",
-        "activitiesProductId": "e485a0fc-b659-4be9-92e6-4e824d588193"
+        "activitiesProductId": "e485a0fc-b659-4be9-92e6-4e824d588193",
+        "halfMealsProductId": "e5a75cc0-223d-47f9-bc4e-6d1e9b30ccc5",
+        "halfActivitiesProductId": "a10b4bb3-fb30-4848-a0a3-585e5ab9f5c9"
       }
     },
     "HDCW": {

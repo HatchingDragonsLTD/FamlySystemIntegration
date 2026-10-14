@@ -1,0 +1,51 @@
+{
+  "_comment": [
+    "Product ids per institution -- STUBBED, not yet populated.",
+    "",
+    "`python main.py pull-products` (and the combined `pull-references` weekly",
+    "run) will fill this in once actions/pull_products/ has a real query wired",
+    "up -- see actions/pull_products/runner.py's module docstring for status.",
+    "Running it today is safe but writes nothing: every institution fails with",
+    "a clear 'not yet implemented' reason, reported rather than guessed at.",
+    "",
+    "Intended structure once implemented: institutions.<site_code>.products.",
+    "<product_id> -> title, matching reference/groups_catalogue.json's shape.",
+    "<site_code> is a key from reference/catalogue.json's `sites` section.",
+    "",
+    "This is separate from reference/catalogue.json's own flat `products`",
+    "section, which is a hand-maintained, DISPLAY-ONLY id -> name map used only",
+    "to label the Slack plan-preview summary and is not institution-keyed.",
+    "",
+    "Point PRODUCTS_CATALOGUE_FILE elsewhere to override the path."
+  ],
+  "institutions": {
+    "HDCITY": {
+      "products": {
+        "68ecac92-9745-4c5f-a2e1-fdcb10adc27b": "(F) Educational Activities & Extras",
+        "3b128632-ef11-4f8b-8b44-93ea00e00dd6": "Meals & Snacks",
+        "c324a1c5-5514-4aaa-8bd1-90e95587cc9c": "(F) Meals & Snacks",
+        "e485a0fc-b659-4be9-92e6-4e824d588193": "Educational Activities & Extras"
+      }
+    },
+    "HDCW": {
+      "products": {
+        "7de23b4b-699a-4847-9ca6-6928d70886fb": "Educational Activities & Extras",
+        "efc8f065-7342-4e4f-8ab0-c9d81ec587d1": "(F) Educational Activities & Extras",
+        "8a95de4f-f080-4063-8d49-3b03fe95644c": "Meals & Snacks",
+        "69ff7b03-2743-4fdb-98fb-dda081e42784": "(F) Meals & Snacks",
+        "da99c7be-7f4b-475d-b650-27a363a03fd3": "(1/2) Educational Activities & Extras",
+        "7561cc9e-e0cb-41b5-8a83-2ce56715f600": "(1/2) Meals & Snacks",
+        "9461b1b3-e1f9-4547-8755-cfba16c093ce": "(1/2,F) Educational Activities & Extras",
+        "3ada3374-27a0-445c-9985-fe0263012c6b": "(1/2,F) Meals & Snacks"
+      }
+    },
+    "HDWEST": {
+      "products": {
+        "2ac668e6-2de1-4fa6-8f92-24aed2ce0d6b": "Meals & Snacks",
+        "5864230e-9177-4aa7-bb24-7ab76cff2042": "(F) Educational Activities & Extras",
+        "5284ce7c-927c-413f-a175-c2c410072ba5": "Educational Activities & Extras",
+        "01e3f36c-216f-44e7-805f-13b154082a47": "(F) Meals & Snacks"
+      }
+    }
+  }
+}
