@@ -66,9 +66,73 @@ BILL_PAYERS_OPERATION_NAME = "PullRosterBillPayers"
 DEFAULT_PUBLIC_GRAPHQL_URL = "https://famlyapi.famly.co/v1/graphql"
 
 
+# THE WHOLE ROSTER, NOT JUST WHO IS ENROLLED TODAY.
+#
+# `children.listBySiteIds` returns only children enrolled today unless it is
+# given a `timeRange` -- its own description says "by default neither past nor
+# future children are listed". Found 2026-10-14, when nine children who exist
+# in Famly with their urn in `externalId` could not be resolved: all of them
+# were past leavers or future starters. Live, the default call returned 168
+# children and this range returns 292 (106 past, 18 future), with nothing from
+# the default set lost.
+#
+# The documented example for "all past and future children" is this exact
+# range. `from` is required by the API, `to` is optional. It is deliberately
+# generous: every child ever enrolled, and every child who will start.
+#
+# DEFINED HERE, ONCE. `actions/urn_lookup` imports it, so the two roster
+# builders cannot drift apart again.
+ROSTER_TIME_RANGE = {"from": "2000-01-01", "to": "2100-01-01"}
+
+
 def public_graphql_url() -> str:
     override = os.environ.get("FAMLY_PUBLIC_GRAPHQL_URL", "").strip()
     return override or DEFAULT_PUBLIC_GRAPHQL_URL
+
+
+def _fill_blanks(kept: Any, duplicate: Any) -> Any:
+    """`kept`, with any empty field filled from `duplicate`.
+
+    Only blanks (None or "") are filled, so what was already known is never
+    overwritten -- a duplicate can add information but never replace it.
+    """
+    if not dataclasses.is_dataclass(kept):
+        return kept
+    updates = {}
+    for item in dataclasses.fields(kept):
+        current = getattr(kept, item.name)
+        other = getattr(duplicate, item.name, None)
+        if current in (None, "") and other not in (None, ""):
+            updates[item.name] = other
+    return dataclasses.replace(kept, **updates) if updates else kept
+
+
+def merge_by_id(rows: list[Any]) -> list[Any]:
+    """Rows merged by child `id`: one row per child, in first-seen order.
+
+    The same child can arrive more than once -- a page boundary that repeats a
+    row, a child related to two sites that were asked for together -- and a
+    roster with duplicates would make a urn match "twice" and be reported as a
+    data problem it is not. The first occurrence is kept; a later duplicate
+    only fills fields the first left empty.
+
+    A row with no id cannot be matched to another, so it is kept as it is
+    rather than guessed at.
+    """
+    slots: list[Any] = []
+    position: dict[str, int] = {}
+
+    for row in rows:
+        row_id = getattr(row, "id", None)
+        if not row_id:
+            slots.append(row)
+        elif row_id in position:
+            slots[position[row_id]] = _fill_blanks(slots[position[row_id]], row)
+        else:
+            position[row_id] = len(slots)
+            slots.append(row)
+
+    return slots
 
 
 def _public_client() -> GraphQLClient:
@@ -113,7 +177,12 @@ def fetch_children_and_contacts(
     """Every child (and every one of their contacts) across `site_ids`.
 
     Contacts are de-duplicated by id: the same contact (e.g. a parent with two
-    children at the same site) would otherwise appear once per child.
+    children at the same site) would otherwise appear once per child. So are
+    children (see `merge_by_id`).
+
+    PAST AND FUTURE CHILDREN ARE INCLUDED (see ROSTER_TIME_RANGE). The cache
+    therefore also holds the contacts of children who have left or not yet
+    started.
 
     Raises:
         GraphQLError / GraphQLHTTPError: propagated deliberately, uncaught.
@@ -127,7 +196,11 @@ def fetch_children_and_contacts(
     while True:
         body = client.execute(
             query_path=CHILDREN_QUERY_PATH,
-            variables={"siteIds": site_ids, "next": cursor},
+            variables={
+                "siteIds": site_ids,
+                "next": cursor,
+                "timeRange": dict(ROSTER_TIME_RANGE),
+            },
             operation_name=CHILDREN_OPERATION_NAME,
         )
 
@@ -152,7 +225,7 @@ def fetch_children_and_contacts(
         if not cursor:
             break
 
-    return children, list(contacts_by_id.values())
+    return merge_by_id(children), list(contacts_by_id.values())
 
 
 def _parse_bill_payer(node: Any) -> store.BillPayerRow | None:

@@ -353,5 +353,196 @@ class HandleTests(UrnLookupTestCase):
         self.assertEqual(status, 422)
 
 
+# --------------------------------------------------------------------------- #
+# The roster must include PAST and FUTURE children.
+#
+# Famly's `children.listBySiteIds` returns only children enrolled TODAY unless
+# it is given a `timeRange`. Nine children who exist in Famly with their urn in
+# `externalId` could not be resolved because all nine were leavers or future
+# starters. The fake below behaves like the real API in that respect, so these
+# tests fail against the old code instead of merely checking a variable.
+# --------------------------------------------------------------------------- #
+class TimeAwareClient:
+    """Like Famly: current children only, unless a timeRange is supplied."""
+
+    def __init__(self, current, past=(), future=()):
+        self.current = list(current)
+        self.extra = list(past) + list(future)
+        self.calls = []
+
+    def execute(self, query_path, variables, operation_name):
+        self.calls.append(dict(variables or {}))
+        rows = list(self.current)
+        if (variables or {}).get("timeRange"):
+            rows += self.extra
+        return page_body(rows)
+
+
+class TimeRangeTests(UrnLookupTestCase):
+    def roster(self):
+        client = TimeAwareClient(
+            current=[child_node("c-now", "urn:now", "Now")],
+            past=[child_node("c-past", "urn:past", "Past")],
+            future=[child_node("c-future", "urn:future", "Future")],
+        )
+        return runner.fetch_roster(client=client), client
+
+    def test_a_child_who_has_left_is_in_the_roster(self):
+        rows, _ = self.roster()
+        matches = runner.find_matches("urn:past", rows)
+
+        self.assertEqual([m.id for m in matches], ["c-past"])
+
+    def test_a_child_who_has_not_started_is_in_the_roster(self):
+        rows, _ = self.roster()
+        matches = runner.find_matches("urn:future", rows)
+
+        self.assertEqual([m.id for m in matches], ["c-future"])
+
+    def test_a_current_child_is_still_found(self):
+        rows, _ = self.roster()
+
+        self.assertEqual([m.id for m in runner.find_matches("urn:now", rows)], ["c-now"])
+
+    def test_every_page_asks_for_the_time_range(self):
+        client = FakeGraphQLClient(
+            pages=[
+                page_body([child_node("c-1", "urn:1", "Ada")], next_cursor="page-2"),
+                page_body([child_node("c-2", "urn:2", "Bea")], next_cursor=None),
+            ]
+        )
+
+        runner.fetch_roster(client=client)
+
+        self.assertEqual(len(client.calls), 2)
+        for call in client.calls:
+            self.assertEqual(call["timeRange"], runner.ROSTER_TIME_RANGE)
+
+    def test_the_range_is_shared_with_pull_roster(self):
+        # One definition of "the whole roster", so the two actions cannot
+        # drift apart again.
+        from actions.pull_roster import runner as pull_roster
+
+        self.assertIs(runner.ROSTER_TIME_RANGE, pull_roster.ROSTER_TIME_RANGE)
+
+    def test_a_caller_cannot_change_the_range_by_mutating_a_request(self):
+        client = FakeGraphQLClient(pages=[page_body([])])
+        before = dict(runner.ROSTER_TIME_RANGE)
+
+        runner.fetch_roster(client=client)
+        client.calls[0]["timeRange"]["from"] = "1999-01-01"
+
+        self.assertEqual(runner.ROSTER_TIME_RANGE, before)
+
+    def test_the_query_declares_and_passes_the_time_range(self):
+        # The bug was the ABSENCE of this argument. Fails if it is ever removed.
+        text = runner.QUERY_PATH.read_text(encoding="utf-8")
+
+        self.assertIn("$timeRange: NonEmptyLocalDateRangeInput", text)
+        self.assertIn("timeRange: $timeRange", text)
+
+    def test_the_web_handler_resolves_a_leaver_exactly_once(self):
+        client = TimeAwareClient(
+            current=[child_node("c-now", "urn:now", "Now")],
+            past=[child_node("c-past", "urn:past", "Past")],
+        )
+
+        # The real handler and the real fetch, with only the HTTP client faked.
+        with mock.patch.object(runner, "_public_client", lambda: client):
+            data, status = web.handle({"action": "urn_lookup", "urn": "urn:past"})
+
+        self.assertEqual(status, 200)
+        self.assertTrue(data["matched"])
+        self.assertEqual(data["childId"], "c-past")
+
+
+# --------------------------------------------------------------------------- #
+# Merge by child id
+# --------------------------------------------------------------------------- #
+class MergeByIdTests(UrnLookupTestCase):
+    def test_a_child_returned_on_two_pages_is_one_row(self):
+        client = FakeGraphQLClient(
+            pages=[
+                page_body([child_node("c-1", "urn:1", "Ada")], next_cursor="page-2"),
+                # A page boundary that repeats the last row.
+                page_body([child_node("c-1", "urn:1", "Ada"), child_node("c-2", "urn:2", "Bea")]),
+            ]
+        )
+
+        rows = runner.fetch_roster(client=client)
+
+        self.assertEqual([r.id for r in rows], ["c-1", "c-2"])
+
+    def test_a_duplicate_does_not_turn_one_match_into_two(self):
+        # Without the merge this reads as a "duplicate externalId" data
+        # problem (HTTP 409) when it is only the same child twice.
+        client = FakeGraphQLClient(
+            pages=[
+                page_body(
+                    [child_node("c-1", "urn:1", "Ada"), child_node("c-1", "urn:1", "Ada")]
+                )
+            ]
+        )
+
+        rows = runner.fetch_roster(client=client)
+
+        self.assertEqual(len(runner.find_matches("urn:1", rows)), 1)
+
+    def test_two_different_children_with_the_same_urn_are_NOT_merged(self):
+        # The merge is by CHILD id. Two children sharing an externalId are a
+        # real data problem and must still be reported, never collapsed.
+        client = FakeGraphQLClient(
+            pages=[
+                page_body(
+                    [child_node("c-1", "urn:same", "Ada"), child_node("c-2", "urn:same", "Bea")]
+                )
+            ]
+        )
+
+        rows = runner.fetch_roster(client=client)
+
+        self.assertEqual([r.id for r in rows], ["c-1", "c-2"])
+        self.assertEqual(len(runner.find_matches("urn:same", rows)), 2)
+
+    def test_first_seen_order_is_kept(self):
+        client = FakeGraphQLClient(
+            pages=[
+                page_body(
+                    [
+                        child_node("c-3", "u3", "C"),
+                        child_node("c-1", "u1", "A"),
+                        child_node("c-3", "u3", "C"),
+                        child_node("c-2", "u2", "B"),
+                    ]
+                )
+            ]
+        )
+
+        self.assertEqual([r.id for r in runner.fetch_roster(client=client)], ["c-3", "c-1", "c-2"])
+
+    def test_a_duplicate_fills_a_blank_but_never_overwrites(self):
+        merged = runner.merge_by_id(
+            [
+                runner.ChildRow(id="c-1", external_id=None, full_name="Ada"),
+                runner.ChildRow(id="c-1", external_id="urn:1", full_name="Someone Else"),
+            ]
+        )
+
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0].external_id, "urn:1")  # blank filled
+        self.assertEqual(merged[0].full_name, "Ada")  # known value kept
+
+    def test_a_row_with_no_id_is_kept_rather_than_guessed_at(self):
+        merged = runner.merge_by_id(
+            [
+                runner.ChildRow(id=None, external_id="u-a"),
+                runner.ChildRow(id=None, external_id="u-b"),
+                runner.ChildRow(id="c-1", external_id="u-1"),
+            ]
+        )
+
+        self.assertEqual(len(merged), 3)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -7,15 +7,26 @@
 # calling it with them) -- despite the "site" name, it is not a separate id
 # space this project needs to learn.
 #
+# TIME RANGE (found 2026-10-14): `listBySiteIds` lists ONLY children enrolled
+# today by default -- "by default neither past nor future children are listed"
+# (the field's own description). Past leavers and future starters are returned
+# only when `timeRange` is given. Without it the roster was 168 children; with
+# it, 292. `from` is required, `to` optional. runner.py's ROSTER_TIME_RANGE is
+# the one place the range is defined.
+#
 # Minimal field selection only (id, externalId, and each child's nested
 # contacts' id + email) -- Child has many more fields (name, birthday,
 # currentGroup, records, ...) not needed here. Fetching contacts NESTED here,
 # rather than via the separate `contacts { list(childIds, nextToken) }` query,
 # avoids a second round trip per child: this query already returns every
 # contact for every child in the same page.
-query PullRosterChildren($siteIds: [SiteId!]!, $next: ChildCursor) {
+query PullRosterChildren(
+  $siteIds: [SiteId!]!
+  $next: ChildCursor
+  $timeRange: NonEmptyLocalDateRangeInput
+) {
   children {
-    listBySiteIds(siteIds: $siteIds, nextToken: $next) {
+    listBySiteIds(siteIds: $siteIds, nextToken: $next, timeRange: $timeRange) {
       result {
         id
         externalId

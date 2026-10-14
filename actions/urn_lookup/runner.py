@@ -33,6 +33,14 @@ existing "no institution filter, one flat roster" behaviour by reusing the
 same catalogue every other pull already reads, rather than adding a new
 per-institution mode to a utility slated for deletion.
 
+THE ROSTER INCLUDES PAST AND FUTURE CHILDREN (found 2026-10-14).
+`listBySiteIds` returns only children enrolled TODAY unless it is given a
+`timeRange`, so a child who had left -- or who has not started yet -- was
+absent and their urn never matched. `fetch_roster` now passes
+`pull_roster.runner.ROSTER_TIME_RANGE`, the one definition of "the whole
+roster" shared with `pull_roster` (live: 168 children before, 292 after).
+Results are merged by child id, so a child returned twice is still one row.
+
 Server-importable: no argparse, no Flask.
 """
 
@@ -44,6 +52,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from actions.pull_roster.runner import ROSTER_TIME_RANGE, merge_by_id
 from core.client import GraphQLClient
 from core.config import load_config
 from integrations import catalogue
@@ -164,7 +173,12 @@ def _fetch_page(
     """One page of the roster: the parsed rows, and the next cursor (or None)."""
     body = client.execute(
         query_path=QUERY_PATH,
-        variables={"siteIds": site_ids, "next": next_cursor},
+        variables={
+            "siteIds": site_ids,
+            "next": next_cursor,
+            # Without this the API returns only children enrolled today.
+            "timeRange": dict(ROSTER_TIME_RANGE),
+        },
         operation_name=OPERATION_NAME,
     )
 
@@ -184,6 +198,9 @@ def fetch_roster(client: GraphQLClient | None = None) -> list[ChildRow]:
     """Fetch the FULL child roster (every institutionId configured in
     reference/catalogue.json, in one paginated pull), following `next` until
     it comes back empty/null.
+
+    "Full" includes children who have LEFT and children who have not STARTED
+    (see ROSTER_TIME_RANGE), and the rows are merged by child id.
 
     Args:
         client: optional GraphQLClient, mainly for tests. Defaults to a
@@ -211,7 +228,7 @@ def fetch_roster(client: GraphQLClient | None = None) -> list[ChildRow]:
         if not cursor:
             break
 
-    return rows
+    return merge_by_id(rows)
 
 
 def get_roster(

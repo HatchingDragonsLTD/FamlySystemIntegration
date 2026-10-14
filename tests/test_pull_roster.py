@@ -406,5 +406,191 @@ class ExistenceCheckGuardTests(unittest.TestCase):
         raise NotImplementedError
 
 
+# --------------------------------------------------------------------------- #
+# The roster must include PAST and FUTURE children.
+#
+# Famly's `children.listBySiteIds` returns only children enrolled TODAY unless
+# it is given a `timeRange` (found 2026-10-14: 168 children by default, 292 with
+# a range). The fake below behaves like the real API in that respect, so these
+# tests fail against the old code rather than just checking a variable.
+# --------------------------------------------------------------------------- #
+class TimeAwareClient:
+    """Like Famly: current children only, unless a timeRange is supplied."""
+
+    def __init__(self, current, extra=()):
+        self.current = list(current)
+        self.extra = list(extra)
+        self.calls = []
+
+    def execute(self, query_path, variables, operation_name):
+        self.calls.append((operation_name, dict(variables or {})))
+        if operation_name == pull_roster.BILL_PAYERS_OPERATION_NAME:
+            return {"data": {"billPayers": {"listBySiteIds": {"result": [], "next": None}}}}
+
+        rows = list(self.current)
+        if (variables or {}).get("timeRange"):
+            rows += self.extra
+        return {"data": {"children": {"listBySiteIds": {"result": rows, "next": None}}}}
+
+
+class TimeRangeTests(PullRosterTestCase):
+    def test_a_child_who_has_left_or_not_started_is_pulled(self):
+        client = TimeAwareClient(
+            current=[child_node("c-now", "urn-now")],
+            extra=[child_node("c-past", "urn-past"), child_node("c-future", "urn-future")],
+        )
+
+        children, _ = pull_roster.fetch_children_and_contacts([CITY_ID], client)
+
+        self.assertEqual({c.id for c in children}, {"c-now", "c-past", "c-future"})
+
+    def test_every_page_asks_for_the_time_range(self):
+        client = FakeGraphQLClient(
+            children_pages=[
+                {"result": [child_node("c-1", "urn-1")], "next": "page-2"},
+                {"result": [child_node("c-2", "urn-2")], "next": None},
+            ]
+        )
+
+        pull_roster.fetch_children_and_contacts([CITY_ID], client)
+
+        for _op, variables in client.calls:
+            self.assertEqual(variables["timeRange"], pull_roster.ROSTER_TIME_RANGE)
+
+    def test_the_range_is_wide_enough_and_well_formed(self):
+        from datetime import date
+
+        start = date.fromisoformat(pull_roster.ROSTER_TIME_RANGE["from"])
+        end = date.fromisoformat(pull_roster.ROSTER_TIME_RANGE["to"])
+
+        self.assertLess(start, date(2010, 1, 1))  # every child ever enrolled
+        self.assertGreater(end, date(2060, 1, 1))  # every child yet to start
+        self.assertLess(start, end)
+
+    def test_the_query_declares_and_passes_the_time_range(self):
+        # The bug was the ABSENCE of this argument. Fails if it is ever removed.
+        text = pull_roster.CHILDREN_QUERY_PATH.read_text(encoding="utf-8")
+
+        self.assertIn("$timeRange: NonEmptyLocalDateRangeInput", text)
+        self.assertIn("timeRange: $timeRange", text)
+
+    def test_pull_all_includes_them_for_every_institution(self):
+        client = TimeAwareClient(
+            current=[child_node("c-now", "urn-now")],
+            extra=[child_node("c-past", "urn-past")],
+        )
+
+        result = pull_roster.pull_all(client)
+
+        for code in ("HDCITY", "HDCW"):
+            self.assertEqual(
+                {c.id for c in result.rosters[code].children}, {"c-now", "c-past"}
+            )
+
+    def test_one_institution_failing_still_does_not_stop_the_others(self):
+        # Failure isolation is unchanged by the range.
+        class FailsForCity(TimeAwareClient):
+            def execute(self, query_path, variables, operation_name):
+                if CITY_ID in (variables or {}).get("siteIds", []):
+                    raise GraphQLError("boom", errors=[{"message": "boom"}])
+                return super().execute(query_path, variables, operation_name)
+
+        client = FailsForCity(current=[child_node("c-1", "urn-1")], extra=[child_node("c-2", "urn-2")])
+
+        result = pull_roster.pull_all(client)
+
+        self.assertIn("HDCITY", result.institutions_failed)
+        self.assertEqual(result.institutions_pulled, ["HDCW"])
+        self.assertEqual({c.id for c in result.rosters["HDCW"].children}, {"c-1", "c-2"})
+
+    def test_past_and_future_children_reach_the_store_and_match(self):
+        client = TimeAwareClient(
+            current=[child_node("c-now", "urn-now")],
+            extra=[child_node("c-past", "URN-Past ")],
+        )
+
+        pull_roster.write_store(pull_roster.pull_all(client), self.store_file)
+
+        found = store.find_child_by_external_id("urn-past", self.store_file)
+        self.assertEqual([row["famly_id"] for row in found], ["c-past"])
+
+
+class MergeByIdTests(PullRosterTestCase):
+    def test_a_child_repeated_across_pages_is_one_row(self):
+        client = FakeGraphQLClient(
+            children_pages=[
+                {"result": [child_node("c-1", "urn-1")], "next": "page-2"},
+                {"result": [child_node("c-1", "urn-1"), child_node("c-2", "urn-2")], "next": None},
+            ]
+        )
+
+        children, _ = pull_roster.fetch_children_and_contacts([CITY_ID], client)
+
+        self.assertEqual([c.id for c in children], ["c-1", "c-2"])
+
+    def test_a_child_returned_for_two_site_ids_is_one_row(self):
+        # Two sites asked for together, one child related to both.
+        client = FakeGraphQLClient(
+            children_pages=[
+                {
+                    "result": [child_node("c-1", "urn-1"), child_node("c-1", "urn-1")],
+                    "next": None,
+                }
+            ]
+        )
+
+        children, _ = pull_roster.fetch_children_and_contacts([CITY_ID, CW_ID], client)
+
+        self.assertEqual([c.id for c in children], ["c-1"])
+
+    def test_different_children_sharing_a_urn_are_not_merged(self):
+        client = FakeGraphQLClient(
+            children_pages=[
+                {
+                    "result": [child_node("c-1", "urn-same"), child_node("c-2", "urn-same")],
+                    "next": None,
+                }
+            ]
+        )
+
+        children, _ = pull_roster.fetch_children_and_contacts([CITY_ID], client)
+
+        self.assertEqual([c.id for c in children], ["c-1", "c-2"])
+
+    def test_a_duplicate_fills_a_blank_but_never_overwrites(self):
+        merged = pull_roster.merge_by_id(
+            [
+                store.ChildRow(id="c-1", external_id=None),
+                store.ChildRow(id="c-1", external_id="urn-1"),
+                store.ChildRow(id="c-2", external_id="urn-2"),
+                store.ChildRow(id="c-2", external_id="urn-OTHER"),
+            ]
+        )
+
+        self.assertEqual([(c.id, c.external_id) for c in merged], [("c-1", "urn-1"), ("c-2", "urn-2")])
+
+    def test_a_child_with_no_id_is_still_dropped_from_the_fetch(self):
+        # Unchanged behaviour: a row the store cannot key is not kept.
+        client = FakeGraphQLClient(
+            children_pages=[{"result": [child_node(None, "urn-x"), child_node("c-1", "urn-1")], "next": None}]
+        )
+
+        children, _ = pull_roster.fetch_children_and_contacts([CITY_ID], client)
+
+        self.assertEqual([c.id for c in children], ["c-1"])
+
+    def test_a_child_in_two_institutions_is_one_row_at_rest(self):
+        # Pins the store's existing guarantee, which the wider range makes
+        # more likely to matter: a child who left one site and joined another
+        # is returned by both, and must not be stored (or matched) twice.
+        client = TimeAwareClient(current=[child_node("c-1", "urn-1")])
+
+        pull_roster.write_store(pull_roster.pull_all(client), self.store_file)
+
+        self.assertEqual(
+            len(store.find_child_by_external_id("urn-1", self.store_file)), 1
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
