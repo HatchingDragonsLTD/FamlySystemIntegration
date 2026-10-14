@@ -1371,6 +1371,203 @@ def child_id(n: int) -> str:
     return f"00000000-0000-0000-0000-00000000e{n:03d}"
 
 
+class FullyFundedZeroEstimateTests(QueueTestCase):
+    """A fully funded deal's funded plan may legitimately price at 0.
+
+    The funding covers the whole bill, so there is nothing left to charge.
+    Holding that is noise. A 0 with NO funding on the period is a different
+    thing entirely -- a plan priced at nothing for no reason -- and still holds.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.zero_funded_periods()
+
+    def zero_funded_periods(self, funding=210.0, estimate=0):
+        """Make the FUNDED segment come back priced at `estimate`."""
+
+        def price(node, body):
+            if not body["plan"].get("publicFundingSettings"):
+                return
+            for state in node.get("planStates") or []:
+                state["monthlyEstimate"] = estimate
+                if funding is None:
+                    state.pop("publicFunding", None)
+                else:
+                    state["publicFunding"] = {"amount": funding}
+
+        self.famly.preview_hook = price
+
+    def fully_funded_body(self, **overrides):
+        return self.body(fully_funded="true", **overrides)
+
+    def funded_segment_index(self, data):
+        job = self.job(data)
+        return next(i for i, s in enumerate(job.segments) if s.get("funded"))
+
+    # --- committing ------------------------------------------------------- #
+    def test_zero_with_funding_commits_without_a_hold(self):
+        data = self.queue(self.fully_funded_body())
+        self.run_all()
+
+        job = self.job(data)
+        self.assertEqual(job.status, jobs.STATUS_DONE)
+        self.assertEqual(len(self.famly.commits), 3)
+        self.assertEqual(self.previews_posted, [])  # nobody was asked
+
+    def test_zero_with_no_funding_is_held_with_that_reason(self):
+        self.zero_funded_periods(funding=0)
+        data = self.queue(self.fully_funded_body())
+        self.run_all()
+
+        job = self.job(data)
+        self.assertEqual(job.status, jobs.STATUS_HELD)
+        self.assertIn("is 0 and no funding is applied", job.detail)
+
+    def test_zero_with_missing_funding_is_held(self):
+        self.zero_funded_periods(funding=None)
+        data = self.queue(self.fully_funded_body())
+        self.run_all()
+
+        self.assertEqual(self.job(data).status, jobs.STATUS_HELD)
+        self.assertIn("is 0 and no funding is applied", self.job(data).detail)
+
+    def test_zero_with_unparseable_funding_is_held(self):
+        self.zero_funded_periods(funding="not a number")
+        data = self.queue(self.fully_funded_body())
+        self.run_all()
+
+        self.assertEqual(self.job(data).status, jobs.STATUS_HELD)
+        self.assertIn("is 0 and no funding is applied", self.job(data).detail)
+
+    def test_without_the_flag_a_zero_estimate_is_held_as_before(self):
+        data = self.queue()  # no fully_funded
+        self.run_all()
+
+        job = self.job(data)
+        self.assertEqual(job.status, jobs.STATUS_HELD)
+        self.assertIn("is not above 0", job.detail)
+
+    def test_the_flag_being_false_behaves_like_no_flag(self):
+        data = self.queue(self.body(fully_funded="false"))
+        self.run_all()
+
+        self.assertEqual(self.job(data).status, jobs.STATUS_HELD)
+        self.assertIn("is not above 0", self.job(data).detail)
+
+    def test_a_non_funded_segment_at_zero_is_still_held(self):
+        # The rule is for FUNDED plans only: a base plan at 0 is wrong even on
+        # a fully funded deal.
+        def price_everything_zero(node, body):
+            for state in node.get("planStates") or []:
+                state["monthlyEstimate"] = 0
+                state["publicFunding"] = {"amount": 210.0}
+
+        self.famly.preview_hook = price_everything_zero
+        data = self.queue(self.fully_funded_body())
+        self.run_all()
+
+        job = self.job(data)
+        self.assertEqual(job.status, jobs.STATUS_HELD)
+        # Held on the FIRST plan, which is the non-funded one.
+        self.assertEqual(job.next_index, 0)
+        self.assertIn("is not above 0", job.detail)
+
+    def test_a_negative_estimate_is_still_held(self):
+        self.zero_funded_periods(estimate=-5)
+        data = self.queue(self.fully_funded_body())
+        self.run_all()
+
+        self.assertEqual(self.job(data).status, jobs.STATUS_HELD)
+        self.assertIn("is not above 0", self.job(data).detail)
+
+    def test_the_ceiling_is_still_enforced(self):
+        self.zero_funded_periods(estimate=999999)
+        data = self.queue(self.fully_funded_body())
+        self.run_all()
+
+        self.assertEqual(self.job(data).status, jobs.STATUS_HELD)
+        self.assertIn("QUEUE_MAX_MONTHLY", self.job(data).detail)
+
+    def test_an_ordinary_estimate_is_unaffected_by_the_flag(self):
+        self.famly.preview_hook = None  # the harness's normal pricing
+        data = self.queue(self.fully_funded_body())
+        self.run_all()
+
+        self.assertEqual(self.job(data).status, jobs.STATUS_DONE)
+        self.assertEqual(len(self.famly.commits), 3)
+
+    # --- the flag itself --------------------------------------------------- #
+    def test_the_flag_is_stored_on_the_job(self):
+        data = self.queue(self.fully_funded_body())
+
+        self.assertEqual(self.job(data).payload.get("fully_funded"), "true")
+
+    def test_the_flag_never_reaches_famly(self):
+        data = self.queue(self.fully_funded_body())
+        self.run_all()
+
+        sent = json.dumps(self.famly.previews + self.famly.commits)
+        self.assertNotIn("fully_funded", sent)
+        self.assertEqual(self.job(data).status, jobs.STATUS_DONE)
+
+    def test_the_flag_is_stripped_from_every_segment_payload(self):
+        from actions.create_timeline import engine
+
+        payload = engine.segment_payload(
+            self.fully_funded_body(), {"from": "2026-01-01", "to": None, "funded": True,
+                                       "advanced": False},
+            is_last=True,
+        )
+
+        self.assertNotIn("fully_funded", payload)
+
+    def test_the_flag_changes_the_idempotency_key(self):
+        # It is part of the request, so two deals differing only by it are two
+        # different jobs rather than one.
+        plain = self.queue()
+        jobs.set_status(plain["job_id"], jobs.STATUS_FAILED, "make way")
+
+        flagged = self.queue(self.fully_funded_body())
+
+        self.assertFalse(flagged["already_queued"])
+        self.assertNotEqual(self.job(plain).job_key, self.job(flagged).job_key)
+
+    # --- rounding and the digest ------------------------------------------ #
+    def test_rounding_reports_no_reason_at_zero(self):
+        # Nothing to round is not a failure: a 0 estimate must not be reported
+        # as "rounding was not applied".
+        from actions.plan_write import rounding as rounding_module
+
+        plan = rounding_module.plan_rounding([("2026-01-01", "pg-1", 0)])
+
+        self.assertIsNone(plan.reason)
+        self.assertEqual(plan.entries, [])
+
+    def test_a_zero_estimate_does_not_add_a_rounding_reason(self):
+        data = self.queue(self.fully_funded_body(auto_round="true"))
+        self.run_all()
+
+        job = self.job(data)
+        self.assertEqual(job.status, jobs.STATUS_DONE)
+        self.assertNotIn("rounding", (job.detail or ""))
+
+    def test_the_digest_notes_a_plan_committed_at_zero(self):
+        self.queue(self.fully_funded_body())
+        self.run_all()
+
+        digest = next(n for n in self.notices if "Queue digest" in n)
+        self.assertIn("estimate 0 (fully funded)", digest)
+
+    def test_the_note_is_absent_for_an_ordinary_plan(self):
+        self.famly.preview_hook = None
+        self.queue(self.fully_funded_body())
+        self.run_all()
+
+        digest = next(n for n in self.notices if "Queue digest" in n)
+        self.assertNotIn("estimate 0 (fully funded)", digest)
+
+
 class DryDoneKeyTests(QueueTestCase):
     """A dry run must NOT hold its idempotency key.
 

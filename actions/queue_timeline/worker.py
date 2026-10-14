@@ -47,7 +47,14 @@ from decimal import Decimal
 import requests
 
 from actions.create_timeline import engine
-from actions.plan_write import approval, auto_round, funded_hours, preview_store, rounding
+from actions.plan_write import (
+    approval,
+    auto_round,
+    funded_hours,
+    hubspot_flatten,
+    preview_store,
+    rounding,
+)
 from actions.plan_write import web as plan_write_web
 from actions.read_child_plans import runner as read_child_plans
 from core.rest_client import RestHTTPError
@@ -252,10 +259,30 @@ def _informational(warning) -> bool:
     return any(fragment in title for fragment in INFORMATIONAL_TITLES)
 
 
-def clean_reasons(prepared, requested_rounding: bool) -> list[str]:
+def _funding_amount(state):
+    """This period's public funding amount, or None when there is not one.
+
+    Per PERIOD, not the plan: each period carries its own funding, and the
+    plan-level figure only mirrors the first one.
+    """
+    funding = getattr(state, "public_funding", None)
+    return rounding.to_decimal(getattr(funding, "amount", None))
+
+
+def clean_reasons(
+    prepared, requested_rounding: bool, allow_zero_estimate: bool = False
+) -> list[str]:
     """Everything that stops this previewed plan from being committed unattended.
 
     Empty means clean.
+
+    `allow_zero_estimate` is for a FULLY FUNDED deal's FUNDED plans, where an
+    estimate of exactly 0 is the right answer -- the funding covers the whole
+    bill, so there is nothing left to charge. It is accepted only when that
+    period actually has funding on it: a 0 estimate with no funding means the
+    plan is priced at nothing for no reason, which is exactly the case worth
+    holding. Everything else is unchanged -- a missing estimate, a negative
+    one, and the QUEUE_MAX_MONTHLY ceiling all still hold the job.
     """
     if prepared.status != 200:
         return [f"it did not validate: {'; '.join(prepared.data.get('errors') or ['unknown'])}"]
@@ -278,7 +305,17 @@ def clean_reasons(prepared, requested_rounding: bool) -> list[str]:
     for state in states:
         estimate = rounding.to_decimal(state.monthly_estimate)
         start = str(state.from_ or "unknown")[:10]
-        if estimate is None or estimate <= 0:
+        if allow_zero_estimate and estimate is not None and estimate == 0:
+            # Fully funded: 0 is right ONLY if funding is actually paying for
+            # this period. No funding (or a figure that will not parse) and a
+            # zero bill is a plan priced at nothing by accident.
+            funding = _funding_amount(state)
+            if funding is None or funding <= 0:
+                reasons.append(
+                    f"the estimate for the period from {start} is 0 and no "
+                    f"funding is applied"
+                )
+        elif estimate is None or estimate <= 0:
             reasons.append(f"the estimate for the period from {start} is not above 0")
         elif estimate >= ceiling:
             reasons.append(
@@ -440,11 +477,25 @@ def _run(job_id: str) -> None:
             return
 
 
+def _allow_zero_estimate(job: jobs.Job, index: int) -> bool:
+    """Whether a 0 estimate is acceptable for this segment.
+
+    Only when the DEAL is marked fully funded AND the segment itself is the
+    funded one: a non-funded segment of a fully funded deal still has to be
+    worth something.
+    """
+    if not hubspot_flatten._as_bool(job.payload.get("fully_funded")):
+        return False
+    return bool(job.segments[index].get("funded"))
+
+
 def _run_dry(job: jobs.Job) -> None:
     """Preview and check every segment on its own. Commits nothing."""
     for index in range(len(job.segments)):
         prepared, requested = _prepare(job, index, None, store_job=False)
-        reasons = clean_reasons(prepared, requested)
+        reasons = clean_reasons(
+            prepared, requested, _allow_zero_estimate(job, index)
+        )
         if job.institution.upper() not in allowed_institutions():
             reasons.append(f"institution {job.institution or 'unknown'} is not allowed to auto-commit")
         estimates = []
@@ -486,7 +537,8 @@ def _do_segment(job: jobs.Job) -> bool:
     old_plan_id = job.segments[index - 1]["plan_id"] if index else None
 
     prepared, requested = _prepare(job, index, old_plan_id, store_job=True)
-    reasons = clean_reasons(prepared, requested)
+    zero_allowed = _allow_zero_estimate(job, index)
+    reasons = clean_reasons(prepared, requested, zero_allowed)
     if prepared.status != 200:
         fail(job.job_id, f"{_where(job, index)} {reasons[0]}")
         return False
@@ -529,6 +581,12 @@ def _do_segment(job: jobs.Job) -> bool:
         preview_store.mark(prepared.preview_id, preview_store.STATUS_COMMITTED)
 
     jobs.mark_committed(job.job_id, index, written.id)
+
+    # Note a plan committed at 0 under the fully-funded rule, so the digest can
+    # show it: a zero bill is worth seeing without opening anything.
+    if zero_allowed and _priced_at_zero(prepared):
+        jobs.record_segment(job.job_id, index, zero_fully_funded=True)
+
     job = jobs.get(job.job_id)
 
     plans = read_plans(job.child_id)
@@ -614,6 +672,14 @@ def expire_held() -> list[str]:
     return cancelled
 
 
+def _priced_at_zero(prepared) -> bool:
+    """True when every pricing period of the previewed plan came back at 0."""
+    states = getattr(prepared.preview.plan, "plan_states", None) or []
+    if not states:
+        return False
+    return all(rounding.to_decimal(s.monthly_estimate) == 0 for s in states)
+
+
 def _digest_lines(job: jobs.Job) -> list[str]:
     label = " (dry run)" if job.status == jobs.STATUS_DRY_DONE else ""
     lines = [f"• {_child_line(job.child_id)} — job `{job.job_id}`{label}"]
@@ -624,7 +690,10 @@ def _digest_lines(job: jobs.Job) -> list[str]:
             figures = ", ".join(dry["rounded"] or dry["estimates"]) or "no estimate"
             lines.append(f"    {_where(job, index)}: {verdict} ({figures})")
         elif segment.get("plan_id"):
-            lines.append(f"    {_where(job, index)}: created, plan `{segment['plan_id']}`")
+            note = " — estimate 0 (fully funded)" if segment.get("zero_fully_funded") else ""
+            lines.append(
+                f"    {_where(job, index)}: created, plan `{segment['plan_id']}`{note}"
+            )
     return lines
 
 
@@ -717,7 +786,9 @@ def status() -> dict:
         "mode": mode(),
         "paused": jobs.is_paused(),
         "consecutiveFailures": jobs.consecutive_failures(),
-        "commitsToday": jobs.commits_today(),
+        # Through _now(), like the cap check and the counter write, so the three
+        # always agree on what "today" is.
+        "commitsToday": jobs.commits_today(_now()),
         "maxCommitsPerDay": max_commits_per_day(),
         "allowedInstitutions": sorted(allowed_institutions()),
         "maxMonthly": str(max_monthly()),
