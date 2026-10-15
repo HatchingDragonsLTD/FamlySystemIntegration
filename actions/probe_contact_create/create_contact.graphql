@@ -1,0 +1,12 @@
+# THE ONLY WRITE in this package. Confirmed against the live public API schema
+# (2026-10-15): ContactsMutation.create(contacts: [ContactInput!]!) ->
+# [Contact!]!. Only `id` is selected: the contact is read back with a separate
+# query (read_contacts.graphql) so a bad field in a selection set cannot be the
+# reason a create is rejected.
+mutation ProbeContactCreate($contacts: [ContactInput!]!) {
+  contacts {
+    create(contacts: $contacts) {
+      id
+    }
+  }
+}

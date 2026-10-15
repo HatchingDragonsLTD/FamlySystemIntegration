@@ -1,0 +1,46 @@
+# READ-ONLY readback of a child's contacts (ContactQueries.list), in full, to see
+# how Famly stored a probe contact. Test values only.
+query ProbeReadContacts($childIds: [ChildId!]!, $next: ContactCursor) {
+  contacts {
+    list(childIds: $childIds, nextToken: $next) {
+      result {
+        id
+        name {
+          firstName
+          middleName
+          lastName
+          fullName
+          shortName
+        }
+        email
+        address {
+          street
+          zip
+          city
+          state
+          country
+        }
+        phoneNumbers {
+          value
+          phoneType
+          formatted
+        }
+        childIds
+        roles {
+          targetId
+          role {
+            roleId
+            title
+          }
+        }
+        roleInvitations {
+          roleInvitationId
+          roleTitle
+        }
+        emergencyContact
+        lastModifiedAt
+      }
+      next
+    }
+  }
+}
