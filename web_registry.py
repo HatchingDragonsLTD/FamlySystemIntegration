@@ -21,7 +21,9 @@ from actions.contact_lookup import web as contact_lookup_web
 from actions.create_timeline import web as create_timeline_web
 from actions.plan_status import web as plan_status_web
 from actions.delete_plans import web as delete_plans_web  # TEMPORARY -- see its module docstring
+from actions.onboard import approval as onboard_approval
 from actions.plan_write import approval as plan_write_approval
+from integrations import slack as _slack
 from actions.plan_write import web as plan_write_web
 from actions.queue_timeline import web as queue_timeline_web
 from actions.urn_lookup import web as urn_lookup_web  # TEMPORARY -- see its module docstring
@@ -58,6 +60,9 @@ def handle_slack_click(
     Returns the message text to show, or None when there is nothing to say
     (opening a modal leaves the original message alone).
     """
+    # Onboarding Gate A buttons carry a job, not a plan preview.
+    if action_id in _slack.ONBOARD_ACTIONS:
+        return onboard_approval.handle_click(action_id, preview_id, user)
     return SLACK_CLICK_HANDLER(
         action_id, preview_id, user, trigger_id, response_url=response_url
     )

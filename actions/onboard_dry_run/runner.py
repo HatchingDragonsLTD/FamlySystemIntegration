@@ -16,7 +16,7 @@ HOLDS. Anything that could put a child in the wrong room, link the wrong child
 or pick between candidates is a HOLD with a reason code, never a guess:
 site_unmapped, site_id_missing, group_missing, group_ambiguous, dob_missing,
 start_date_missing, date_invalid, dates_inconsistent, child_ambiguous,
-contact_no_email, contact_ambiguous_on_child, contact_unmatched_on_existing_child,
+contact_no_email, contact_ambiguous_on_child,
 bill_payer_unclear, famly_childid_not_found, child_possible_duplicate,
 end_date_missing, deal_not_found.
 A deal with any hold is `held`; one without is `ready`; one a read failed for is
@@ -30,9 +30,7 @@ from typing import Any
 from actions.onboard_dry_run import derive, links
 from actions.onboard_dry_run.famly_reads import (
     FamlyReads,
-    copies_differ,
     local_part,
-    newest,
     normalise_email,
 )
 from core.client import GraphQLError, GraphQLHTTPError
@@ -48,11 +46,9 @@ CHILD_AMBIGUOUS = "child_ambiguous"
 
 # Contact statuses.
 PRESENT = "present"
-WOULD_COPY = "would_copy"
 WOULD_CREATE = "would_create"
 NO_EMAIL = "no_email"
 AMBIGUOUS_ON_CHILD = "ambiguous_on_child"
-UNMATCHED_ON_EXISTING_CHILD = "contact_unmatched_on_existing_child"
 CHILD_UNRESOLVED = "child_unresolved"
 
 # Hold reasons owned by this module (derive.py owns the rest).
@@ -63,6 +59,7 @@ CONTACT_AMBIGUOUS_ON_CHILD = "contact_ambiguous_on_child"
 BILL_PAYER_UNCLEAR = "bill_payer_unclear"
 FAMLY_CHILDID_NOT_FOUND = "famly_childid_not_found"
 CHILD_POSSIBLE_DUPLICATE = "child_possible_duplicate"
+CHILD_NAME_INCOMPLETE = "child_name_incomplete"
 
 
 class DryRun:
@@ -86,13 +83,19 @@ class DryRun:
         return self._stages
 
     # ------------------------------------------------------------------ #
-    def plan_deal(self, deal_id: str) -> dict:
+    def plan_deal(self, deal_id: str, context: dict | None = None) -> dict:
         """The dry-run plan for one deal. Never raises for a read failure: that
-        becomes `status: error` so one bad deal cannot stop a batch."""
+        becomes `status: error` so one bad deal cannot stop a batch.
+
+        `context`, if given, is filled with `deal` (the raw allow-listed deal
+        properties) and `contacts` (the DealContacts, with their raw properties):
+        personal data for the phase-2 writer, held in memory only. It is never
+        part of the returned plan."""
         deal_id = str(deal_id).strip()
         plan: dict[str, Any] = {"dealId": deal_id, "holds": [], "warnings": []}
+        context = context if context is not None else {}
         try:
-            self._plan(deal_id, plan)
+            self._plan(deal_id, plan, context)
         except HubSpotError as exc:
             if exc.status_code == 404:
                 plan["holds"].append({"reason": DEAL_NOT_FOUND})
@@ -108,8 +111,9 @@ class DryRun:
         )
         return plan
 
-    def _plan(self, deal_id: str, plan: dict) -> None:
+    def _plan(self, deal_id: str, plan: dict, context: dict) -> None:
         deal = self._hubspot.get_deal(deal_id)
+        context["deal"] = deal
         warnings = plan["warnings"]
 
         plan["stage"] = self._stage(deal)
@@ -119,8 +123,9 @@ class DryRun:
         self._derive_dates(deal, left_nursery, plan)
         plan["child"] = self._child(deal, deal_id, plan)
         if plan["child"]["status"] == CHILD_WOULD_CREATE:
+            self._check_creatable(deal, plan)
             self._check_possible_duplicate(deal, plan)
-        plan["contacts"] = self._contacts(deal_id, plan["child"], plan)
+        plan["contacts"] = self._contacts(deal_id, plan["child"], plan, context)
         plan["quotes"], quote_warnings = links.quote_summary(
             self._hubspot, self.labels(), deal_id
         )
@@ -246,6 +251,25 @@ class DryRun:
             return {"status": CHILD_FOUND, "famlyChildId": recorded, "via": "famly_childid"}
         return {"status": CHILD_WOULD_CREATE}
 
+    def _check_creatable(self, deal: dict, plan: dict) -> None:
+        """What a child create needs that the room and site rules do not already
+        hold for: a first and last name and a date of birth."""
+        holds = plan["holds"]
+        reasons = [h["reason"] for h in holds]
+        if not (
+            str(deal.get("child_first_name") or "").strip()
+            and str(deal.get("child_last_name") or "").strip()
+        ):
+            holds.append({"reason": CHILD_NAME_INCOMPLETE})
+        try:
+            dob = derive.parse_hubspot_date(deal.get("child_date_of_birth"))
+        except ValueError:
+            dob = None
+        if dob is None and not any(
+            r in reasons for r in (derive.DOB_MISSING, derive.DATE_INVALID)
+        ):
+            holds.append({"reason": derive.DOB_MISSING})
+
     def _check_possible_duplicate(self, deal: dict, plan: dict) -> None:
         """Before a child would be created: any child at the same site with the
         same date of birth AND a matching name is a HOLD (ids only). Names and
@@ -275,8 +299,12 @@ class DryRun:
             )
 
     # -- contacts -------------------------------------------------------- #
-    def _contacts(self, deal_id: str, child: dict, plan: dict) -> list[dict]:
+    def _contacts(
+        self, deal_id: str, child: dict, plan: dict, context: dict | None = None
+    ) -> list[dict]:
         deal_contacts = links.deal_contacts(self._hubspot, self.labels(), deal_id)
+        if context is not None:
+            context["contacts"] = deal_contacts
         holds, warnings = plan["holds"], plan["warnings"]
 
         bill_payers = sum(1 for c in deal_contacts if c.is_bill_payer)
@@ -321,6 +349,8 @@ class DryRun:
                 holds.append({"reason": CONTACT_NO_EMAIL, "hubspotContactId": contact.hubspot_id})
             elif child["status"] == CHILD_FOUND:
                 self._existing_child_contact(contact, on_child, entry, holds)
+                if entry.get("warnings"):
+                    warnings.extend(entry["warnings"])
             elif child["status"] == CHILD_WOULD_CREATE:
                 self._new_child_contact(contact, entry)
             else:
@@ -329,8 +359,10 @@ class DryRun:
         return out
 
     def _existing_child_contact(self, contact, on_child, entry: dict, holds: list) -> None:
-        """The child exists: the parent must already be one of its contacts.
-        There is no copy or create here, so an unmatched parent is a hold."""
+        """The child exists: a parent already on it is `present`; one that is not
+        is `would_create` (there is no copy logic any more). Contacts on the child
+        that share the part before the @ are reported as ids only, with a
+        warning, so a person can spot a parent entered under another address."""
         target = normalise_email(contact.email)
         here = list(dict.fromkeys(cid for cid, mail in on_child if mail == target))
         if len(here) == 1:
@@ -345,36 +377,20 @@ class DryRun:
                 }
             )
         else:
-            # Candidates share the part before the @ (ids only); they are
-            # evidence for a person to look at, never a match.
+            entry["status"] = WOULD_CREATE
             wanted = local_part(contact.email)
             candidates = list(
                 dict.fromkeys(
                     cid for cid, mail in on_child if wanted and local_part(mail) == wanted
                 )
             )
-            entry.update(status=UNMATCHED_ON_EXISTING_CHILD, candidateIds=candidates)
-            holds.append(
-                {
-                    "reason": UNMATCHED_ON_EXISTING_CHILD,
-                    "hubspotContactId": contact.hubspot_id,
-                    "candidateIds": candidates,
-                }
-            )
+            if candidates:
+                entry["candidateIds"] = candidates
+                entry["warnings"] = ["contact_possible_match_on_existing_child"]
 
     def _new_child_contact(self, contact, entry: dict) -> None:
-        """The child does not exist yet: copy the newest existing copy of this
-        email from another child, or create."""
-        copies = self._famly.copies_of_email(contact.email, None)
-        if copies:
-            entry.update(
-                status=WOULD_COPY,
-                famlyContactId=newest(copies).contact_id,
-                copyCount=len(copies),
-                copiesDiffer=copies_differ(copies),
-            )
-        else:
-            entry["status"] = WOULD_CREATE
+        """The child does not exist yet, so every contact is created."""
+        entry["status"] = WOULD_CREATE
 
 
 def _hubspot_child_names(deal: dict) -> list[str]:
@@ -452,3 +468,15 @@ def run(
     }
     logger.info("onboard_dry_run: %s", result["summary"])
     return result
+
+
+def plan_hash(plan: dict) -> str:
+    """A hash of the plan JSON. The plan holds ids, codes and counts only (no
+    personal data), so the hash is safe to store; if anything the approver saw
+    changes, it changes."""
+    import hashlib
+    import json
+
+    return hashlib.sha256(
+        json.dumps(plan, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()

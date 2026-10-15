@@ -136,6 +136,9 @@ class DealContact:
     phone_source: str = "none"
     has_complete_address: bool = False
     has_first_and_last_name: bool = False
+    # The raw allow-listed contact properties, IN MEMORY ONLY: used to build a
+    # Famly contact. repr=False so it can never leak into a log line by accident.
+    props: dict = field(default_factory=dict, repr=False)
 
 
 # Phone order: first one present wins. (source code, HubSpot property, Famly type)
@@ -223,6 +226,7 @@ def deal_contacts(client: HubSpotClient, labels: LabelMap, deal_id: str) -> list
                 phone_source=phone_source(props),
                 has_complete_address=has_complete_address(props),
                 has_first_and_last_name=has_first_and_last_name(props),
+                props=dict(props),
             )
         )
     return out

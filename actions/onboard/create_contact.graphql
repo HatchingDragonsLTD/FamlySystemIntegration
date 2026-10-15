@@ -1,0 +1,10 @@
+# THE CONTACT WRITE (phase 2). The shape proven by probe-contact-create: the
+# public API's ContactsMutation.create(contacts: [ContactInput!]!) -> [Contact!]!.
+# One contact per call, never batched, never retried. Only `id` is selected.
+mutation OnboardContactCreate($contacts: [ContactInput!]!) {
+  contacts {
+    create(contacts: $contacts) {
+      id
+    }
+  }
+}

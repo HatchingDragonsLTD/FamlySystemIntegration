@@ -17,6 +17,9 @@ from dataclasses import asdict, is_dataclass
 from actions.contact_lookup import cli as contact_lookup
 from actions.create_timeline import chain_cancel, chain_resume, chain_status, chain_sweep
 from actions.delete_plans import delete_digest, delete_resume
+from actions.onboard import cli_enqueue as onboard_enqueue
+from actions.onboard import cli_status as onboard_status
+from actions.onboard import cli_worker as onboard_worker
 from actions.onboard_dry_run import cli as onboard_dry_run
 from actions.plan_write import cli as plan_write
 from actions.probe_child_create import cli as probe_child_create
@@ -58,6 +61,9 @@ ACTIONS = [
     pull_roster,
     contact_lookup,
     onboard_dry_run,
+    onboard_enqueue,
+    onboard_worker,
+    onboard_status,
     probe_contact_create,
     probe_child_create,
     probe_child_delete,
