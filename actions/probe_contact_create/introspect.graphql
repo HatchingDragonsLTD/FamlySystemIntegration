@@ -1,0 +1,13 @@
+# READ-ONLY schema introspection of the contact-create mutation and its input.
+query ProbeIntrospect {
+  mutation: __type(name: "ContactsMutation") {
+    fields {
+      name
+      args { name type { kind name ofType { kind name ofType { kind name ofType { kind name } } } } }
+      type { kind name ofType { kind name ofType { kind name ofType { kind name } } } }
+    }
+  }
+  input: __type(name: "ContactInput") {
+    inputFields { name type { kind name ofType { kind name ofType { kind name ofType { kind name } } } } }
+  }
+}
