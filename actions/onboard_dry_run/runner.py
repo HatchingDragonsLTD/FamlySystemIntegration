@@ -16,7 +16,7 @@ HOLDS. Anything that could put a child in the wrong room, link the wrong child
 or pick between candidates is a HOLD with a reason code, never a guess:
 site_unmapped, site_id_missing, group_missing, group_ambiguous, dob_missing,
 start_date_missing, date_invalid, dates_inconsistent, child_ambiguous,
-contact_no_email, contact_ambiguous_on_child,
+contact_no_email, contact_ambiguous_on_child, contact_unmatched_on_existing_child,
 bill_payer_unclear, famly_childid_not_found, child_possible_duplicate,
 end_date_missing, deal_not_found.
 A deal with any hold is `held`; one without is `ready`; one a read failed for is
@@ -47,6 +47,7 @@ CHILD_AMBIGUOUS = "child_ambiguous"
 # Contact statuses.
 PRESENT = "present"
 WOULD_CREATE = "would_create"
+UNMATCHED_ON_EXISTING_CHILD = "contact_unmatched_on_existing_child"
 NO_EMAIL = "no_email"
 AMBIGUOUS_ON_CHILD = "ambiguous_on_child"
 CHILD_UNRESOLVED = "child_unresolved"
@@ -83,19 +84,29 @@ class DryRun:
         return self._stages
 
     # ------------------------------------------------------------------ #
-    def plan_deal(self, deal_id: str, context: dict | None = None) -> dict:
+    def plan_deal(
+        self,
+        deal_id: str,
+        context: dict | None = None,
+        created_child_id: str | None = None,
+    ) -> dict:
         """The dry-run plan for one deal. Never raises for a read failure: that
         becomes `status: error` so one bad deal cannot stop a batch.
 
         `context`, if given, is filled with `deal` (the raw allow-listed deal
         properties) and `contacts` (the DealContacts, with their raw properties):
         personal data for the phase-2 writer, held in memory only. It is never
-        part of the returned plan."""
+        part of the returned plan.
+
+        `created_child_id` is the child THIS JOB created, if it has created one
+        (the child id in the job record). A child found by lookup that is not
+        that one already existed when the job started, and is handled more
+        strictly: see `_existing_child_contact`."""
         deal_id = str(deal_id).strip()
         plan: dict[str, Any] = {"dealId": deal_id, "holds": [], "warnings": []}
         context = context if context is not None else {}
         try:
-            self._plan(deal_id, plan, context)
+            self._plan(deal_id, plan, context, created_child_id)
         except HubSpotError as exc:
             if exc.status_code == 404:
                 plan["holds"].append({"reason": DEAL_NOT_FOUND})
@@ -111,7 +122,9 @@ class DryRun:
         )
         return plan
 
-    def _plan(self, deal_id: str, plan: dict, context: dict) -> None:
+    def _plan(
+        self, deal_id: str, plan: dict, context: dict, created_child_id: str | None = None
+    ) -> None:
         deal = self._hubspot.get_deal(deal_id)
         context["deal"] = deal
         warnings = plan["warnings"]
@@ -122,6 +135,13 @@ class DryRun:
         self._derive_group(deal, site_code, left_nursery, plan)
         self._derive_dates(deal, left_nursery, plan)
         plan["child"] = self._child(deal, deal_id, plan)
+        if plan["child"]["status"] == CHILD_FOUND:
+            # Existing when the job started, or created by this very job.
+            plan["child"]["origin"] = (
+                "created_by_this_job"
+                if created_child_id and plan["child"]["famlyChildId"] == created_child_id
+                else "existing"
+            )
         if plan["child"]["status"] == CHILD_WOULD_CREATE:
             self._check_creatable(deal, plan)
             self._check_possible_duplicate(deal, plan)
@@ -348,9 +368,10 @@ class DryRun:
                 entry["status"] = NO_EMAIL
                 holds.append({"reason": CONTACT_NO_EMAIL, "hubspotContactId": contact.hubspot_id})
             elif child["status"] == CHILD_FOUND:
-                self._existing_child_contact(contact, on_child, entry, holds)
-                if entry.get("warnings"):
-                    warnings.extend(entry["warnings"])
+                self._existing_child_contact(
+                    contact, on_child, entry, holds,
+                    own_child=child.get("origin") == "created_by_this_job",
+                )
             elif child["status"] == CHILD_WOULD_CREATE:
                 self._new_child_contact(contact, entry)
             else:
@@ -358,11 +379,21 @@ class DryRun:
             out.append(entry)
         return out
 
-    def _existing_child_contact(self, contact, on_child, entry: dict, holds: list) -> None:
-        """The child exists: a parent already on it is `present`; one that is not
-        is `would_create` (there is no copy logic any more). Contacts on the child
-        that share the part before the @ are reported as ids only, with a
-        warning, so a person can spot a parent entered under another address."""
+    def _existing_child_contact(
+        self, contact, on_child, entry: dict, holds: list, own_child: bool = False
+    ) -> None:
+        """The child exists. A parent already on it (canonical email: trimmed,
+        lower-cased, googlemail.com = gmail.com) is `present`.
+
+        One that is not:
+          * on a child that ALREADY EXISTED when the job started: a HOLD,
+            `contact_unmatched_on_existing_child`, with the ids of contacts on the
+            child that share the part before the @ (ids only: evidence for a
+            person, never a match). A contact is never added to a child somebody
+            else created on a guess.
+          * on a child THIS JOB created: `would_create`, as the child was ours
+            and these are the contacts we are putting on it.
+        """
         target = normalise_email(contact.email)
         here = list(dict.fromkeys(cid for cid, mail in on_child if mail == target))
         if len(here) == 1:
@@ -376,17 +407,23 @@ class DryRun:
                     "contactIds": here,
                 }
             )
-        else:
+        elif own_child:
             entry["status"] = WOULD_CREATE
+        else:
             wanted = local_part(contact.email)
             candidates = list(
                 dict.fromkeys(
                     cid for cid, mail in on_child if wanted and local_part(mail) == wanted
                 )
             )
-            if candidates:
-                entry["candidateIds"] = candidates
-                entry["warnings"] = ["contact_possible_match_on_existing_child"]
+            entry.update(status=UNMATCHED_ON_EXISTING_CHILD, candidateIds=candidates)
+            holds.append(
+                {
+                    "reason": UNMATCHED_ON_EXISTING_CHILD,
+                    "hubspotContactId": contact.hubspot_id,
+                    "candidateIds": candidates,
+                }
+            )
 
     def _new_child_contact(self, contact, entry: dict) -> None:
         """The child does not exist yet, so every contact is created."""

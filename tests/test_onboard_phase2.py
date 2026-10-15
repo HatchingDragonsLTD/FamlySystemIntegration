@@ -76,6 +76,8 @@ class FakeHub(FakeHubSpot):
                                   "famly_sync_gaps", "dealname")}
         self.writes = []
         self.write_error = None
+        self.fail_write_numbers = set()    # fail these (1-based) write attempts
+        self.write_attempts = 0
 
     def deal_property_definitions(self):
         return dict(self.defs)
@@ -83,8 +85,9 @@ class FakeHub(FakeHubSpot):
     def write_deal_properties(self, deal_id, properties):
         if set(properties) - hubspot.WRITABLE_DEAL_PROPERTIES:
             raise AssertionError("write of a property outside the sync four")
-        if self.write_error:
-            raise self.write_error
+        self.write_attempts += 1
+        if self.write_error or self.write_attempts in self.fail_write_numbers:
+            raise self.write_error or HubSpotError("PATCH failed with HTTP 500", 500)
         self.writes.append((deal_id, dict(properties)))
 
 
@@ -540,15 +543,17 @@ class ChildCreateTests(Phase2Case):
                 self.famly.contacts[child_id] = []
         self.famly.after_first["OnboardChildByExternalRef"] = add
 
-    def test_a_child_that_now_exists_is_used_not_created(self):
+    def test_a_child_that_now_exists_is_used_not_created_and_gets_no_unmatched_contact(self):
         self.run_to_approval()
         self.approve()
-        self.appear("child-existing")
+        self.appear("child-existing")      # somebody else's child, with no contacts on it
         result = self.run_worker()
         self.assertEqual(self.famly.child_creates, [])               # no create
         self.assertEqual(self.job().child_id, "child-existing")
-        self.assertEqual(len(self.famly.contact_creates), 2)         # carried on with that child
-        self.assertEqual(result["status"], store.DONE)
+        self.assertEqual(self.famly.contact_creates, [])             # and nothing added to it
+        self.assertEqual(self.job().outcomes, ["c1:contact_unmatched_on_existing_child",
+                                               "c2:contact_unmatched_on_existing_child"])
+        self.assertEqual(result["status"], store.NEEDS_REVIEW)
 
     def test_two_children_found_before_the_write_is_needs_review(self):
         self.run_to_approval()
@@ -791,18 +796,22 @@ class ContactTests(Phase2Case):
             "name": "x", "externalId": "URN-1", "currentGroupId": GROUP_ID,
             "sitesRelation": [{"siteId": SITE_ID, "firstDay": "2026-01-15"}],
             "externalSystemsReferences": [{"foreignId": DEAL, "system": "HUBSPOT"}]}
-        self.famly.contacts["child-9"] = [("fc-1", "ADA.L@googlemail.com")]
+        self.famly.contacts["child-9"] = [("fc-1", "ADA.L@googlemail.com"),
+                                          ("fc-2", " Ben.B@Example.org ")]
         self.hub.contacts["c1"]["email"] = "ada.l@gmail.com"         # gmail == googlemail
-        self.run_through()
-        self.assertEqual(self.job().outcomes, ["c1:present", "c2:created"])
-        self.assertEqual(len(self.famly.contact_creates), 1)
+        self.enqueue()
+        result = self.run_worker()      # nothing to write: no approval is needed
+        self.assertEqual(result["status"], store.DONE)
+        self.assertEqual(self.job().outcomes, ["c1:present", "c2:present"])
+        self.assertEqual(self.famly.contact_creates, [])
+        self.assertEqual(self.notify.gates, [])
 
 
 # --------------------------------------------------------------------------- #
 # Re-runs
 # --------------------------------------------------------------------------- #
 class RerunTests(Phase2Case):
-    def test_a_rerun_after_needs_review_only_does_what_is_missing(self):
+    def test_a_rerun_after_needs_review_does_not_add_a_contact_to_the_existing_child(self):
         self.hub.contacts["c2"]["lastname"] = ""
         self.run_through()
         self.assertEqual(self.job().status, store.NEEDS_REVIEW)
@@ -812,16 +821,33 @@ class RerunTests(Phase2Case):
         again = self.enqueue()
         self.assertEqual(again.outcome, store.CREATED)         # a fresh job
         self.assertNotEqual(again.job.id, first_job.id)
-        result = self.run_worker()                             # the live plan sees child + c1
-        self.assertEqual(result["status"], store.AWAITING_APPROVAL)
-        self.assertIn("1 to create, 1 present", self.notify.gates[-1][0])
-        self.approve()
-        self.run_worker()
-        self.assertEqual(self.job().status, store.DONE)
-        self.assertEqual(len(self.famly.child_creates), 1)     # never a second child
-        self.assertEqual(len(self.famly.contact_creates), 2)   # c1 once, c2 once: no duplicates
-        self.assertEqual(self.job().outcomes, ["c1:present", "c2:created"])
-        self.assertEqual(self.job().child_id, "child-1")
+        result = self.run_worker()
+        # The child now ALREADY EXISTED when this job started, so c2 (unmatched on
+        # it) is a hold, not something to create. A person adds it.
+        self.assertEqual((result["status"], result["code"]),
+                         (store.HELD, "contact_unmatched_on_existing_child"))
+        self.assertEqual(len(self.notify.gates), 1)            # only the first job asked
+        self.assertEqual(len(self.famly.child_creates), 1)
+        self.assertEqual(len(self.famly.contact_creates), 1)   # still only c1, from the first job
+
+    def test_a_rerun_after_our_own_contact_creation_creates_nothing(self):
+        # The first job creates the child and both contacts, then its FINAL
+        # write-back fails, so it ends needs_review although Famly is complete.
+        self.hub.fail_write_numbers = {2}
+        self.run_through()
+        self.assertEqual((self.job().status, self.job().last_error_code),
+                         (store.NEEDS_REVIEW, "hubspot_writeback_failed"))
+        self.assertEqual((len(self.famly.child_creates), len(self.famly.contact_creates)), (1, 2))
+
+        self.hub.fail_write_numbers = set()
+        self.assertEqual(self.enqueue().outcome, store.CREATED)
+        gates_before = len(self.notify.gates)
+        result = self.run_worker()
+        self.assertEqual(result["status"], store.DONE)         # nothing to write: no approval
+        self.assertEqual(len(self.notify.gates), gates_before)
+        self.assertEqual((len(self.famly.child_creates), len(self.famly.contact_creates)), (1, 2))
+        self.assertEqual(self.job().outcomes, ["c1:present", "c2:present"])
+        self.assertEqual(self.hub.writes[-1][1]["famly_sync_status"], "contacts_linked")
 
     def test_a_rerun_after_a_failed_create_does_not_double_create(self):
         self.famly.child_land_then_raise = None
@@ -959,7 +985,7 @@ class GuaranteeTests(Phase2Case):
         self.assertEqual(columns, ["id", "deal_id", "status", "mode", "plan_hash", "approved_hash",
                                    "child_id", "attempts", "last_error_code", "approval_ref",
                                    "child_create_sent", "outcomes", "claimed_at", "created_at",
-                                   "updated_at"])
+                                   "updated_at", "source"])
 
     def test_the_famly_writers_are_create_only_and_the_fake_would_catch_anything_else(self):
         for path in (famly_writes.CREATE_CHILD_QUERY, famly_writes.CREATE_CONTACT_QUERY):
@@ -998,6 +1024,112 @@ class GuaranteeTests(Phase2Case):
             self.assertEqual(web_registry.handle_slack_click(slack.ACTION_APPROVE, "pid", "U1"),
                              "plan")
         handler.assert_called_once()
+
+
+# --------------------------------------------------------------------------- #
+# Existing child vs a child this job created; Gate A for contact-only plans
+# --------------------------------------------------------------------------- #
+class ExistingChildRuleTests(Phase2Case):
+    def existing_child(self, contacts):
+        self.famly.children["child-9"] = {
+            "name": "x", "externalId": "URN-1", "currentGroupId": GROUP_ID,
+            "sitesRelation": [{"siteId": SITE_ID, "firstDay": "2026-01-15"}],
+            "externalSystemsReferences": [{"foreignId": DEAL, "system": "HUBSPOT"}]}
+        self.famly.contacts["child-9"] = list(contacts)
+
+    def own_child_job(self, contacts):
+        """A job whose record says it already created the child (as after a worker
+        that created it and then stopped), with these contacts on it."""
+        self.existing_child(contacts)
+        job = self.enqueue().job
+        store.update(job.id, child_id="child-9")
+        self.assertTrue(store.mark_child_create_sent(job.id))
+        return job
+
+    def test_an_existing_child_with_an_unmatched_contact_holds_with_no_writes(self):
+        self.existing_child([("fc-1", "ada.l@example.org"), ("fc-3", "ben.b@other.com")])
+        self.enqueue()
+        result = self.run_worker()
+        self.assertEqual((result["status"], result["code"]),
+                         (store.HELD, "contact_unmatched_on_existing_child"))
+        self.assertEqual(self.notify.gates, [])                    # nothing to approve
+        self.assertFalse(self.famly.child_creates or self.famly.contact_creates)
+        self.assertTrue(any("contact_unmatched_on_existing_child" in n for n in self.notify.notices))
+        self.assertEqual(self.hub.writes[0][1]["famly_sync_note"],
+                         "held:contact_unmatched_on_existing_child")
+        # Candidate ids live in the plan only; no email or name reaches Slack or the DB.
+        blob = self.all_output()
+        for value in PII:
+            self.assertNotIn(value, blob, value)
+
+    def test_every_unmatched_contact_on_an_existing_child_gets_its_own_hold(self):
+        from actions.onboard_dry_run.runner import DryRun
+        self.existing_child([])
+        plan = DryRun(self.hub, FamlyReads(self.famly, site_ids=[SITE_ID])).plan_deal(DEAL)
+        holds = [h for h in plan["holds"] if h["reason"] == "contact_unmatched_on_existing_child"]
+        self.assertEqual([(h["hubspotContactId"], h["candidateIds"]) for h in holds],
+                         [("c1", []), ("c2", [])])
+
+    def test_the_same_plan_for_a_child_this_job_created_proceeds(self):
+        job = self.own_child_job([("fc-1", "ada.l@example.org")])
+        result = self.run_worker()
+        # c2 is unmatched but the child is OURS: it stays would_create, so the job
+        # asks for approval rather than holding.
+        self.assertEqual(result["status"], store.AWAITING_APPROVAL)
+        self.assertIn("Child: created by this job", self.notify.gates[0][0])
+        self.approve(job)
+        final = self.run_worker()
+        self.assertEqual(final["status"], store.DONE)
+        self.assertEqual(self.job().outcomes, ["c1:present", "c2:created"])
+        self.assertEqual(self.famly.child_creates, [])             # not a second child
+        self.assertEqual(len(self.famly.contact_creates), 1)
+
+    def test_a_contact_only_plan_needs_approval_and_writes_nothing_before_it(self):
+        job = self.own_child_job([("fc-1", "ada.l@example.org")])
+        result = self.run_worker()
+        self.assertEqual(result["status"], store.AWAITING_APPROVAL)
+        self.assertEqual(len(self.notify.gates), 1)
+        self.assertFalse(self.famly.child_creates or self.famly.contact_creates)
+        self.assertEqual(self.hub.writes, [])
+        text = self.notify.gates[0][0]
+        self.assertIn("Famly writes planned: 0 child, 1 contact(s)", text)
+        self.assertIn("1 to create, 1 present", text)
+        # The click alone writes nothing either; the worker does, only afterwards.
+        self.approve(job)
+        self.assertFalse(self.famly.contact_creates)
+        self.run_worker()
+        self.assertEqual(len(self.famly.contact_creates), 1)
+
+    def test_a_contact_only_plan_whose_hash_changes_is_re_approved(self):
+        job = self.own_child_job([("fc-1", "ada.l@example.org")])
+        self.run_worker()
+        self.approve(job)
+        # A change the plan can see (the plan JSON holds presence flags and codes,
+        # never an email, so an email edit alone would not change the hash).
+        self.hub.contacts["c2"]["phone"] = ""
+        result = self.run_worker()
+        self.assertEqual(result["status"], store.AWAITING_APPROVAL)
+        self.assertEqual(len(self.notify.gates), 2)
+        self.assertIn("approval is needed again", self.notify.gates[1][0])
+        self.assertFalse(self.famly.contact_creates)
+
+    def test_a_plan_with_nothing_to_write_needs_no_approval(self):
+        self.existing_child([("fc-1", "ada.l@example.org"), ("fc-2", "ben.b@example.org")])
+        self.enqueue()
+        self.assertEqual(self.run_worker()["status"], store.DONE)
+        self.assertEqual(self.notify.gates, [])
+
+    def test_gmail_and_googlemail_are_the_same_parent_and_nothing_else_is(self):
+        self.existing_child([("fc-1", "ADA.L@GoogleMail.com "), ("fc-2", "ben.b@example.org")])
+        self.hub.contacts["c1"]["email"] = "ada.l@gmail.com"
+        self.enqueue()
+        self.assertEqual(self.run_worker()["status"], store.DONE)    # both matched
+        # A dot or a +tag is a different address: unmatched, so a hold.
+        store._reset_for_tests()
+        self.famly.contacts["child-9"] = [("fc-1", "a.da.l@gmail.com"), ("fc-2", "ben.b@example.org")]
+        self.enqueue()
+        result = self.run_worker()
+        self.assertEqual(result["code"], "contact_unmatched_on_existing_child")
 
 
 if __name__ == "__main__":

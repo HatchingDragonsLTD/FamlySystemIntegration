@@ -46,6 +46,7 @@ Routes:
     POST /slack/interactivity Slack-signature auth; Approve commits a plan
 """
 
+import hmac
 import logging
 import os
 
@@ -66,7 +67,7 @@ SHARED_SECRET = os.environ.get("INTAKE_SHARED_SECRET", "").strip()
 
 
 def _authorized(req) -> bool:
-    """Constant-ish check of the shared secret header.
+    """Constant-time check of the shared secret header.
 
     Returns False when no secret is configured, so a misconfigured server
     fails closed rather than accepting everything.
@@ -74,8 +75,7 @@ def _authorized(req) -> bool:
     if not SHARED_SECRET:
         return False
     provided = req.headers.get("X-Intake-Secret", "")
-    # Simple equality is fine here; both values are short server-side secrets.
-    return provided == SHARED_SECRET
+    return hmac.compare_digest(provided.encode("utf-8"), SHARED_SECRET.encode("utf-8"))
 
 
 def _envelope(

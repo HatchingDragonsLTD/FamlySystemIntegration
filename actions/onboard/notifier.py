@@ -38,10 +38,19 @@ def gate_text(plan: dict, plan_hash: str, mode: str, plan_changed: bool = False)
         f"Start date: {'present' if dates.get('firstDayPresent') else 'missing'} · "
         f"End date: {'present' if dates.get('lastDayPresent') else 'none'}"
     )
+    if child.get("status") == "child_would_create":
+        child_state = "would be created"
+    elif child.get("origin") == "created_by_this_job":
+        child_state = "created by this job"
+    else:
+        child_state = "already in Famly"
+    child_writes = 1 if child.get("status") == "child_would_create" else 0
     lines.append(
-        f"Child: {'would be created' if child.get('status') == 'child_would_create' else 'already in Famly'}"
-        f" · Contacts: {len(contacts)} ({creating} to create, {present} present) · "
-        f"Bill payer identified: {'yes' if bill_payer else 'no'}"
+        f"Famly writes planned: {child_writes} child, {creating} contact(s)"
+    )
+    lines.append(
+        f"Child: {child_state} · Contacts: {len(contacts)} ({creating} to create, "
+        f"{present} present) · Bill payer identified: {'yes' if bill_payer else 'no'}"
     )
     warnings = sorted(set(plan.get("warnings") or []))
     lines.append("Warnings: " + (", ".join(warnings) if warnings else "none"))

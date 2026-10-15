@@ -22,6 +22,7 @@ from actions.create_timeline import web as create_timeline_web
 from actions.plan_status import web as plan_status_web
 from actions.delete_plans import web as delete_plans_web  # TEMPORARY -- see its module docstring
 from actions.onboard import approval as onboard_approval
+from actions.onboard import web as onboard_web
 from actions.plan_write import approval as plan_write_approval
 from integrations import slack as _slack
 from actions.plan_write import web as plan_write_web
@@ -37,6 +38,7 @@ ACTIONS = {
     queue_timeline_web.ACTION_NAME: queue_timeline_web.handle,
     urn_lookup_web.ACTION_NAME: urn_lookup_web.handle,  # TEMPORARY backfill utility
     contact_lookup_web.ACTION_NAME: contact_lookup_web.handle,  # read-only HubSpot id linking
+    onboard_web.ACTION_NAME: onboard_web.handle,  # enqueue only: no Famly or HubSpot call
     delete_plans_web.ACTION_NAME: delete_plans_web.handle,  # TEMPORARY, DESTRUCTIVE clean-up utility
 }
 
