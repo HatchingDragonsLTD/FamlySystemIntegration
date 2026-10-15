@@ -1,0 +1,221 @@
+"""READ-ONLY HubSpot client for the onboarding pipeline.
+
+Bearer token from env HUBSPOT_TOKEN (the private app "Famly_Server_Key").
+
+HARD RULES, each pinned by tests:
+
+  * READ ONLY. The only HTTP method this module can send is GET (`_get`). There
+    is no POST/PUT/PATCH/DELETE code path, so nothing here can write to HubSpot.
+    Contacts and quotes are read one at a time with GET rather than via the
+    POST batch-read endpoint for exactly this reason.
+  * EXPLICIT ALLOW-LISTS. Every object read names the properties it wants
+    (`DEAL_PROPERTIES`, `CONTACT_PROPERTIES`, `QUOTE_PROPERTIES`). Never "all
+    properties": a contact also holds national insurance numbers, dates of
+    birth and photos that must never be requested.
+  * NEVER LOGS PROPERTY VALUES. A log line carries the method, path and status
+    only; an error carries the status and path, never a response body.
+  * RETRIES 429 and 5xx with backoff (honouring Retry-After), then raises.
+
+Values read here (names, emails, dates of birth) are held in memory by the
+caller for a single run only: never stored, logged or printed (CLAUDE.md).
+"""
+
+import logging
+import os
+import time
+from typing import Any, Callable
+
+import requests
+
+from core.config import ConfigError
+
+logger = logging.getLogger(__name__)
+
+BASE_URL = "https://api.hubapi.com"
+DEFAULT_TIMEOUT = 30
+MAX_ATTEMPTS = 5
+BACKOFF_BASE_SECONDS = 1.0
+BACKOFF_CAP_SECONDS = 30.0
+
+# The deal properties the dry run reads. `dealname` is requested but must never
+# be printed or logged (it can be a child's name).
+DEAL_PROPERTIES = (
+    "dealname",
+    "dealstage",
+    "pipeline",
+    "child_urn",
+    "child_date_of_birth",
+    "actual_start_date_1",
+    "location_of_interest",
+    "deposit_amount",
+    "famly_childid",
+)
+# Only what is needed to know the contact has an email, and to match it.
+CONTACT_PROPERTIES = ("email",)
+QUOTE_PROPERTIES = ("hs_status", "hs_quote_esign_status", "hs_manually_signed")
+
+# Association labels (verified by Drew in HubSpot's API details, 2026-10-15).
+# Matched by LABEL and INTERNAL NAME first; the type id is only a cross-check
+# and is reported when it differs. Each can be overridden from the environment.
+BILL_PAYER_LABEL = os.environ.get("HUBSPOT_BILL_PAYER_LABEL", "Bill Payer")
+BILL_PAYER_INTERNAL_NAME = os.environ.get(
+    "HUBSPOT_BILL_PAYER_INTERNAL_NAME", "bill_payer_childcare_account"
+)
+BILL_PAYER_TYPE_ID = int(os.environ.get("HUBSPOT_BILL_PAYER_TYPE_ID", "91"))
+SALES_LABEL = os.environ.get("HUBSPOT_SALES_LABEL", "Sales")
+SALES_INTERNAL_NAME = os.environ.get("HUBSPOT_SALES_INTERNAL_NAME", "sales_operations")
+SALES_OPERATIONS_TYPE_ID = int(os.environ.get("HUBSPOT_SALES_OPERATIONS_TYPE_ID", "138"))
+
+
+class HubSpotError(RuntimeError):
+    """A HubSpot call failed. Carries the status and path, never a body."""
+
+    def __init__(self, message: str, status_code: int | None = None):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+class HubSpotConfigError(ConfigError):
+    """HUBSPOT_TOKEN is missing."""
+
+
+class HubSpotClient:
+    def __init__(
+        self,
+        token: str | None = None,
+        *,
+        session: Any = None,
+        sleep: Callable[[float], None] = time.sleep,
+        base_url: str = BASE_URL,
+    ):
+        token = (token if token is not None else os.environ.get("HUBSPOT_TOKEN", "")).strip()
+        if not token:
+            raise HubSpotConfigError("HUBSPOT_TOKEN is not set")
+        self._token = token
+        self._session = session or requests.Session()
+        self._sleep = sleep
+        self._base_url = base_url.rstrip("/")
+
+    # ------------------------------------------------------------------ #
+    # The one and only transport. GET, with retry.
+    # ------------------------------------------------------------------ #
+    def _get(self, path: str, params: dict | None = None) -> dict:
+        url = f"{self._base_url}{path}"
+        headers = {"Authorization": f"Bearer {self._token}", "Accept": "application/json"}
+
+        for attempt in range(1, MAX_ATTEMPTS + 1):
+            try:
+                response = self._session.get(
+                    url, headers=headers, params=params, timeout=DEFAULT_TIMEOUT
+                )
+            except requests.RequestException as exc:
+                # Type only: the message can echo the URL.
+                if attempt == MAX_ATTEMPTS:
+                    raise HubSpotError(f"GET {path} failed: {type(exc).__name__}") from None
+                self._sleep(self._backoff(attempt, None))
+                continue
+
+            status = response.status_code
+            if status == 429 or status >= 500:
+                if attempt == MAX_ATTEMPTS:
+                    raise HubSpotError(f"GET {path} failed with HTTP {status}", status)
+                logger.info("hubspot: GET %s -> %s, retrying", path, status)
+                self._sleep(self._backoff(attempt, response.headers.get("Retry-After")))
+                continue
+
+            if status != 200:
+                raise HubSpotError(f"GET {path} failed with HTTP {status}", status)
+
+            try:
+                body = response.json()
+            except ValueError:
+                raise HubSpotError(f"GET {path} returned a non-JSON body", status) from None
+            return body if isinstance(body, dict) else {}
+
+        raise HubSpotError(f"GET {path} failed")  # unreachable; loop always returns/raises
+
+    @staticmethod
+    def _backoff(attempt: int, retry_after: Any) -> float:
+        try:
+            if retry_after is not None:
+                return min(float(retry_after), BACKOFF_CAP_SECONDS)
+        except (TypeError, ValueError):
+            pass
+        return min(BACKOFF_BASE_SECONDS * (2 ** (attempt - 1)), BACKOFF_CAP_SECONDS)
+
+    # ------------------------------------------------------------------ #
+    # Objects (allow-listed properties only)
+    # ------------------------------------------------------------------ #
+    def get_deal(self, deal_id: str) -> dict:
+        """The deal's allow-listed properties, as a flat dict. Raises HubSpotError
+        (status 404) if there is no such deal."""
+        body = self._get(
+            f"/crm/v3/objects/deals/{deal_id}",
+            {"properties": ",".join(DEAL_PROPERTIES)},
+        )
+        return dict(body.get("properties") or {})
+
+    def get_contact(self, contact_id: str) -> dict:
+        body = self._get(
+            f"/crm/v3/objects/contacts/{contact_id}",
+            {"properties": ",".join(CONTACT_PROPERTIES)},
+        )
+        return dict(body.get("properties") or {})
+
+    def get_quote(self, quote_id: str) -> dict:
+        body = self._get(
+            f"/crm/v3/objects/quotes/{quote_id}",
+            {"properties": ",".join(QUOTE_PROPERTIES)},
+        )
+        return dict(body.get("properties") or {})
+
+    def stage_names(self) -> dict[str, tuple[str, str]]:
+        """Deal stage id -> (pipeline label, stage label), for every pipeline."""
+        body = self._get("/crm/v3/pipelines/deals")
+        names: dict[str, tuple[str, str]] = {}
+        for pipeline in body.get("results") or []:
+            for stage in pipeline.get("stages") or []:
+                names[str(stage.get("id"))] = (
+                    str(pipeline.get("label") or ""),
+                    str(stage.get("label") or ""),
+                )
+        return names
+
+    # ------------------------------------------------------------------ #
+    # Associations (v4), with labels
+    # ------------------------------------------------------------------ #
+    def association_labels(self, from_type: str, to_type: str) -> list[dict]:
+        """The association definitions from `from_type` to `to_type`:
+        [{"typeId", "label", "category", "name"?}, ...]."""
+        body = self._get(f"/crm/v4/associations/{from_type}/{to_type}/labels")
+        return [dict(item) for item in body.get("results") or [] if isinstance(item, dict)]
+
+    def associations(self, from_type: str, from_id: str, to_type: str) -> list[dict]:
+        """Objects of `to_type` associated with the object, each as
+        {"id": str, "types": [{"typeId", "label", "category"}, ...]}. Follows
+        paging."""
+        out: list[dict] = []
+        after: str | None = None
+        while True:
+            params = {"limit": 500}
+            if after:
+                params["after"] = after
+            body = self._get(
+                f"/crm/v4/objects/{from_type}/{from_id}/associations/{to_type}", params
+            )
+            for item in body.get("results") or []:
+                if not isinstance(item, dict) or item.get("toObjectId") is None:
+                    continue
+                out.append(
+                    {
+                        "id": str(item["toObjectId"]),
+                        "types": [
+                            dict(t)
+                            for t in item.get("associationTypes") or []
+                            if isinstance(t, dict)
+                        ],
+                    }
+                )
+            after = ((body.get("paging") or {}).get("next") or {}).get("after")
+            if not after:
+                return out

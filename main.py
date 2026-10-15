@@ -17,6 +17,7 @@ from dataclasses import asdict, is_dataclass
 from actions.contact_lookup import cli as contact_lookup
 from actions.create_timeline import chain_cancel, chain_resume, chain_status, chain_sweep
 from actions.delete_plans import delete_digest, delete_resume
+from actions.onboard_dry_run import cli as onboard_dry_run
 from actions.plan_write import cli as plan_write
 from actions.queue_timeline import (
     queue_cancel,
@@ -37,6 +38,7 @@ from actions.staff_credentials import cli as staff_credentials
 from actions.plan_write.runner import PlanCommitRefused
 from core.client import GraphQLError, GraphQLHTTPError
 from core.config import ConfigError
+from core.hubspot import HubSpotError
 from core.rest_client import RestHTTPError
 from integrations.catalogue import UnknownInstitutionError
 
@@ -52,6 +54,7 @@ ACTIONS = [
     pull_references,
     pull_roster,
     contact_lookup,
+    onboard_dry_run,
     chain_status,
     chain_cancel,
     chain_resume,
@@ -114,6 +117,9 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     except RestHTTPError as exc:
         print(f"HTTP error: {exc}", file=sys.stderr)
+        return 1
+    except HubSpotError as exc:
+        print(f"HubSpot error: {exc}", file=sys.stderr)
         return 1
     except PlanCommitRefused as exc:
         print(f"Refused: {exc}", file=sys.stderr)
