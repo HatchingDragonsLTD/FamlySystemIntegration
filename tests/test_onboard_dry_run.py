@@ -443,7 +443,7 @@ class ChildLookupTests(DryRunTestCase):
         self.famly.ext_refs["D1"] = ["child-1"]
         child = self.plan()["child"]
         self.assertEqual(child, {"status": "child_found", "famlyChildId": "child-1",
-                                 "via": "external_system_reference"})
+                                 "via": "external_system_reference", "origin": "existing"})
         self.assertNotIn(urn_runner.OPERATION_NAME, self.famly.calls)
 
     def test_no_reference_falls_back_to_the_urn_live(self):
@@ -495,7 +495,7 @@ class ContactPlanTests(DryRunTestCase):
         self.assertEqual(first["labels"], [
             {"typeId": 91, "label": "Bill Payer", "direction": "deal_to_contact"}])
 
-    def test_existing_child_unmatched_parent_is_would_create_with_a_warning(self):
+    def test_existing_child_unmatched_parent_is_a_hold_with_candidate_ids_only(self):
         self.famly.ext_refs["D1"] = ["child-1"]
         self.famly.child_contacts["child-1"] = [
             ("fc-1", "parent.one@example.org"),
@@ -504,12 +504,34 @@ class ContactPlanTests(DryRunTestCase):
         ]
         plan = self.plan()
         second = plan["contacts"][1]
-        self.assertEqual(second["status"], "would_create")
-        self.assertEqual(second["candidateIds"], ["fc-3"])  # ids only, evidence not a match
+        self.assertEqual(second["status"], "contact_unmatched_on_existing_child")
+        self.assertEqual(second["candidateIds"], ["fc-3"])   # ids only: evidence, not a match
         self.assertNotIn("famlyContactId", second)
-        self.assertIn("contact_possible_match_on_existing_child", plan["warnings"])
+        self.assertEqual(plan["child"]["origin"], "existing")
+        hold = [h for h in plan["holds"] if h["reason"] == "contact_unmatched_on_existing_child"]
+        self.assertEqual(hold, [{"reason": "contact_unmatched_on_existing_child",
+                                 "hubspotContactId": "c2", "candidateIds": ["fc-3"]}])
+        self.assertEqual(plan["status"], "held")
+        blob = json.dumps(plan)
+        for text in ("example.org", "other.com", "parent.two", "@"):
+            self.assertNotIn(text, blob)           # no email, not even a fragment
+
+    def test_a_child_created_by_this_job_keeps_would_create_for_an_unmatched_contact(self):
+        self.famly.ext_refs["D1"] = ["child-1"]
+        self.famly.child_contacts["child-1"] = [("fc-1", "parent.one@example.org")]
+        plan = self.dry_with_own_child("child-1")
+        self.assertEqual(plan["child"]["origin"], "created_by_this_job")
+        self.assertEqual([c["status"] for c in plan["contacts"]], ["present", "would_create"])
         self.assertEqual(plan["holds"], [])
-        self.assertEqual(plan["status"], "ready")
+        # A DIFFERENT child id in the job record is not this child: it existed already.
+        other = self.dry_with_own_child("some-other-child")
+        self.assertEqual(other["child"]["origin"], "existing")
+        self.assertEqual(self.reasons(other), ["contact_unmatched_on_existing_child"])
+
+    def dry_with_own_child(self, child_id):
+        from actions.onboard_dry_run.runner import DryRun
+        return DryRun(self.hub, FamlyReads(self.famly, site_ids=[WEST_ID])).plan_deal(
+            "D1", None, created_child_id=child_id)
 
     def test_googlemail_and_gmail_match_and_nothing_else_is_fuzzy(self):
         from actions.onboard_dry_run.famly_reads import normalise_email
@@ -747,7 +769,7 @@ class ChildSafetyTests(DryRunTestCase):
         self.famly.urn_children = [("child-5", "other-urn")]
         plan = self.plan()
         self.assertEqual(plan["child"], {"status": "child_found", "famlyChildId": "child-5",
-                                         "via": "famly_childid"})
+                                         "via": "famly_childid", "origin": "existing"})
         self.assertNotIn("famly_childid_not_found", self.reasons(plan))
 
     def test_possible_duplicate_needs_same_site_birth_date_and_name(self):

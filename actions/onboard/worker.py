@@ -168,8 +168,22 @@ def _process(job: store.Job, deps: Deps, run_mode: str) -> dict:
         _held(job, deps, ["deal_not_allowlisted"], write_back=False)
         return {}
 
+    # A job from the webhook must first be confirmed as an Operations deal at
+    # Deposit Pending. Its FIRST live read; a CLI job has no such restriction.
+    # No write of any kind, HubSpot included, when it is not.
+    if job.source == "webhook":
+        reason = _webhook_hold_reason(deps, deal_id)
+        if reason:
+            _held(job, deps, [reason], write_back=False)
+            return {}
+
     context: dict = {}
-    plan = DryRun(deps.hubspot, deps.famly()).plan_deal(deal_id, context)
+    # The child id in the job record, if THIS job created a child: the plan then
+    # knows the child is ours and not one that already existed.
+    own_child_id = job.child_id if job.child_create_sent else None
+    plan = DryRun(deps.hubspot, deps.famly()).plan_deal(
+        deal_id, context, created_child_id=own_child_id
+    )
     if plan["status"] == "error":
         raise StopJob(store.FAILED, "plan_read_failed")
 
@@ -185,14 +199,48 @@ def _process(job: store.Job, deps: Deps, run_mode: str) -> dict:
         store.set_status(job.id, store.DRY_DONE, plan_hash=digest)
         return {}
 
-    needs_writes = plan["child"]["status"] == "child_would_create" or any(
-        c["status"] == "would_create" for c in plan["contacts"]
-    )
-    if needs_writes and job.approved_hash != digest:
+    # GATE A applies to ANY live plan that would perform a Famly write: a child
+    # create, or only contact creates on a child that exists.
+    if famly_writes_planned(plan) and job.approved_hash != digest:
         _ask_for_approval(job, deps, plan, digest, run_mode, plan_changed=job.approved_hash is not None)
         return {}
 
     return _write_phase(job, deps, plan, context, digest)
+
+
+def famly_writes_planned(plan: dict) -> bool:
+    """Whether the plan would write to Famly at all: a child create and/or any
+    contact create. Such a plan needs a Slack approval (Gate A) in live mode."""
+    return plan["child"]["status"] == "child_would_create" or any(
+        c["status"] == "would_create" for c in plan["contacts"]
+    )
+
+
+STAGE_NOT_ELIGIBLE = "stage_not_eligible"
+ELIGIBLE_PIPELINE = "operations"
+ELIGIBLE_STAGE = "deposit pending"
+
+
+def _webhook_hold_reason(deps, deal_id: str) -> str | None:
+    """None if the deal is in the Operations pipeline at Deposit Pending, else the
+    hold reason (`stage_not_eligible`, or `deal_not_found`).
+
+    Raises:
+        StopJob: HubSpot could not be read (`plan_read_failed`).
+    """
+    try:
+        deal = deps.hubspot.get_deal(deal_id)
+        pipeline, stage = deps.hubspot.stage_names().get(str(deal.get("dealstage")), ("", ""))
+    except HubSpotError as exc:
+        if exc.status_code == 404:
+            return "deal_not_found"
+        raise StopJob(store.FAILED, "plan_read_failed") from None
+    if (
+        derive.norm_stage(pipeline) == ELIGIBLE_PIPELINE
+        and derive.norm_stage(stage) == ELIGIBLE_STAGE
+    ):
+        return None
+    return STAGE_NOT_ELIGIBLE
 
 
 def _ask_for_approval(job, deps, plan, digest, run_mode, plan_changed: bool) -> None:
@@ -229,12 +277,16 @@ def _write_phase(job, deps, plan, context, digest) -> dict:
     deal = context["deal"]
     child_id, created = _ensure_child(job, deps, plan, deal)
     store.update(job.id, child_id=child_id)
+    # Ours if this job created it now, or created it earlier (the job record).
+    own_child = created or (job.child_create_sent and job.child_id == child_id)
 
     _write_back(deps, deal_id, hubspot_sync.STATUS_CHILD_READY, "child_ready",
                 plan["warnings"], child_id)
 
     store.set_status(job.id, store.CREATING_CONTACTS)
-    outcomes, contact_warnings, all_ok = _create_contacts(job, deps, plan, context, child_id)
+    outcomes, contact_warnings, all_ok = _create_contacts(
+        job, deps, plan, context, child_id, own_child
+    )
     store.update(job.id, outcomes=outcomes)
 
     codes = sorted({o.split(":", 1)[1] for o in outcomes if o.split(":", 1)[1] not in OK_OUTCOMES})
@@ -336,7 +388,9 @@ def _verify_child(deps, deal, deal_id, plan, child_id, is_test) -> None:
 # --------------------------------------------------------------------------- #
 # Contacts
 # --------------------------------------------------------------------------- #
-def _create_contacts(job, deps, plan, context, child_id) -> tuple[list[str], list[str], bool]:
+def _create_contacts(
+    job, deps, plan, context, child_id, own_child: bool
+) -> tuple[list[str], list[str], bool]:
     """(outcome codes, warning codes, whether every contact is created/present)."""
     famly = deps.famly()
     by_id = {c.hubspot_id: c for c in context["contacts"]}
@@ -370,6 +424,13 @@ def _create_contacts(job, deps, plan, context, child_id) -> tuple[list[str], lis
             continue
         if len(here) > 1:
             record(hubspot_id, "ambiguous_on_child")
+            continue
+
+        if not own_child:
+            # A child that already existed: an unmatched contact is never added to
+            # it (the plan holds on this; this is the last line, for a child that
+            # appeared between the plan and the write).
+            record(hubspot_id, "contact_unmatched_on_existing_child")
             continue
 
         try:

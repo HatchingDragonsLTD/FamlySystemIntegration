@@ -27,6 +27,9 @@ could carry data.
                        a job never sends a second one
     outcomes           JSON list of contact outcome codes
     claimed_at         set while a worker holds the job
+    source             cli | webhook: how the job was enqueued. A `webhook` job
+                       must pass the worker's stage check (Operations pipeline,
+                       Deposit Pending) or it is held `stage_not_eligible`
 
 ONE ACTIVE JOB PER DEAL is enforced by a UNIQUE PARTIAL INDEX, not just in code:
 active = queued, awaiting_approval, creating_child, creating_contacts. `held`,
@@ -85,7 +88,8 @@ CREATE TABLE IF NOT EXISTS onboard_jobs (
     outcomes          TEXT,
     claimed_at        TEXT,
     created_at        TEXT NOT NULL,
-    updated_at        TEXT NOT NULL
+    updated_at        TEXT NOT NULL,
+    source            TEXT NOT NULL DEFAULT 'cli'
 );
 CREATE UNIQUE INDEX IF NOT EXISTS onboard_one_active_per_deal
     ON onboard_jobs (deal_id)
@@ -116,6 +120,7 @@ class Job:
     outcomes: list | None = None
     created_at: str | None = None
     updated_at: str | None = None
+    source: str = "cli"
 
 
 def store_path() -> Path:
@@ -137,10 +142,23 @@ def _open():
     try:
         connection.execute("PRAGMA journal_mode=WAL")
         connection.executescript(_SCHEMA)
+        _migrate(connection)
         yield connection
         connection.commit()
     finally:
         connection.close()
+
+
+def _migrate(connection: sqlite3.Connection) -> None:
+    """Add columns a store created before they existed does not have."""
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(onboard_jobs)")}
+    if "source" not in columns:
+        connection.execute(
+            "ALTER TABLE onboard_jobs ADD COLUMN source TEXT NOT NULL DEFAULT 'cli'"
+        )
+
+
+SOURCES = ("cli", "webhook")
 
 
 def _to_job(row: sqlite3.Row) -> Job:
@@ -155,6 +173,7 @@ def _to_job(row: sqlite3.Row) -> Job:
         last_error_code=row["last_error_code"], approval_ref=row["approval_ref"],
         child_create_sent=bool(row["child_create_sent"]), outcomes=outcomes,
         created_at=row["created_at"], updated_at=row["updated_at"],
+        source=row["source"],
     )
 
 
@@ -172,7 +191,7 @@ class Enqueued:
     job: Job
 
 
-def enqueue(deal_id: str, mode: str) -> Enqueued:
+def enqueue(deal_id: str, mode: str, source: str = "cli") -> Enqueued:
     """Enqueue a job for `deal_id`, with ONE atomic INSERT.
 
     * A deal that already has a `done` job creates no job (`already_done`).
@@ -182,6 +201,8 @@ def enqueue(deal_id: str, mode: str) -> Enqueued:
       `dry_done` job does not block a fresh one; its first action is the live
       plan, which sees what is already in Famly.
     """
+    if source not in SOURCES:
+        raise ValueError(f"unknown job source: {source!r}")
     deal_id = str(deal_id).strip()
     with _open() as connection:
         done = connection.execute(
@@ -197,9 +218,9 @@ def enqueue(deal_id: str, mode: str) -> Enqueued:
     try:
         with _open() as connection:
             connection.execute(
-                "INSERT INTO onboard_jobs (id, deal_id, status, mode, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?)",
-                (job_id, deal_id, QUEUED, mode, now),
+                "INSERT INTO onboard_jobs (id, deal_id, status, mode, created_at, updated_at, source) "
+                "VALUES (?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?, ?)",
+                (job_id, deal_id, QUEUED, mode, now, source),
             )
     except sqlite3.IntegrityError:
         active = active_for_deal(deal_id)

@@ -993,8 +993,9 @@ Output holds ids, codes and counts only: no names, emails, phone numbers or
 dates of birth. It never uses `roster_cache.db`.
 
 On a child that already exists, a HubSpot parent whose email is not one of its
-contacts is a hold (`contact_unmatched_on_existing_child`); copy/create is only
-planned for a child that does not exist yet. `googlemail.com` and `gmail.com`
+contacts is a hold (`contact_unmatched_on_existing_child`, with candidate ids only);
+create is only planned for a child that does not exist yet or that the job itself
+created. `googlemail.com` and `gmail.com`
 compare equal; nothing else is fuzzy. Left Nursery deals use Voyagers and need a
 start date and an end date (`end_date`, the Leave Date); the output says only
 whether each date is present.
@@ -1034,6 +1035,26 @@ those four properties does not exist). Names, emails, phones, addresses and date
 of birth are held in memory only; the jobs table, Slack and the logs carry ids,
 codes and hashes. See `actions/onboard/worker.py` and
 `docs/famly_onboarding_pipeline_design.md`.
+
+### HubSpot trigger (HTTP)
+
+The webhook action sends, to the existing intake route:
+
+```
+POST https://<domain>/intake
+X-Intake-Secret: <INTAKE_SHARED_SECRET>
+Content-Type: application/json
+
+{"action": "onboard_enqueue", "dealId": "<deal record id>"}
+```
+
+`dealId` may be a string or a number but must be digits only (else 400). The
+request only enqueues (same function as `onboard-enqueue`) and returns the job id;
+the worker does the rest. It answers 200 for `queued`, `already_queued`,
+`already_done`, `refused_mode_off` and `refused_not_allowlisted`, so HubSpot's
+retries only fire on a real fault (500). A job from the webhook is held
+`stage_not_eligible` unless the deal is in the Operations pipeline at Deposit
+Pending; a CLI job has no such rule.
 
 ## Tests
 
