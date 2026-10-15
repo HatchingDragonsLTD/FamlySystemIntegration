@@ -302,9 +302,145 @@ class CliTests(unittest.TestCase):
                 mock.patch.object(cli, "_public_client", return_value=public), \
                 mock.patch.object(cli, "GraphQLClient", return_value=object()):
             with self.assertRaises(SystemExit) as ctx, contextlib.redirect_stderr(io.StringIO()):
-                cli.handle(argparse.Namespace(confirm=False))
+                cli.handle(argparse.Namespace(confirm=False, no_delete=False))
         self.assertEqual(ctx.exception.code, 3)
         self.assertEqual(public.calls, [])
+
+
+# --------------------------------------------------------------------------- #
+# --no-delete and probe-child-delete
+# --------------------------------------------------------------------------- #
+ID_ONE = "11111111-1111-1111-1111-111111111111"
+ID_TWO = "22222222-2222-2222-2222-222222222222"
+ID_THREE = "33333333-3333-3333-3333-333333333333"
+
+
+class NoDeleteTests(ProbeTestCase):
+    def run_no_delete(self):
+        return runner.run_probe(True, self.rest, self.public, self.internal,
+                                out=self.lines.append, no_delete=True)
+
+    def test_no_delete_skips_the_delete_step_and_says_the_ids_must_be_deleted(self):
+        result = self.run_no_delete()
+        self.assertNotIn(runner.DELETE_OP, self.public.calls)
+        self.assertEqual(self.public.delete_vars, [])
+        self.assertEqual(result.deleted, [])
+        self.assertEqual(result.undeleted, ["child-1", "child-2"])
+        self.assertIn("--no-delete: the delete step was SKIPPED", self.text)
+        self.assertIn("MUST BE DELETED", self.text)
+        self.assertIn("  child-1", self.text)
+        self.assertIn("  child-2", self.text)
+        self.assertIn("probe-child-delete --child-ids child-1,child-2 --confirm", self.text)
+        # Nothing was deleted, so the "no longer returned" lookups are not run.
+        self.assertNotIn("FINAL LOOKUPS", self.text)
+
+    def test_no_delete_still_creates_and_inspects_within_the_caps(self):
+        self.run_no_delete()
+        self.assertEqual(len(self.public.creates), 2)
+        self.assertIn("FULL INTERNAL SUMMARY", self.text)
+        self.assertLessEqual(len(self.public.writes), runner.MAX_WRITES)
+
+    def test_the_flag_is_off_by_default_and_passed_through(self):
+        parser = argparse.ArgumentParser()
+        cli.add_args(parser)
+        self.assertFalse(parser.parse_args(["--confirm"]).no_delete)
+        self.assertTrue(parser.parse_args(["--confirm", "--no-delete"]).no_delete)
+        public = FakePublic()
+        with mock.patch.object(cli, "RestClient", return_value=FakeRest()), \
+                mock.patch.object(cli, "_public_client", return_value=public), \
+                mock.patch.object(cli, "GraphQLClient", return_value=FakeInternal(public)), \
+                mock.patch.object(runner, "resolve_site_and_group", return_value=(SITE_ID, GROUP_ID)), \
+                contextlib.redirect_stdout(io.StringIO()):
+            cli.handle(argparse.Namespace(confirm=True, no_delete=True))
+        self.assertNotIn(runner.DELETE_OP, public.calls)
+
+
+class DeleteCommandTests(unittest.TestCase):
+    def setUp(self):
+        self.public = FakePublic()
+        self.rest = FakeRest()
+        self.lines = []
+
+    def delete(self, ids, confirm=True):
+        return runner.run_delete(ids, confirm, self.rest, self.public, out=self.lines.append)
+
+    @property
+    def text(self):
+        return "\n".join(self.lines)
+
+    def assert_nothing_happened(self):
+        self.assertEqual(self.public.calls, [])
+        self.assertEqual(self.public.delete_vars, [])
+
+    def test_it_refuses_without_confirm_and_touches_nothing(self):
+        with self.assertRaises(runner.ProbeRefused):
+            self.delete([ID_ONE], confirm=False)
+        self.assert_nothing_happened()
+        self.assertEqual(self.rest.gets, [])
+
+    def test_ids_are_limited_to_two_distinct_uuids(self):
+        for raw in ("", " , ", f"{ID_ONE},{ID_TWO},{ID_THREE}", "not-a-uuid", f"{ID_ONE},oops"):
+            with self.subTest(raw=raw):
+                with self.assertRaises(runner.ProbeRefused):
+                    runner.parse_child_ids(raw)
+        self.assertEqual(runner.parse_child_ids(f" {ID_ONE} , {ID_ONE},{ID_TWO} "), [ID_ONE, ID_TWO])
+        with self.assertRaises(runner.ProbeRefused):   # the run itself also enforces the cap
+            self.delete([ID_ONE, ID_TWO, ID_THREE])
+        self.assert_nothing_happened()
+
+    def test_every_id_must_be_a_test_child_or_nothing_is_deleted(self):
+        self.rest.not_test.add(ID_TWO)   # the SECOND id is a real child
+        with self.assertRaises(runner.ProbeRefused) as ctx:
+            self.delete([ID_ONE, ID_TWO])
+        self.assertIn(ID_TWO, str(ctx.exception))
+        self.assert_nothing_happened()   # not even the first one, which was fine
+
+    def test_an_unreadable_summary_refuses_everything(self):
+        self.rest.error = RestHTTPError("boom", 500, "body")
+        with self.assertRaises(runner.ProbeRefused):
+            self.delete([ID_ONE])
+        self.assert_nothing_happened()
+
+    def test_it_sends_one_child_per_request_and_never_site_ids(self):
+        result = self.delete([ID_ONE, ID_TWO])
+        self.assertEqual(self.public.delete_vars, [{"childIds": [ID_ONE]}, {"childIds": [ID_TWO]}])
+        self.assertEqual(result.deleted, [ID_ONE, ID_TWO])
+        self.assertEqual(result.writes, 2)
+        for variables in self.public.delete_vars:
+            self.assertEqual(list(variables), ["childIds"])
+            self.assertNotIn("siteIds", variables)
+        # Each id was read once up front and once again right before its delete.
+        self.assertEqual(self.rest.reads, {ID_ONE: 2, ID_TWO: 2})
+
+    def test_a_child_that_stops_being_a_test_child_before_its_delete_is_not_deleted(self):
+        self.rest.flip_on_second_read.add(ID_ONE)
+        result = self.delete([ID_ONE, ID_TWO])
+        self.assertEqual(self.public.delete_vars, [{"childIds": [ID_TWO]}])
+        self.assertEqual(result.undeleted, [ID_ONE])
+        self.assertIn("NOT DELETING " + ID_ONE, self.text)
+        self.assertIn("DELETE THESE TEST CHILDREN BY HAND", self.text)
+
+    def test_with_no_delete_mutation_the_ids_are_printed_instead(self):
+        self.public = FakePublic(has_delete=False)
+        result = self.delete([ID_ONE])
+        self.assertNotIn(runner.DELETE_OP, self.public.calls)
+        self.assertEqual(result.undeleted, [ID_ONE])
+        self.assertIn(f"  {ID_ONE}", self.text)
+
+    def test_the_cli_refuses_without_confirm_with_a_non_zero_exit_and_no_request(self):
+        from actions.probe_child_create import cli_delete
+        parser = argparse.ArgumentParser()
+        cli_delete.add_args(parser)
+        self.assertFalse(parser.parse_args(["--child-ids", ID_ONE]).confirm)
+        with mock.patch.object(cli_delete, "RestClient", return_value=self.rest), \
+                mock.patch.object(cli_delete, "_public_client", return_value=self.public):
+            for argv in (["--child-ids", ID_ONE], ["--child-ids", f"{ID_ONE},{ID_TWO},{ID_THREE}", "--confirm"]):
+                with self.subTest(argv=argv):
+                    with self.assertRaises(SystemExit) as ctx, \
+                            contextlib.redirect_stderr(io.StringIO()):
+                        cli_delete.handle(parser.parse_args(argv))
+                    self.assertEqual(ctx.exception.code, 3)
+        self.assert_nothing_happened()
 
 
 if __name__ == "__main__":

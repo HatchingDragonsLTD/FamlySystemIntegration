@@ -28,9 +28,16 @@ Every guard, all before the first write:
      are printed.
   4. The site is HDCW and the group is its "Hatchlings" group, both from the
      reference files; if either is missing nothing is written.
+
+`--no-delete` skips the delete step (the created ids are printed and must be
+deleted by hand or with `probe-child-delete`). `run_delete` backs the separate
+`probe-child-delete` command: at most MAX_CHILDREN ids, `--confirm`, and EVERY id
+must show isTestChild true in its internal summary before any is deleted (and is
+re-read again right before its own delete request).
 """
 
 import json
+import re
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
@@ -56,6 +63,10 @@ LIST_OP = "ProbeChildrenList"
 
 MAX_CHILDREN = 2
 MAX_WRITES = 8
+
+UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
 
 SITE_CODE = "HDCW"
 GROUP_TITLE = "Hatchlings"
@@ -166,6 +177,9 @@ class ProbeSession:
         self.rest, self.public, self.internal, self.out = rest, public, internal, out
         self.result = ProbeResult()
         self._created_ids: set[str] = set()
+        # Ids that may be deleted without having been created by this run:
+        # only ones named to `probe-child-delete` AND verified as test children.
+        self._verified_ids: set[str] = set()
 
     # -- the write budget -------------------------------------------------- #
     def _spend_write(self) -> None:
@@ -232,6 +246,24 @@ class ProbeSession:
             if not cursor:
                 return False, None
 
+    def verify_all_test_children(self, child_ids: list[str]) -> None:
+        """Read every id's internal summary; ALL must say isTestChild true, or
+        none is allowed to be deleted.
+
+        Raises:
+            ProbeRefused: any summary is unreadable or is not a test child.
+        """
+        for child_id in child_ids:
+            try:
+                summary = self.summary(child_id)
+            except RestHTTPError as exc:
+                raise ProbeRefused(
+                    f"could not verify {child_id} (HTTP {exc.status_code}); nothing deleted"
+                ) from None
+            if not is_test_child(summary):
+                raise ProbeRefused(f"{child_id} is not a test child; nothing deleted")
+        self._verified_ids.update(child_ids)
+
     # -- delete -------------------------------------------------------------- #
     def delete_child(self, child_id: str) -> bool:
         """Delete ONE child created by this run, after re-verifying it.
@@ -240,8 +272,10 @@ class ProbeSession:
         if the child was not created by this run; returns False if the re-read
         does not say isTestChild true.
         """
-        if child_id not in self._created_ids:
-            raise ProbeRefused("refusing to delete a child this run did not create")
+        if child_id not in self._created_ids and child_id not in self._verified_ids:
+            raise ProbeRefused(
+                "refusing to delete a child this run did not create or verify"
+            )
         try:
             summary = self.summary(child_id)
         except RestHTTPError as exc:
@@ -287,8 +321,18 @@ def resolve_site_and_group() -> tuple[str, str]:
     return site_id, group_id
 
 
-def run_probe(confirm: bool, rest, public, internal, out: Callable[[str], None] = print):
-    """Run the probe. Raises ProbeRefused if a guard fails before any write."""
+def run_probe(
+    confirm: bool,
+    rest,
+    public,
+    internal,
+    out: Callable[[str], None] = print,
+    no_delete: bool = False,
+):
+    """Run the probe. Raises ProbeRefused if a guard fails before any write.
+
+    With `no_delete` the created children are left in Famly and their ids are
+    printed to be deleted afterwards."""
     if not confirm:
         raise ProbeRefused("refusing without --confirm; nothing was written")
     site_id, group_id = resolve_site_and_group()
@@ -307,6 +351,10 @@ def run_probe(confirm: bool, rest, public, internal, out: Callable[[str], None] 
     except Exception as exc:  # noqa: BLE001 - never skip the clean-up below
         out(f"ERROR while inspecting ({type(exc).__name__}): {error_text(exc)}; "
             f"continuing to the delete step")
+
+    if no_delete:
+        _leave_for_deletion(session, out)
+        return session.result
 
     _delete_all(session, delete_available, out)
     try:
@@ -381,6 +429,19 @@ def _inspect(session: ProbeSession, spec: ChildSpec, child_id: str, site_id: str
         safe(f"childrenList {'+'.join(statuses)}", listing)
 
 
+def _leave_for_deletion(session: ProbeSession, out) -> None:
+    """--no-delete: say loudly that the test children are still in Famly."""
+    ids = [item["id"] for item in session.result.created]
+    session.result.undeleted = list(ids)
+    out("--no-delete: the delete step was SKIPPED. THESE TEST CHILDREN ARE STILL IN FAMLY AND "
+        "MUST BE DELETED:")
+    for child_id in ids:
+        out(f"  {child_id}")
+    if ids:
+        out(f"Delete them with: python main.py probe-child-delete --child-ids "
+            f"{','.join(ids)} --confirm")
+
+
 def _delete_all(session: ProbeSession, delete_available: bool, out) -> None:
     ids = [item["id"] for item in session.result.created]
     if not ids:
@@ -444,3 +505,68 @@ def _print_schema(public, out) -> bool:
         for field_ in (data.get(key) or {}).get("inputFields") or []:
             out(f"  {field_['name']}: {_type_name(field_['type'])}")
     return has_delete
+
+
+# --------------------------------------------------------------------------- #
+# probe-child-delete: delete named test children
+# --------------------------------------------------------------------------- #
+def parse_child_ids(raw: str) -> list[str]:
+    """Comma-separated ids -> a de-duplicated list of 1 to MAX_CHILDREN UUIDs.
+
+    Raises:
+        ProbeRefused: none, too many, or not a UUID.
+    """
+    ids = list(dict.fromkeys(part.strip() for part in str(raw or "").split(",") if part.strip()))
+    if not ids:
+        raise ProbeRefused("--child-ids needs at least one id; nothing was deleted")
+    if len(ids) > MAX_CHILDREN:
+        raise ProbeRefused(f"at most {MAX_CHILDREN} ids may be deleted per run; nothing was deleted")
+    for child_id in ids:
+        if not UUID_RE.match(child_id.lower()):
+            raise ProbeRefused(f"{child_id!r} is not a UUID; nothing was deleted")
+    return ids
+
+
+def run_delete(
+    child_ids: list[str],
+    confirm: bool,
+    rest,
+    public,
+    out: Callable[[str], None] = print,
+) -> ProbeResult:
+    """Delete the named children, each only if its internal summary says
+    isTestChild true. One id per request, never `siteIds`.
+
+    Raises:
+        ProbeRefused: a guard failed before any write.
+    """
+    if not confirm:
+        raise ProbeRefused("refusing without --confirm; nothing was deleted")
+    if not child_ids or len(child_ids) > MAX_CHILDREN:
+        raise ProbeRefused(f"between 1 and {MAX_CHILDREN} ids are required; nothing was deleted")
+
+    session = ProbeSession(rest, public, None, out)
+    session.verify_all_test_children(child_ids)  # all or nothing, before any write
+
+    out(f"CAPS: at most {MAX_CHILDREN} children, one delete request per child, never siteIds")
+    delete_available = _print_schema(public, out)
+    if not delete_available:
+        out("The public schema has no children delete. DELETE THESE TEST CHILDREN BY HAND:")
+        for child_id in child_ids:
+            out(f"  {child_id}")
+        session.result.undeleted = list(child_ids)
+        return session.result
+
+    for child_id in child_ids:
+        try:
+            deleted = session.delete_child(child_id)
+        except ProbeRefused as exc:
+            out(f"STOPPED DELETING: {exc}")
+            deleted = False
+        if not deleted:
+            session.result.undeleted.append(child_id)
+    if session.result.undeleted:
+        out("NOT DELETED, DELETE THESE TEST CHILDREN BY HAND:")
+        for child_id in session.result.undeleted:
+            out(f"  {child_id}")
+    return session.result

@@ -20,6 +20,7 @@ from actions.delete_plans import delete_digest, delete_resume
 from actions.onboard_dry_run import cli as onboard_dry_run
 from actions.plan_write import cli as plan_write
 from actions.probe_child_create import cli as probe_child_create
+from actions.probe_child_create import cli_delete as probe_child_delete
 from actions.probe_contact_create import cli as probe_contact_create
 from actions.queue_timeline import (
     queue_cancel,
@@ -59,6 +60,7 @@ ACTIONS = [
     onboard_dry_run,
     probe_contact_create,
     probe_child_create,
+    probe_child_delete,
     chain_status,
     chain_cancel,
     chain_resume,
