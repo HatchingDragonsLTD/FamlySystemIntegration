@@ -1,13 +1,16 @@
-"""READ-ONLY HubSpot client for the onboarding pipeline.
+"""HubSpot client for the onboarding pipeline: READ-ONLY, plus one narrow writer.
 
 Bearer token from env HUBSPOT_TOKEN (the private app "Famly_Server_Key").
 
 HARD RULES, each pinned by tests:
 
-  * READ ONLY. The only HTTP method this module can send is GET (`_get`). There
-    is no POST/PUT/PATCH/DELETE code path, so nothing here can write to HubSpot.
-    Contacts and quotes are read one at a time with GET rather than via the
-    POST batch-read endpoint for exactly this reason.
+  * `HubSpotClient` IS READ ONLY. The only HTTP method it can send is GET
+    (`_get`). There is no POST/PUT/PATCH/DELETE code path, so nothing on it can
+    write to HubSpot. Contacts and quotes are read one at a time with GET rather
+    than via the POST batch-read endpoint for exactly this reason.
+  * `HubSpotDealWriter` (below) is the ONE writer: it can PATCH a deal, and only
+    the four sync properties in WRITABLE_DEAL_PROPERTIES (phase 2). Nothing else
+    is writable through it: not another property, not a contact, not a quote.
   * EXPLICIT ALLOW-LISTS. Every object read names the properties it wants
     (`DEAL_PROPERTIES`, `CONTACT_PROPERTIES`, `QUOTE_PROPERTIES`). Never "all
     properties": a contact also holds national insurance numbers, dates of
@@ -53,7 +56,7 @@ DEAL_PROPERTIES = (
 )
 # Child name properties, used ONLY for the in-memory possible-duplicate check
 # before a child would be created; never printed or logged. THE INTERNAL NAMES
-# ARE A GUESS (design doc: "child first, last and full name") -- override with
+# are `child_first_name` and `child_last_name` (design doc, section 16) -- override with
 # HUBSPOT_CHILD_NAME_PROPERTIES (comma-separated). HubSpot ignores a property
 # that does not exist, and with none returned the duplicate check treats every
 # same-site, same-birth-date child as a possible duplicate (the safe side).
@@ -61,7 +64,7 @@ CHILD_NAME_PROPERTIES = tuple(
     p.strip()
     for p in os.environ.get(
         "HUBSPOT_CHILD_NAME_PROPERTIES",
-        "child_first_name,child_last_name,child_full_name",
+        "child_first_name,child_last_name",
     ).split(",")
     if p.strip()
 )
@@ -134,39 +137,54 @@ class HubSpotClient:
     # The one and only transport. GET, with retry.
     # ------------------------------------------------------------------ #
     def _get(self, path: str, params: dict | None = None) -> dict:
+        return self._call("GET", path, params)
+
+    def _call(
+        self, method: str, path: str, params: dict | None = None,
+        json_body: dict | None = None,
+    ) -> dict:
+        """The one transport: send, retry 429/5xx with backoff, return JSON.
+
+        Only `_get` and the writer's `_patch` call this; `HubSpotClient` itself
+        only ever passes GET."""
         url = f"{self._base_url}{path}"
         headers = {"Authorization": f"Bearer {self._token}", "Accept": "application/json"}
 
         for attempt in range(1, MAX_ATTEMPTS + 1):
             try:
-                response = self._session.get(
-                    url, headers=headers, params=params, timeout=DEFAULT_TIMEOUT
-                )
+                if method == "GET":
+                    response = self._session.get(
+                        url, headers=headers, params=params, timeout=DEFAULT_TIMEOUT
+                    )
+                else:
+                    response = getattr(self._session, method.lower())(
+                        url, headers=headers, json=json_body, timeout=DEFAULT_TIMEOUT
+                    )
             except requests.RequestException as exc:
                 # Type only: the message can echo the URL.
                 if attempt == MAX_ATTEMPTS:
-                    raise HubSpotError(f"GET {path} failed: {type(exc).__name__}") from None
+                    raise HubSpotError(f"{method} {path} failed: {type(exc).__name__}") from None
                 self._sleep(self._backoff(attempt, None))
                 continue
 
             status = response.status_code
             if status == 429 or status >= 500:
                 if attempt == MAX_ATTEMPTS:
-                    raise HubSpotError(f"GET {path} failed with HTTP {status}", status)
-                logger.info("hubspot: GET %s -> %s, retrying", path, status)
+                    raise HubSpotError(f"{method} {path} failed with HTTP {status}", status)
+                logger.info("hubspot: %s %s -> %s, retrying", method, path, status)
                 self._sleep(self._backoff(attempt, response.headers.get("Retry-After")))
                 continue
 
             if status != 200:
-                raise HubSpotError(f"GET {path} failed with HTTP {status}", status)
+                raise HubSpotError(f"{method} {path} failed with HTTP {status}", status)
 
             try:
                 body = response.json()
             except ValueError:
-                raise HubSpotError(f"GET {path} returned a non-JSON body", status) from None
+                raise HubSpotError(f"{method} {path} returned a non-JSON body", status) from None
             return body if isinstance(body, dict) else {}
 
-        raise HubSpotError(f"GET {path} failed")  # unreachable; loop always returns/raises
+        raise HubSpotError(f"{method} {path} failed")  # unreachable; loop always returns/raises
 
     @staticmethod
     def _backoff(attempt: int, retry_after: Any) -> float:
@@ -253,3 +271,59 @@ class HubSpotClient:
             after = ((body.get("paging") or {}).get("next") or {}).get("after")
             if not after:
                 return out
+
+
+# --------------------------------------------------------------------------- #
+# Phase 2: the one writer
+# --------------------------------------------------------------------------- #
+# The only deal properties anything may write, and only through the writer below.
+FAMLY_CHILDID_PROPERTY = "famly_childid"
+SYNC_STATUS_PROPERTY = "famly_sync_status"
+SYNC_NOTE_PROPERTY = "famly_sync_note"
+SYNC_GAPS_PROPERTY = "famly_sync_gaps"
+WRITABLE_DEAL_PROPERTIES = frozenset(
+    {FAMLY_CHILDID_PROPERTY, SYNC_STATUS_PROPERTY, SYNC_NOTE_PROPERTY, SYNC_GAPS_PROPERTY}
+)
+
+
+class HubSpotDealWriter(HubSpotClient):
+    """A HubSpotClient that can also write the four sync properties on a deal.
+
+    `write_deal_properties` refuses any other property name before sending
+    anything, and the values are codes and a Famly child id (no personal data).
+    PATCH of the same values is idempotent, so a retry cannot change the outcome.
+    """
+
+    def deal_property_definitions(self) -> dict[str, dict]:
+        """Every deal property: name -> {"type", "fieldType", "options"} (GET)."""
+        body = self._get("/crm/v3/properties/deals")
+        out: dict[str, dict] = {}
+        for item in body.get("results") or []:
+            if not isinstance(item, dict) or not item.get("name"):
+                continue
+            out[str(item["name"])] = {
+                "type": item.get("type"),
+                "fieldType": item.get("fieldType"),
+                "options": [
+                    str(o.get("value"))
+                    for o in item.get("options") or []
+                    if isinstance(o, dict) and o.get("value") is not None
+                ],
+            }
+        return out
+
+    def write_deal_properties(self, deal_id: str, properties: dict) -> None:
+        """PATCH the deal's sync properties.
+
+        Raises:
+            ValueError: a property outside WRITABLE_DEAL_PROPERTIES (nothing sent).
+            HubSpotError: the request failed.
+        """
+        extra = set(properties) - WRITABLE_DEAL_PROPERTIES
+        if extra or not properties:
+            raise ValueError(f"refusing to write deal properties: {sorted(extra) or 'none given'}")
+        self._call(
+            "PATCH",
+            f"/crm/v3/objects/deals/{deal_id}",
+            json_body={"properties": {k: str(v) for k, v in properties.items()}},
+        )

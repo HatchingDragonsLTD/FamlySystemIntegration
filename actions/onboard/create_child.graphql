@@ -1,0 +1,11 @@
+# THE CHILD WRITE (phase 2). The shape proven by probe-child-create: the public
+# API's ChildrenMutation.create(children: [ChildInput!]!) -> [Child!]!. Only `id`
+# and `externalId` are selected. Never retried (see famly_writes.py).
+mutation OnboardChildCreate($children: [ChildInput!]!) {
+  children {
+    create(children: $children) {
+      id
+      externalId
+    }
+  }
+}

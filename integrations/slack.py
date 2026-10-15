@@ -59,6 +59,12 @@ ACTION_REJECT = "plan_reject"
 # Approve path under a fresh preview_id.
 ACTION_ADJUST = "plan_adjust"
 
+# Onboarding Gate A (phase 2): Approve / Reject on "create this child and these
+# contacts in Famly". The button value is `<job_id>:<plan hash prefix>`.
+ACTION_ONBOARD_APPROVE = "onboard_approve"
+ACTION_ONBOARD_REJECT = "onboard_reject"
+ONBOARD_ACTIONS = (ACTION_ONBOARD_APPROVE, ACTION_ONBOARD_REJECT)
+
 # Interaction types Slack posts to the same endpoint.
 TYPE_BLOCK_ACTIONS = "block_actions"
 TYPE_VIEW_SUBMISSION = "view_submission"
@@ -821,6 +827,62 @@ def post_adjusted(summary_text: str, preview_id: str) -> bool:
 
     logger.info("Posted adjusted plan to Slack: preview_id=%s", preview_id)
     return True
+
+
+def _onboard_blocks(text: str, value: str) -> list:
+    """Gate A message: the summary plus Approve / Reject buttons carrying `value`."""
+    return [
+        {"type": "section", "text": {"type": "mrkdwn", "text": text}},
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Approve", "emoji": True},
+                    "style": "primary",
+                    "action_id": ACTION_ONBOARD_APPROVE,
+                    "value": value,
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Reject", "emoji": True},
+                    "style": "danger",
+                    "action_id": ACTION_ONBOARD_REJECT,
+                    "value": value,
+                },
+            ],
+        },
+    ]
+
+
+def post_onboard_gate(text: str, value: str) -> str | None:
+    """Post the onboarding approval request. Returns a message ref
+    (`<channel>:<ts>`) when Slack accepted it, else None. Never raises."""
+    import os
+
+    token = os.environ.get("SLACK_BOT_TOKEN", "").strip()
+    channel = os.environ.get("SLACK_CHANNEL_ID", "").strip()
+    if not token or not channel:
+        logger.warning("Slack not configured; dropping onboarding approval request")
+        return None
+    try:
+        response = requests.post(
+            POST_MESSAGE_URL,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json; charset=utf-8",
+            },
+            json={"channel": channel, "text": text, "blocks": _onboard_blocks(text, value)},
+            timeout=POST_TIMEOUT,
+        )
+        body = response.json()
+    except Exception as exc:  # noqa: BLE001 - Slack must never break the caller
+        logger.warning("Slack post failed (onboarding approval): %s", type(exc).__name__)
+        return None
+    if response.status_code != 200 or not body.get("ok"):
+        logger.warning("Slack rejected the onboarding approval request: %s", body.get("error"))
+        return None
+    return f"{body.get('channel') or channel}:{body.get('ts') or ''}"
 
 
 def post_notice(text: str) -> bool:

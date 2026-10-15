@@ -1004,6 +1004,37 @@ none), `hasEmail`, `hasCompleteAddress` (street, zip and city), `hasFirstAndLast
 `emergencyContact` (the bill payer only) and a RELATION=Parent record, as booleans
 and codes only, with the warnings `phone_missing` and `address_incomplete`.
 
+## Onboarding phase 2: create the child and contacts (`onboard-*`)
+
+Queued, Slack-approved creation of a child and the parent contacts in Famly for a
+HubSpot deal. **Not deployed; no webhook triggers it yet.**
+
+```
+ONBOARD_MODE=off|dry|live        default off (enqueue refuses, worker does nothing)
+ONBOARD_ALLOWED_DEAL_IDS=1,2     live writes ONLY for these (anything else: held, deal_not_allowlisted)
+ONBOARD_TEST_DEAL_IDS=1          subset of the above: isTestChild true (never set otherwise)
+HUBSPOT_PORTAL_ID=...            optional, for the deal link in Slack
+```
+
+```
+python main.py onboard-enqueue --deal-id <id>     # queue a job (refuses when off)
+python main.py onboard-worker --once              # process one job (the same shape as queue-worker; run without --once to poll)
+python main.py onboard-status --deal-id <id>      # counts and codes only
+```
+
+`dry` runs the full live plan and posts the Slack message but writes nothing and
+ends `dry_done`. `live` posts an Approve/Reject request (Gate A); on approve the
+worker re-runs the plan and writes only if its hash is unchanged. It then creates
+the child (one request, never retried; an unknown outcome is settled by a live
+lookup, never a second create), reads it back (including that the room move starts
+on the start date), creates each contact with **empty roles**, reads each back, and
+writes `famly_childid`, `famly_sync_status`, `famly_sync_note` and
+`famly_sync_gaps` to the deal (it fails closed before any Famly write if one of
+those four properties does not exist). Names, emails, phones, addresses and dates
+of birth are held in memory only; the jobs table, Slack and the logs carry ids,
+codes and hashes. See `actions/onboard/worker.py` and
+`docs/famly_onboarding_pipeline_design.md`.
+
 ## Tests
 
 ```bash

@@ -156,6 +156,8 @@ def make_deal(**over):
         "location_of_interest": "Westminster",
         "deposit_amount": "1500",
         "famly_childid": "",
+        "child_first_name": "Zara",
+        "child_last_name": "Quillfeather",
     }
     deal.update(over)
     return deal
@@ -472,21 +474,15 @@ class ChildLookupTests(DryRunTestCase):
 # Contacts plan.
 # --------------------------------------------------------------------------- #
 class ContactPlanTests(DryRunTestCase):
-    def test_new_child_contacts_are_would_copy_or_would_create(self):
-        self.famly.scan = [
-            {"id": "child-7", "contacts": [
-                scan_contact("fc-old", "parent.one@example.org", "2025-01-01T00:00:00Z"),
-                scan_contact("fc-new", "parent.one@example.org", "2026-05-01T00:00:00Z",
-                             phone="07700900999"),
-            ]},
-        ]
-        contacts = self.plan()["contacts"]  # no child exists yet
-        self.assertEqual(contacts[0]["status"], "would_copy")
-        self.assertEqual(contacts[0]["famlyContactId"], "fc-new")  # newest lastModifiedAt
-        self.assertEqual((contacts[0]["copyCount"], contacts[0]["copiesDiffer"]), (2, True))
-        self.assertEqual(contacts[1]["status"], "would_create")
-        self.famly.scan = []
-        self.assertEqual(self.plan()["contacts"][0]["status"], "would_create")
+    def test_a_new_child_has_no_copy_logic_every_contact_is_would_create(self):
+        # Even if another child carries the same email, nothing is copied.
+        self.famly.scan = [{"id": "child-7", "contacts": [
+            scan_contact("fc-7", "parent.one@example.org")]}]
+        plan = self.plan()  # no child exists yet
+        self.assertEqual([c["status"] for c in plan["contacts"]],
+                         ["would_create", "would_create"])
+        self.assertNotIn("would_copy", json.dumps(plan))
+        self.assertNotIn("OnboardContactsScan", self.famly.calls)
 
     def test_existing_child_parent_on_the_child_is_present(self):
         self.famly.ext_refs["D1"] = ["child-1"]
@@ -499,24 +495,21 @@ class ContactPlanTests(DryRunTestCase):
         self.assertEqual(first["labels"], [
             {"typeId": 91, "label": "Bill Payer", "direction": "deal_to_contact"}])
 
-    def test_existing_child_unmatched_parent_is_never_copied_or_created(self):
+    def test_existing_child_unmatched_parent_is_would_create_with_a_warning(self):
         self.famly.ext_refs["D1"] = ["child-1"]
         self.famly.child_contacts["child-1"] = [
             ("fc-1", "parent.one@example.org"),
             ("fc-3", "parent.two@other.com"),   # same local part, different domain
             ("fc-4", "someone.else@example.org"),
         ]
-        # Another child carries the exact email: still no copy onto an existing child.
-        self.famly.scan = [{"id": "child-7", "contacts": [
-            scan_contact("fc-7", "parent.two@example.org")]}]
         plan = self.plan()
         second = plan["contacts"][1]
-        self.assertEqual(second["status"], "contact_unmatched_on_existing_child")
-        self.assertEqual(second["candidateIds"], ["fc-3"])
+        self.assertEqual(second["status"], "would_create")
+        self.assertEqual(second["candidateIds"], ["fc-3"])  # ids only, evidence not a match
         self.assertNotIn("famlyContactId", second)
-        self.assertEqual(plan["status"], "held")
-        self.assertEqual(self.reasons(plan), ["contact_unmatched_on_existing_child"])
-        self.assertNotIn("OnboardContactsScan", self.famly.calls)  # copy search not used
+        self.assertIn("contact_possible_match_on_existing_child", plan["warnings"])
+        self.assertEqual(plan["holds"], [])
+        self.assertEqual(plan["status"], "ready")
 
     def test_googlemail_and_gmail_match_and_nothing_else_is_fuzzy(self):
         from actions.onboard_dry_run.famly_reads import normalise_email
@@ -531,10 +524,6 @@ class ContactPlanTests(DryRunTestCase):
         self.famly.child_contacts["child-1"] = [("fc-1", "parent.one@gmail.com"),
                                                 ("fc-2", "parent.two@example.org")]
         self.assertEqual(self.plan()["contacts"][0]["status"], "present")
-        self.famly.ext_refs.clear()
-        self.famly.scan = [{"id": "child-7", "contacts": [
-            scan_contact("fc-7", "parent.one@gmail.com")]}]
-        self.assertEqual(self.plan()["contacts"][0]["status"], "would_copy")
 
     def test_two_contacts_with_one_email_on_the_child_hold(self):
         self.famly.ext_refs["D1"] = ["child-1"]
@@ -736,7 +725,6 @@ class RunGuaranteeTests(DryRunTestCase):
         self.hub.deals["D2"] = make_deal()
         self.hub.assoc[("deals", "D2", "contacts")] = self.hub.assoc[("deals", "D1", "contacts")]
         self.run_all(["D1", "D2"])
-        self.assertEqual(self.famly.calls.count("OnboardContactsScan"), 1)
         self.assertEqual(self.famly.calls.count(urn_runner.OPERATION_NAME), 1)
 
 
@@ -775,17 +763,40 @@ class ChildSafetyTests(DryRunTestCase):
                                           "childIds": ["dup-1"]}])
         self.assertEqual(plan["status"], "held")
 
+    def duplicate_ids(self, plan):
+        found = [h for h in plan["holds"] if h["reason"] == "child_possible_duplicate"]
+        return found[0]["childIds"] if found else []
+
     def test_the_deal_name_can_carry_the_childs_name(self):
-        self.hub.deals["D1"] = make_deal(dealname="Zara Quillfeather - Westminster")
-        self.hub.deals["D1"]["child_first_name"] = "Zara"
+        self.hub.deals["D1"] = make_deal(dealname="Zara Quillfeather - Westminster",
+                                         child_first_name="Zara", child_last_name="")
         self.famly.site_children = [("dup-1", "2024-01-15", "zara quillfeather")]
-        self.assertEqual(self.plan()["holds"][0]["childIds"], ["dup-1"])
+        plan = self.plan()
+        self.assertEqual(self.duplicate_ids(plan), ["dup-1"])
+        self.assertIn("child_name_incomplete", self.reasons(plan))  # last name missing too
 
     def test_no_name_on_the_deal_means_every_same_birth_date_child_counts(self):
+        self.hub.deals["D1"] = make_deal(child_first_name="", child_last_name="")
         self.famly.site_children = [("a", "2024-01-15", "Anyone"), ("b", "2023-01-15", "Else")]
-        plan = self.plan()  # make_deal has no child name properties
-        self.assertEqual(plan["holds"][0]["childIds"], ["a"])
+        plan = self.plan()
+        self.assertEqual(self.duplicate_ids(plan), ["a"])
         self.assertIn("child_name_unavailable_for_duplicate_check", plan["warnings"])
+        self.assertIn("child_name_incomplete", self.reasons(plan))
+
+    def test_creating_a_child_needs_a_name_and_a_birth_date(self):
+        for over, reason in [
+            (dict(child_first_name=""), "child_name_incomplete"),
+            (dict(child_last_name="  "), "child_name_incomplete"),
+            (dict(dealstage="s-left", end_date="2026-06-30", child_date_of_birth=""), "dob_missing"),
+        ]:
+            with self.subTest(over=over):
+                self.hub.stages["s-left"] = ("Operations", "Left Nursery")
+                self.hub.deals["D1"] = make_deal(**over)
+                self.assertIn(reason, self.reasons(self.plan()))
+        # An existing child needs neither: nothing is created.
+        self.hub.deals["D1"] = make_deal(child_first_name="")
+        self.famly.ext_refs["D1"] = ["child-1"]
+        self.assertNotIn("child_name_incomplete", self.reasons(self.plan()))
 
     def test_the_duplicate_search_only_runs_when_a_child_would_be_created(self):
         self.famly.ext_refs["D1"] = ["child-1"]
@@ -809,7 +820,8 @@ class LeftNurseryAndDatesTests(DryRunTestCase):
         self.assertEqual((plan["groupTitle"], plan["groupId"]), ("Voyagers", "HDWEST-v"))
         self.assertEqual(plan["groupReason"], "left_nursery_voyagers")
         self.assertEqual(plan["stage"]["depositState"], "none")
-        self.assertEqual(plan["holds"], [])
+        # No age rule hold; only creating the child needs a birth date.
+        self.assertEqual(self.reasons(plan), ["dob_missing"])
 
     def test_stage_matching_ignores_stray_whitespace_and_case(self):
         self.hub.stages["s-left"] = (" operations ", "  LEFT   Nursery ")
