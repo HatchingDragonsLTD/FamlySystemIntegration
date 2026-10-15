@@ -935,6 +935,39 @@ Same note on environment variables as `pull-references` above --
 `FAMLY_ACCESS_TOKEN` (and `FAMLY_PUBLIC_GRAPHQL_URL`/`ROSTER_CACHE_PATH`, if
 overridden) must be available to the cron job's environment.
 
+## `contact_lookup` (HubSpot contact -> Famly ids)
+
+Read-only web action. A HubSpot workflow POSTs a contact's email and writes the
+returned ids onto the contact as properties:
+
+```
+POST /intake   (X-Intake-Secret)
+{"action": "contact_lookup", "email": "..."}
+```
+
+`data` holds only `contactId`, `contactMatched`, `billPayerId`,
+`billPayerMatched` and `source` (`cache`, `live` or `cache+live`); warnings and
+errors ride in the envelope. No names or other emails are returned, and the
+email is never logged.
+
+- The roster cache is checked first. If either id has no cache match, Famly is
+  fetched live once (every site in `catalogue.json`), matched in memory, and
+  held in a per-process cache for `CONTACT_LOOKUP_LIVE_TTL_SECONDS` (default
+  300). Live rows are never written to `roster_cache.db`; `pull-roster` stays
+  the only writer.
+- 200: both lookups completed, including not-found (a contact with no bill
+  payer, or the reverse, is normal and gets a warning).
+- 409: either side has two or more distinct ids. Both ids are null so HubSpot
+  writes nothing half-done; the counts and ids are in `errors`.
+- 422: missing or malformed email. 503: the live fetch failed (the search was
+  incomplete, so it is never reported as "not found").
+
+Check from the server: `python main.py contact-lookup someone@example.com`.
+
+This is a **lookup** for linking HubSpot records to existing Famly ids. It must
+never be the existence check for the contact-creation pipeline (see the
+warning above).
+
 ## Tests
 
 ```bash

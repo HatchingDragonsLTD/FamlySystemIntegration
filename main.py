@@ -14,6 +14,7 @@ import json
 import sys
 from dataclasses import asdict, is_dataclass
 
+from actions.contact_lookup import cli as contact_lookup
 from actions.create_timeline import chain_cancel, chain_resume, chain_status, chain_sweep
 from actions.delete_plans import delete_digest, delete_resume
 from actions.plan_write import cli as plan_write
@@ -50,6 +51,7 @@ ACTIONS = [
     pull_institution_defaults,
     pull_references,
     pull_roster,
+    contact_lookup,
     chain_status,
     chain_cancel,
     chain_resume,

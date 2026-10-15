@@ -17,6 +17,7 @@ exception it raises.
 """
 
 from actions.additional_plan import web as additional_plan_web
+from actions.contact_lookup import web as contact_lookup_web
 from actions.create_timeline import web as create_timeline_web
 from actions.plan_status import web as plan_status_web
 from actions.delete_plans import web as delete_plans_web  # TEMPORARY -- see its module docstring
@@ -33,6 +34,7 @@ ACTIONS = {
     create_timeline_web.ACTION_NAME: create_timeline_web.handle,
     queue_timeline_web.ACTION_NAME: queue_timeline_web.handle,
     urn_lookup_web.ACTION_NAME: urn_lookup_web.handle,  # TEMPORARY backfill utility
+    contact_lookup_web.ACTION_NAME: contact_lookup_web.handle,  # read-only HubSpot id linking
     delete_plans_web.ACTION_NAME: delete_plans_web.handle,  # TEMPORARY, DESTRUCTIVE clean-up utility
 }
 
