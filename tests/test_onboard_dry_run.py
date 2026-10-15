@@ -494,10 +494,10 @@ class ContactPlanTests(DryRunTestCase):
                                                 ("fc-2", "parent.two@example.org")]
         plan = self.plan()
         self.assertEqual(plan["holds"], [])
-        self.assertEqual(plan["contacts"][0], {
-            "hubspotContactId": "c1", "isBillPayer": True, "status": "present",
-            "famlyContactId": "fc-1",
-            "labels": [{"typeId": 91, "label": "Bill Payer", "direction": "deal_to_contact"}]})
+        first = plan["contacts"][0]
+        self.assertEqual((first["status"], first["famlyContactId"]), ("present", "fc-1"))
+        self.assertEqual(first["labels"], [
+            {"typeId": 91, "label": "Bill Payer", "direction": "deal_to_contact"}])
 
     def test_existing_child_unmatched_parent_is_never_copied_or_created(self):
         self.famly.ext_refs["D1"] = ["child-1"]
@@ -619,7 +619,11 @@ class HubSpotClientTests(unittest.TestCase):
         client.get_quote("3")
         sent = [params["properties"].split(",") for _, params, _ in session.requests]
         self.assertEqual(sent[0], list(hubspot.DEAL_PROPERTIES))
-        self.assertEqual(sent[1], ["email"])
+        self.assertEqual(sent[1], list(hubspot.CONTACT_PROPERTIES))
+        for needed in ("email", "firstname", "lastname", "mobilephone", "phone",
+                       "address", "city", "zip", "state", "country"):
+            self.assertIn(needed, sent[1])
+        self.assertEqual(len(sent[1]), 11)  # those ten plus the WhatsApp property
         self.assertEqual(sent[2], list(hubspot.QUOTE_PROPERTIES))
         for props in sent:
             self.assertNotIn("all", [p.lower() for p in props])
@@ -883,6 +887,89 @@ class WarningAndLabelTests(DryRunTestCase):
             {"typeId": 91, "label": "Bill Payer", "direction": "deal_to_contact"}])
         self.assertEqual(contacts[1]["labels"], [
             {"typeId": 3, "label": None, "direction": "deal_to_contact"}])
+
+
+# --------------------------------------------------------------------------- #
+# Per-contact fields: phone, address, name, emergency contact, records.
+# --------------------------------------------------------------------------- #
+class ContactFieldTests(DryRunTestCase):
+    def set_contact(self, contact_id, **props):
+        base = {"email": f"{contact_id}@example.org"}
+        base.update(props)
+        self.hub.contacts[contact_id] = base
+
+    def entry(self, index=0):
+        return self.plan()["contacts"][index]
+
+    def test_phone_order_is_mobile_then_work_then_whatsapp(self):
+        wa = hubspot.WHATSAPP_PROPERTY
+        cases = [
+            (dict(mobilephone="07700900123", phone="02070000000", **{wa: "07700900555"}),
+             "mobile", "MOBILE"),
+            (dict(mobilephone="  ", phone="02070000000", **{wa: "07700900555"}),
+             "work", "WORK"),
+            (dict(**{wa: "07700900555"}), "whatsapp", "MOBILE"),
+            (dict(), "none", None),
+        ]
+        for props, source, famly_type in cases:
+            with self.subTest(source=source):
+                self.set_contact("c1", **props)
+                entry = self.entry()
+                self.assertEqual((entry["phoneSource"], entry["phoneType"]),
+                                 (source, famly_type))
+
+    def test_phone_missing_warns_once_per_deal_and_never_holds(self):
+        plan = self.plan()  # neither default contact has any phone
+        self.assertEqual(plan["warnings"].count("phone_missing"), 1)
+        self.assertEqual(plan["status"], "ready")
+        self.set_contact("c1", mobilephone="07700900123")
+        self.set_contact("c2", phone="02070000000")
+        self.assertNotIn("phone_missing", self.plan()["warnings"])
+
+    def test_a_complete_address_needs_street_zip_and_city_only(self):
+        full = dict(address="1 Mill Lane", zip="E1 1AA", city="London")
+        self.set_contact("c1", **full)
+        self.assertTrue(self.entry()["hasCompleteAddress"])  # state and country not needed
+        for missing in ("address", "zip", "city"):
+            with self.subTest(missing=missing):
+                props = dict(full, state="Greater London", country="UK")
+                props[missing] = "  "
+                self.set_contact("c1", **props)
+                self.assertFalse(self.entry()["hasCompleteAddress"])
+                self.assertIn("address_incomplete", self.plan()["warnings"])
+        self.set_contact("c1", **full)
+        self.set_contact("c2", **full)
+        self.assertNotIn("address_incomplete", self.plan()["warnings"])
+
+    def test_name_and_email_flags_and_the_emergency_contact_rule(self):
+        self.set_contact("c1", firstname="Ada", lastname="Lovelace")
+        self.set_contact("c2", firstname="Ben")
+        first, second = self.plan()["contacts"]
+        self.assertEqual((first["hasFirstAndLastName"], second["hasFirstAndLastName"]),
+                         (True, False))
+        self.assertTrue(first["hasEmail"] and second["hasEmail"])
+        # Emergency contact: the bill payer (c1) only.
+        self.assertEqual((first["isBillPayer"], first["emergencyContact"]), (True, True))
+        self.assertEqual((second["isBillPayer"], second["emergencyContact"]), (False, False))
+        self.hub.contacts["c2"] = {"email": ""}
+        self.assertFalse(self.entry(1)["hasEmail"])
+
+    def test_every_contact_carries_the_relation_record_parent(self):
+        for entry in self.plan()["contacts"]:
+            self.assertEqual(entry["records"], [{"key": "RELATION", "value": "Parent"}])
+
+    def test_no_phone_address_or_name_value_reaches_the_output(self):
+        self.set_contact("c1", firstname="Ada", lastname="Lovelace", mobilephone="07700911111",
+                         address="1 Mill Lane", zip="E1 1AA", city="London",
+                         state="Greater London", country="UK")
+        self.set_contact("c2", phone="02079998888", **{hubspot.WHATSAPP_PROPERTY: "07700922222"})
+        blob = json.dumps(self.plan()).casefold()
+        for value in ("ada", "lovelace", "07700911111", "mill lane", "e1 1aa", "london",
+                      "02079998888", "07700922222", "uk"):
+            if value == "uk":
+                self.assertNotIn('"uk"', blob)
+            else:
+                self.assertNotIn(value, blob, value)
 
 
 if __name__ == "__main__":

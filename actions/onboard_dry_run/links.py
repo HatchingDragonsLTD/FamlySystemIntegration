@@ -132,6 +132,47 @@ class DealContact:
     is_bill_payer: bool
     # The labels on this contact's link to the deal: names and type ids only.
     labels: list[dict] = field(default_factory=list)
+    # Derived codes and booleans only (the values themselves are not kept).
+    phone_source: str = "none"
+    has_complete_address: bool = False
+    has_first_and_last_name: bool = False
+
+
+# Phone order: first one present wins. (source code, HubSpot property, Famly type)
+PHONE_ORDER = (
+    ("mobile", "mobilephone", "MOBILE"),
+    ("work", "phone", "WORK"),
+    ("whatsapp", hubspot.WHATSAPP_PROPERTY, "MOBILE"),
+)
+
+
+def _present(properties: dict, name: str) -> bool:
+    return bool(str(properties.get(name) or "").strip())
+
+
+def phone_source(properties: dict) -> str:
+    """Which phone would be used: mobile, work, whatsapp, or none."""
+    for source, name, _ in PHONE_ORDER:
+        if _present(properties, name):
+            return source
+    return "none"
+
+
+def phone_type(source: str) -> str | None:
+    """The Famly phone type for a phone source (WhatsApp counts as MOBILE)."""
+    for code, _, famly_type in PHONE_ORDER:
+        if code == source:
+            return famly_type
+    return None
+
+
+def has_complete_address(properties: dict) -> bool:
+    """Street, zip and city all present (state and country are not required)."""
+    return all(_present(properties, name) for name in ("address", "zip", "city"))
+
+
+def has_first_and_last_name(properties: dict) -> bool:
+    return _present(properties, "firstname") and _present(properties, "lastname")
 
 
 def _label_rows(types: list[dict], direction: str) -> list[dict]:
@@ -172,8 +213,18 @@ def deal_contacts(client: HubSpotClient, labels: LabelMap, deal_id: str) -> list
                 ):
                     is_bill_payer = True
 
-        email = (client.get_contact(link["id"]).get("email") or "").strip()
-        out.append(DealContact(link["id"], email, is_bill_payer, link_labels))
+        props = client.get_contact(link["id"])
+        out.append(
+            DealContact(
+                link["id"],
+                (props.get("email") or "").strip(),
+                is_bill_payer,
+                link_labels,
+                phone_source=phone_source(props),
+                has_complete_address=has_complete_address(props),
+                has_first_and_last_name=has_first_and_last_name(props),
+            )
+        )
     return out
 
 

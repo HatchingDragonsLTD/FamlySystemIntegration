@@ -999,6 +999,11 @@ compare equal; nothing else is fuzzy. Left Nursery deals use Voyagers and need a
 start date and an end date (`end_date`, the Leave Date); the output says only
 whether each date is present.
 
+Per contact it also reports `phoneSource` (mobile, then work, then WhatsApp, else
+none), `hasEmail`, `hasCompleteAddress` (street, zip and city), `hasFirstAndLastName`,
+`emergencyContact` (the bill payer only) and a RELATION=Parent record, as booleans
+and codes only, with the warnings `phone_missing` and `address_incomplete`.
+
 ## Tests
 
 ```bash
