@@ -48,6 +48,12 @@ DOB_MISSING = "dob_missing"
 START_DATE_MISSING = "start_date_missing"
 DATE_INVALID = "date_invalid"
 DATES_INCONSISTENT = "dates_inconsistent"
+END_DATE_MISSING = "end_date_missing"
+
+
+def today() -> date:
+    """Today (UTC). A function so tests can pin it."""
+    return datetime.now(timezone.utc).date()
 
 
 class Hold(Exception):
@@ -201,13 +207,27 @@ _PAID_STAGES = {
 }
 
 
+def norm_stage(value: Any) -> str:
+    """Stage/pipeline label for matching: trimmed, inner whitespace collapsed,
+    casefolded."""
+    return " ".join(str(value or "").split()).casefold()
+
+
+LEFT_NURSERY = "left nursery"
+LEFT_NURSERY_VOYAGERS = "left_nursery_voyagers"
+
+
+def is_left_nursery(stage_label: Any) -> bool:
+    return norm_stage(stage_label) == LEFT_NURSERY
+
+
 def deposit_state(pipeline_label: str, stage_label: str) -> str:
     """Whether a deposit would be unpaid (Deposit Pending), paid (a later
     Operations stage) or none (Left Nursery). `unknown` for any other stage,
     including every Sales stage."""
-    if (pipeline_label or "").strip().casefold() != "operations":
+    if norm_stage(pipeline_label) != "operations":
         return DEPOSIT_UNKNOWN
-    stage = (stage_label or "").strip().casefold()
+    stage = norm_stage(stage_label)
     if stage in _UNPAID_STAGES:
         return DEPOSIT_UNPAID
     if stage in _NONE_STAGES:

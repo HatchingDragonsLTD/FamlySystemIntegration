@@ -16,7 +16,9 @@ HOLDS. Anything that could put a child in the wrong room, link the wrong child
 or pick between candidates is a HOLD with a reason code, never a guess:
 site_unmapped, site_id_missing, group_missing, group_ambiguous, dob_missing,
 start_date_missing, date_invalid, dates_inconsistent, child_ambiguous,
-contact_no_email, contact_ambiguous_on_child, bill_payer_unclear, deal_not_found.
+contact_no_email, contact_ambiguous_on_child, contact_unmatched_on_existing_child,
+bill_payer_unclear, famly_childid_not_found, child_possible_duplicate,
+end_date_missing, deal_not_found.
 A deal with any hold is `held`; one without is `ready`; one a read failed for is
 `error`.
 """
@@ -29,10 +31,12 @@ from actions.onboard_dry_run import derive, links
 from actions.onboard_dry_run.famly_reads import (
     FamlyReads,
     copies_differ,
+    local_part,
     newest,
     normalise_email,
 )
 from core.client import GraphQLError, GraphQLHTTPError
+from core import hubspot as hubspot_config
 from core.hubspot import HubSpotClient, HubSpotError
 
 logger = logging.getLogger(__name__)
@@ -48,6 +52,8 @@ WOULD_COPY = "would_copy"
 WOULD_CREATE = "would_create"
 NO_EMAIL = "no_email"
 AMBIGUOUS_ON_CHILD = "ambiguous_on_child"
+UNMATCHED_ON_EXISTING_CHILD = "contact_unmatched_on_existing_child"
+CHILD_UNRESOLVED = "child_unresolved"
 
 # Hold reasons owned by this module (derive.py owns the rest).
 DEAL_NOT_FOUND = "deal_not_found"
@@ -55,6 +61,8 @@ CHILD_AMBIGUOUS_HOLD = "child_ambiguous"
 CONTACT_NO_EMAIL = "contact_no_email"
 CONTACT_AMBIGUOUS_ON_CHILD = "contact_ambiguous_on_child"
 BILL_PAYER_UNCLEAR = "bill_payer_unclear"
+FAMLY_CHILDID_NOT_FOUND = "famly_childid_not_found"
+CHILD_POSSIBLE_DUPLICATE = "child_possible_duplicate"
 
 
 class DryRun:
@@ -101,25 +109,28 @@ class DryRun:
 
     def _plan(self, deal_id: str, plan: dict) -> None:
         deal = self._hubspot.get_deal(deal_id)
-        holds, warnings = plan["holds"], plan["warnings"]
+        warnings = plan["warnings"]
 
         plan["stage"] = self._stage(deal)
+        left_nursery = derive.is_left_nursery(plan["stage"]["name"])
         site_code = self._derive_site(deal, plan)
-        self._derive_group(deal, site_code, plan)
+        self._derive_group(deal, site_code, left_nursery, plan)
+        self._derive_dates(deal, left_nursery, plan)
         plan["child"] = self._child(deal, deal_id, plan)
+        if plan["child"]["status"] == CHILD_WOULD_CREATE:
+            self._check_possible_duplicate(deal, plan)
         plan["contacts"] = self._contacts(deal_id, plan["child"], plan)
         plan["quotes"], quote_warnings = links.quote_summary(
             self._hubspot, self.labels(), deal_id
         )
         warnings.extend(quote_warnings)
 
-        # Cross-check only; never decides anything.
-        recorded = (deal.get("famly_childid") or "").strip()
-        found = plan["child"].get("famlyChildId")
-        if recorded and found and recorded != found:
-            warnings.append("famly_childid_differs_from_lookup")
-        elif recorded and not found and plan["child"]["status"] == CHILD_WOULD_CREATE:
-            warnings.append("famly_childid_recorded_but_child_not_found")
+        if plan["quotes"]["count"] == 0:
+            warnings.append("no_quote")
+        if plan["stage"]["depositState"] in (derive.DEPOSIT_UNPAID, derive.DEPOSIT_PAID) and (
+            plan["stage"]["depositAmount"] is None
+        ):
+            warnings.append("deposit_amount_missing")
 
     # -- derivations ---------------------------------------------------- #
     def _stage(self, deal: dict) -> dict:
@@ -144,14 +155,22 @@ class DryRun:
         plan["siteId"] = institution_id
         return code
 
-    def _derive_group(self, deal: dict, site_code: str | None, plan: dict) -> None:
-        try:
-            title = derive.group_title(
-                deal.get("child_date_of_birth"), deal.get("actual_start_date_1")
-            )
-        except derive.Hold as hold:
-            plan["holds"].append({"reason": hold.reason, **hold.detail})
-            return
+    def _derive_group(
+        self, deal: dict, site_code: str | None, left_nursery: bool, plan: dict
+    ) -> None:
+        if left_nursery:
+            # A child who has left is placed in Voyagers whatever their age, so
+            # the age rule is skipped (and a missing date of birth is not a hold).
+            title = derive.VOYAGERS
+            plan["groupReason"] = derive.LEFT_NURSERY_VOYAGERS
+        else:
+            try:
+                title = derive.group_title(
+                    deal.get("child_date_of_birth"), deal.get("actual_start_date_1")
+                )
+            except derive.Hold as hold:
+                plan["holds"].append({"reason": hold.reason, **hold.detail})
+                return
         plan["groupTitle"] = title
         if site_code is None:
             return  # the site hold already explains it; no room can be looked up
@@ -159,6 +178,39 @@ class DryRun:
             plan["groupId"] = derive.group_id_for(site_code, title)
         except derive.Hold as hold:
             plan["holds"].append({"reason": hold.reason, **hold.detail})
+
+    def _derive_dates(self, deal: dict, left_nursery: bool, plan: dict) -> None:
+        """firstDay = actual_start_date_1, lastDay = end_date (Leave Date) when
+        set. The plan says only whether each is present, never the dates.
+
+        Left Nursery: a missing start date or a missing end date is a HOLD (a
+        child with no end date would count as an active child). Any stage: an
+        end date before the start date is `dates_inconsistent`. An end date after
+        today is a warning (`end_date_in_future`)."""
+        holds, warnings = plan["holds"], plan["warnings"]
+
+        def hold_once(reason: str) -> None:
+            if reason not in [h["reason"] for h in holds]:
+                holds.append({"reason": reason})
+
+        try:
+            start = derive.parse_hubspot_date(deal.get("actual_start_date_1"))
+            end = derive.parse_hubspot_date(deal.get("end_date"))
+        except ValueError:
+            hold_once(derive.DATE_INVALID)
+            start = end = None
+
+        plan["dates"] = {"firstDayPresent": start is not None, "lastDayPresent": end is not None}
+
+        if left_nursery:
+            if start is None and not deal.get("actual_start_date_1"):
+                hold_once(derive.START_DATE_MISSING)
+            if end is None and not deal.get("end_date"):
+                hold_once(derive.END_DATE_MISSING)
+        if start is not None and end is not None and end < start:
+            hold_once(derive.DATES_INCONSISTENT)
+        if end is not None and end > derive.today():
+            warnings.append("end_date_in_future")
 
     # -- child ----------------------------------------------------------- #
     def _child(self, deal: dict, deal_id: str, plan: dict) -> dict:
@@ -176,9 +228,50 @@ class DryRun:
         if len(ids) > 1:
             plan["holds"].append({"reason": CHILD_AMBIGUOUS_HOLD, "childIds": ids, "via": via})
             return {"status": CHILD_AMBIGUOUS, "candidateIds": ids, "via": via}
+
+        # The id HubSpot already holds must be a real child. Checked live; if it
+        # is not, nothing about this deal can be trusted, so HOLD.
+        recorded = (deal.get("famly_childid") or "").strip()
+        if recorded and not self._famly.child_exists(recorded):
+            plan["holds"].append({"reason": FAMLY_CHILDID_NOT_FOUND, "famlyChildId": recorded})
+            return {"status": CHILD_UNRESOLVED, "via": via}
+
         if ids:
+            if recorded and recorded != ids[0]:
+                plan["warnings"].append("famly_childid_differs_from_lookup")
             return {"status": CHILD_FOUND, "famlyChildId": ids[0], "via": via}
+        if recorded:
+            # No reference or urn match, but the deal's own recorded child exists.
+            return {"status": CHILD_FOUND, "famlyChildId": recorded, "via": "famly_childid"}
         return {"status": CHILD_WOULD_CREATE}
+
+    def _check_possible_duplicate(self, deal: dict, plan: dict) -> None:
+        """Before a child would be created: any child at the same site with the
+        same date of birth AND a matching name is a HOLD (ids only). Names and
+        dates are compared in memory and never output or logged."""
+        site_id = plan.get("siteId")
+        try:
+            dob = derive.parse_hubspot_date(deal.get("child_date_of_birth"))
+        except ValueError:
+            dob = None
+        if not site_id or dob is None:
+            plan["warnings"].append("duplicate_check_skipped")
+            return
+
+        same_day = [
+            c for c in self._famly.children_at_site(site_id) if c.birthday == dob.isoformat()
+        ]
+        names = _hubspot_child_names(deal)
+        if not names:
+            # No name to compare: every same-site, same-birth-date child counts.
+            plan["warnings"].append("child_name_unavailable_for_duplicate_check")
+            matches = same_day
+        else:
+            matches = [c for c in same_day if _names_match(c.full_name, names, deal)]
+        if matches:
+            plan["holds"].append(
+                {"reason": CHILD_POSSIBLE_DUPLICATE, "childIds": [c.child_id for c in matches]}
+            )
 
     # -- contacts -------------------------------------------------------- #
     def _contacts(self, deal_id: str, child: dict, plan: dict) -> list[dict]:
@@ -205,39 +298,97 @@ class DryRun:
 
         out = []
         for contact in deal_contacts:
-            entry = {"hubspotContactId": contact.hubspot_id, "isBillPayer": contact.is_bill_payer}
+            entry = {
+                "hubspotContactId": contact.hubspot_id,
+                "isBillPayer": contact.is_bill_payer,
+                "labels": contact.labels,
+            }
             if not contact.email:
                 entry["status"] = NO_EMAIL
                 holds.append({"reason": CONTACT_NO_EMAIL, "hubspotContactId": contact.hubspot_id})
-                out.append(entry)
-                continue
-
-            target = normalise_email(contact.email)
-            here = list(dict.fromkeys(cid for cid, mail in on_child if mail == target))
-            if len(here) == 1:
-                entry.update(status=PRESENT, famlyContactId=here[0])
-            elif len(here) > 1:
-                entry.update(status=AMBIGUOUS_ON_CHILD, candidateIds=here)
-                holds.append(
-                    {
-                        "reason": CONTACT_AMBIGUOUS_ON_CHILD,
-                        "hubspotContactId": contact.hubspot_id,
-                        "contactIds": here,
-                    }
-                )
+            elif child["status"] == CHILD_FOUND:
+                self._existing_child_contact(contact, on_child, entry, holds)
+            elif child["status"] == CHILD_WOULD_CREATE:
+                self._new_child_contact(contact, entry)
             else:
-                copies = self._famly.copies_of_email(contact.email, child_id)
-                if copies:
-                    entry.update(
-                        status=WOULD_COPY,
-                        famlyContactId=newest(copies).contact_id,
-                        copyCount=len(copies),
-                        copiesDiffer=copies_differ(copies),
-                    )
-                else:
-                    entry["status"] = WOULD_CREATE
+                entry["status"] = CHILD_UNRESOLVED
             out.append(entry)
         return out
+
+    def _existing_child_contact(self, contact, on_child, entry: dict, holds: list) -> None:
+        """The child exists: the parent must already be one of its contacts.
+        There is no copy or create here, so an unmatched parent is a hold."""
+        target = normalise_email(contact.email)
+        here = list(dict.fromkeys(cid for cid, mail in on_child if mail == target))
+        if len(here) == 1:
+            entry.update(status=PRESENT, famlyContactId=here[0])
+        elif len(here) > 1:
+            entry.update(status=AMBIGUOUS_ON_CHILD, candidateIds=here)
+            holds.append(
+                {
+                    "reason": CONTACT_AMBIGUOUS_ON_CHILD,
+                    "hubspotContactId": contact.hubspot_id,
+                    "contactIds": here,
+                }
+            )
+        else:
+            # Candidates share the part before the @ (ids only); they are
+            # evidence for a person to look at, never a match.
+            wanted = local_part(contact.email)
+            candidates = list(
+                dict.fromkeys(
+                    cid for cid, mail in on_child if wanted and local_part(mail) == wanted
+                )
+            )
+            entry.update(status=UNMATCHED_ON_EXISTING_CHILD, candidateIds=candidates)
+            holds.append(
+                {
+                    "reason": UNMATCHED_ON_EXISTING_CHILD,
+                    "hubspotContactId": contact.hubspot_id,
+                    "candidateIds": candidates,
+                }
+            )
+
+    def _new_child_contact(self, contact, entry: dict) -> None:
+        """The child does not exist yet: copy the newest existing copy of this
+        email from another child, or create."""
+        copies = self._famly.copies_of_email(contact.email, None)
+        if copies:
+            entry.update(
+                status=WOULD_COPY,
+                famlyContactId=newest(copies).contact_id,
+                copyCount=len(copies),
+                copiesDiffer=copies_differ(copies),
+            )
+        else:
+            entry["status"] = WOULD_CREATE
+
+
+def _hubspot_child_names(deal: dict) -> list[str]:
+    """The child's name from the deal, as comparable strings (in memory only)."""
+    values = [
+        " ".join(str(deal.get(p) or "").split()) for p in hubspot_config.CHILD_NAME_PROPERTIES
+    ]
+    values = [v for v in values if v]
+    if not values:
+        return []
+    return list(dict.fromkeys([" ".join(values), *values]))
+
+
+def _tokens(name: str) -> frozenset:
+    return frozenset(name.casefold().split())
+
+
+def _names_match(famly_name: str, hubspot_names: list[str], deal: dict) -> bool:
+    """A Famly child's name equals the deal's child name (same words, any
+    order), or appears in the deal name. In memory only."""
+    famly_tokens = _tokens(famly_name)
+    if not famly_tokens:
+        return False
+    if any(_tokens(n) == famly_tokens for n in hubspot_names):
+        return True
+    dealname = " ".join(str(deal.get("dealname") or "").casefold().split())
+    return " ".join(famly_name.casefold().split()) in dealname
 
 
 def summarise(plans: list[dict]) -> dict:

@@ -46,9 +46,27 @@ DEAL_PROPERTIES = (
     "child_urn",
     "child_date_of_birth",
     "actual_start_date_1",
+    "end_date",
     "location_of_interest",
     "deposit_amount",
     "famly_childid",
+)
+# Child name properties, used ONLY for the in-memory possible-duplicate check
+# before a child would be created; never printed or logged. THE INTERNAL NAMES
+# ARE A GUESS (design doc: "child first, last and full name") -- override with
+# HUBSPOT_CHILD_NAME_PROPERTIES (comma-separated). HubSpot ignores a property
+# that does not exist, and with none returned the duplicate check treats every
+# same-site, same-birth-date child as a possible duplicate (the safe side).
+CHILD_NAME_PROPERTIES = tuple(
+    p.strip()
+    for p in os.environ.get(
+        "HUBSPOT_CHILD_NAME_PROPERTIES",
+        "child_first_name,child_last_name,child_full_name",
+    ).split(",")
+    if p.strip()
+)
+DEAL_PROPERTIES = DEAL_PROPERTIES + tuple(
+    p for p in CHILD_NAME_PROPERTIES if p not in DEAL_PROPERTIES
 )
 # Only what is needed to know the contact has an email, and to match it.
 CONTACT_PROPERTIES = ("email",)

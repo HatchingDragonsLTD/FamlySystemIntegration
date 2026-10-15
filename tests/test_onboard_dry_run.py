@@ -110,6 +110,7 @@ class FakeFamlyClient:
         self.child_contacts = {}  # child id -> [(contact id, email)]
         self.scan = []  # [{"id": child id, "contacts": [node, ...]}]
         self.urn_children = []  # [(child id, externalId)]
+        self.site_children = []  # [(child id, birthday, full name)]
         self.error = None
         self.calls = []
 
@@ -131,6 +132,10 @@ class FakeFamlyClient:
                 "result": [{"id": i, "email": e} for i, e in rows], "next": None}}}}
         if operation_name == "OnboardContactsScan":
             return {"data": {"children": {"listBySiteIds": {"result": self.scan, "next": None}}}}
+        if operation_name == "OnboardSiteChildren":
+            result = [{"id": i, "birthday": b, "name": {"fullName": n}}
+                      for i, b, n in self.site_children]
+            return {"data": {"children": {"listBySiteIds": {"result": result, "next": None}}}}
         if operation_name == urn_runner.OPERATION_NAME:
             result = [
                 {"id": i, "externalId": u, "name": {"fullName": "Zara Quillfeather"}}
@@ -467,41 +472,69 @@ class ChildLookupTests(DryRunTestCase):
 # Contacts plan.
 # --------------------------------------------------------------------------- #
 class ContactPlanTests(DryRunTestCase):
-    def test_present_would_copy_and_would_create(self):
-        self.famly.ext_refs["D1"] = ["child-1"]
-        self.famly.child_contacts["child-1"] = [("fc-1", "PARENT.ONE@example.org ")]
+    def test_new_child_contacts_are_would_copy_or_would_create(self):
         self.famly.scan = [
-            {"id": "child-1", "contacts": [scan_contact("fc-1", "parent.one@example.org")]},
             {"id": "child-7", "contacts": [
-                scan_contact("fc-old", "parent.two@example.org", "2025-01-01T00:00:00Z"),
-                scan_contact("fc-new", "parent.two@example.org", "2026-05-01T00:00:00Z",
+                scan_contact("fc-old", "parent.one@example.org", "2025-01-01T00:00:00Z"),
+                scan_contact("fc-new", "parent.one@example.org", "2026-05-01T00:00:00Z",
                              phone="07700900999"),
             ]},
         ]
-        contacts = self.plan()["contacts"]
-        self.assertEqual(contacts[0], {"hubspotContactId": "c1", "isBillPayer": True,
-                                       "status": "present", "famlyContactId": "fc-1"})
-        self.assertEqual(contacts[1]["status"], "would_copy")
-        self.assertEqual(contacts[1]["famlyContactId"], "fc-new")  # newest lastModifiedAt
-        self.assertEqual((contacts[1]["copyCount"], contacts[1]["copiesDiffer"]), (2, True))
-
+        contacts = self.plan()["contacts"]  # no child exists yet
+        self.assertEqual(contacts[0]["status"], "would_copy")
+        self.assertEqual(contacts[0]["famlyContactId"], "fc-new")  # newest lastModifiedAt
+        self.assertEqual((contacts[0]["copyCount"], contacts[0]["copiesDiffer"]), (2, True))
+        self.assertEqual(contacts[1]["status"], "would_create")
         self.famly.scan = []
-        self.assertEqual(self.plan()["contacts"][1]["status"], "would_create")
+        self.assertEqual(self.plan()["contacts"][0]["status"], "would_create")
 
-    def test_a_contact_already_on_the_child_is_never_copied_from_itself(self):
+    def test_existing_child_parent_on_the_child_is_present(self):
         self.famly.ext_refs["D1"] = ["child-1"]
-        self.famly.scan = [{"id": "child-1", "contacts": [
-            scan_contact("fc-1", "parent.two@example.org")]}]
-        self.assertEqual(self.plan()["contacts"][1]["status"], "would_create")
+        self.famly.child_contacts["child-1"] = [("fc-1", "PARENT.ONE@example.org "),
+                                                ("fc-2", "parent.two@example.org")]
+        plan = self.plan()
+        self.assertEqual(plan["holds"], [])
+        self.assertEqual(plan["contacts"][0], {
+            "hubspotContactId": "c1", "isBillPayer": True, "status": "present",
+            "famlyContactId": "fc-1",
+            "labels": [{"typeId": 91, "label": "Bill Payer", "direction": "deal_to_contact"}]})
 
-    def test_with_no_child_yet_every_contact_searches_all_children(self):
+    def test_existing_child_unmatched_parent_is_never_copied_or_created(self):
+        self.famly.ext_refs["D1"] = ["child-1"]
+        self.famly.child_contacts["child-1"] = [
+            ("fc-1", "parent.one@example.org"),
+            ("fc-3", "parent.two@other.com"),   # same local part, different domain
+            ("fc-4", "someone.else@example.org"),
+        ]
+        # Another child carries the exact email: still no copy onto an existing child.
         self.famly.scan = [{"id": "child-7", "contacts": [
-            scan_contact("fc-7", "parent.one@example.org")]}]
-        contacts = self.plan()["contacts"]
-        self.assertEqual([c["status"] for c in contacts], ["would_copy", "would_create"])
-        self.assertEqual(contacts[0]["copyCount"], 1)
-        self.assertFalse(contacts[0]["copiesDiffer"])
-        self.assertNotIn("OnboardChildContacts", self.famly.calls)
+            scan_contact("fc-7", "parent.two@example.org")]}]
+        plan = self.plan()
+        second = plan["contacts"][1]
+        self.assertEqual(second["status"], "contact_unmatched_on_existing_child")
+        self.assertEqual(second["candidateIds"], ["fc-3"])
+        self.assertNotIn("famlyContactId", second)
+        self.assertEqual(plan["status"], "held")
+        self.assertEqual(self.reasons(plan), ["contact_unmatched_on_existing_child"])
+        self.assertNotIn("OnboardContactsScan", self.famly.calls)  # copy search not used
+
+    def test_googlemail_and_gmail_match_and_nothing_else_is_fuzzy(self):
+        from actions.onboard_dry_run.famly_reads import normalise_email
+        self.assertEqual(normalise_email(" Ada@GoogleMail.com "), normalise_email("ada@gmail.com"))
+        self.assertNotEqual(normalise_email("a.da@gmail.com"), normalise_email("ada@gmail.com"))
+        self.assertNotEqual(normalise_email("ada+x@gmail.com"), normalise_email("ada@gmail.com"))
+        self.assertNotEqual(normalise_email("ada@gmail.co.uk"), normalise_email("ada@gmail.com"))
+        self.assertNotEqual(normalise_email("ada@mygmail.com"), normalise_email("ada@gmail.com"))
+        # End to end: present on an existing child, and found as a copy for a new one.
+        self.hub.contacts["c1"] = {"email": "Parent.One@googlemail.com"}
+        self.famly.ext_refs["D1"] = ["child-1"]
+        self.famly.child_contacts["child-1"] = [("fc-1", "parent.one@gmail.com"),
+                                                ("fc-2", "parent.two@example.org")]
+        self.assertEqual(self.plan()["contacts"][0]["status"], "present")
+        self.famly.ext_refs.clear()
+        self.famly.scan = [{"id": "child-7", "contacts": [
+            scan_contact("fc-7", "parent.one@gmail.com")]}]
+        self.assertEqual(self.plan()["contacts"][0]["status"], "would_copy")
 
     def test_two_contacts_with_one_email_on_the_child_hold(self):
         self.famly.ext_refs["D1"] = ["child-1"]
@@ -701,6 +734,155 @@ class RunGuaranteeTests(DryRunTestCase):
         self.run_all(["D1", "D2"])
         self.assertEqual(self.famly.calls.count("OnboardContactsScan"), 1)
         self.assertEqual(self.famly.calls.count(urn_runner.OPERATION_NAME), 1)
+
+
+# --------------------------------------------------------------------------- #
+# Child safety: recorded id, possible duplicates.
+# --------------------------------------------------------------------------- #
+class ChildSafetyTests(DryRunTestCase):
+    def test_a_recorded_famly_childid_that_does_not_exist_holds(self):
+        self.hub.deals["D1"] = make_deal(famly_childid="child-gone")
+        self.famly.urn_children = [("child-other", "x")]
+        plan = self.plan()
+        self.assertEqual(plan["status"], "held")
+        self.assertEqual(plan["holds"][0], {"reason": "famly_childid_not_found",
+                                            "famlyChildId": "child-gone"})
+        self.assertEqual(plan["child"]["status"], "child_unresolved")
+        self.assertTrue(all(c["status"] == "child_unresolved" for c in plan["contacts"]))
+
+    def test_a_recorded_childid_that_exists_is_used_when_no_reference_matches(self):
+        self.hub.deals["D1"] = make_deal(famly_childid="child-5")
+        self.famly.urn_children = [("child-5", "other-urn")]
+        plan = self.plan()
+        self.assertEqual(plan["child"], {"status": "child_found", "famlyChildId": "child-5",
+                                         "via": "famly_childid"})
+        self.assertNotIn("famly_childid_not_found", self.reasons(plan))
+
+    def test_possible_duplicate_needs_same_site_birth_date_and_name(self):
+        self.hub.deals["D1"] = make_deal(child_first_name="Zara", child_last_name="Quillfeather")
+        self.famly.site_children = [
+            ("dup-1", "2024-01-15", "Quillfeather  ZARA"),   # same words, any order
+            ("other-dob", "2024-01-16", "Zara Quillfeather"),
+            ("other-name", "2024-01-15", "Mina Brightwater"),
+        ]
+        plan = self.plan()
+        self.assertEqual(plan["child"], {"status": "child_would_create"})
+        self.assertEqual(plan["holds"], [{"reason": "child_possible_duplicate",
+                                          "childIds": ["dup-1"]}])
+        self.assertEqual(plan["status"], "held")
+
+    def test_the_deal_name_can_carry_the_childs_name(self):
+        self.hub.deals["D1"] = make_deal(dealname="Zara Quillfeather - Westminster")
+        self.hub.deals["D1"]["child_first_name"] = "Zara"
+        self.famly.site_children = [("dup-1", "2024-01-15", "zara quillfeather")]
+        self.assertEqual(self.plan()["holds"][0]["childIds"], ["dup-1"])
+
+    def test_no_name_on_the_deal_means_every_same_birth_date_child_counts(self):
+        self.famly.site_children = [("a", "2024-01-15", "Anyone"), ("b", "2023-01-15", "Else")]
+        plan = self.plan()  # make_deal has no child name properties
+        self.assertEqual(plan["holds"][0]["childIds"], ["a"])
+        self.assertIn("child_name_unavailable_for_duplicate_check", plan["warnings"])
+
+    def test_the_duplicate_search_only_runs_when_a_child_would_be_created(self):
+        self.famly.ext_refs["D1"] = ["child-1"]
+        self.famly.site_children = [("dup-1", "2024-01-15", "Zara Quillfeather")]
+        self.plan()
+        self.assertNotIn("OnboardSiteChildren", self.famly.calls)
+
+
+# --------------------------------------------------------------------------- #
+# Left Nursery, start and end dates.
+# --------------------------------------------------------------------------- #
+class LeftNurseryAndDatesTests(DryRunTestCase):
+    def left(self, **over):
+        self.hub.stages["s-left"] = ("Operations", "Left Nursery")
+        over.setdefault("end_date", "2026-06-30")  # after the 2026-01-15 start
+        self.hub.deals["D1"] = make_deal(dealstage="s-left", **over)
+
+    def test_left_nursery_is_voyagers_from_the_catalogue_with_no_age_rule(self):
+        self.left(child_date_of_birth="")  # age would be needed for the age rule
+        plan = self.plan()
+        self.assertEqual((plan["groupTitle"], plan["groupId"]), ("Voyagers", "HDWEST-v"))
+        self.assertEqual(plan["groupReason"], "left_nursery_voyagers")
+        self.assertEqual(plan["stage"]["depositState"], "none")
+        self.assertEqual(plan["holds"], [])
+
+    def test_stage_matching_ignores_stray_whitespace_and_case(self):
+        self.hub.stages["s-left"] = (" operations ", "  LEFT   Nursery ")
+        self.hub.deals["D1"] = make_deal(dealstage="s-left", end_date="2026-06-30")
+        self.assertEqual(self.plan()["groupReason"], "left_nursery_voyagers")
+        self.assertEqual(derive.deposit_state("OPERATIONS ", " deposit   pending"), "unpaid")
+
+    def test_left_nursery_without_an_end_date_holds_as_it_would_look_active(self):
+        self.left()
+        self.hub.deals["D1"]["end_date"] = ""
+        self.assertEqual(self.reasons(self.plan()), ["end_date_missing"])
+
+    def test_left_nursery_without_a_start_date_holds(self):
+        self.left(actual_start_date_1="")
+        self.assertEqual(self.reasons(self.plan()), ["start_date_missing"])
+        self.hub.deals["D1"]["end_date"] = ""
+        self.assertEqual(sorted(self.reasons(self.plan())),
+                         ["end_date_missing", "start_date_missing"])
+
+    def test_an_end_date_before_the_start_date_is_inconsistent_at_any_stage(self):
+        self.hub.deals["D1"] = make_deal(end_date="2025-12-31")  # start is 2026-01-15
+        self.assertEqual(self.reasons(self.plan()), ["dates_inconsistent"])
+        self.left(end_date="2025-12-31")
+        self.assertEqual(self.reasons(self.plan()), ["dates_inconsistent"])
+        # An end date equal to the start date is allowed.
+        self.hub.deals["D1"]["end_date"] = "2026-01-15"
+        self.assertEqual(self.reasons(self.plan()), [])
+
+    def test_an_end_date_in_the_future_warns(self):
+        self.left()
+        self.hub.deals["D1"]["end_date"] = "2026-12-01"
+        with mock.patch.object(derive, "today", return_value=date(2026, 10, 15)):
+            plan = self.plan()
+            self.assertIn("end_date_in_future", plan["warnings"])
+            self.hub.deals["D1"]["end_date"] = "2026-10-15"  # today is not the future
+            self.assertNotIn("end_date_in_future", self.plan()["warnings"])
+
+    def test_a_current_child_needs_no_end_date_and_reports_only_presence(self):
+        plan = self.plan()
+        self.assertEqual(plan["dates"], {"firstDayPresent": True, "lastDayPresent": False})
+        self.assertEqual(plan["holds"], [])
+        self.hub.deals["D1"]["end_date"] = "2027-03-31"
+        plan = self.plan()
+        self.assertEqual(plan["dates"], {"firstDayPresent": True, "lastDayPresent": True})
+        blob = json.dumps(plan)
+        for text in ("2027-03-31", "2026-01-15", "2024-01-15"):
+            self.assertNotIn(text, blob)
+
+    def test_an_unparseable_end_date_holds(self):
+        self.hub.deals["D1"]["end_date"] = "soon"
+        self.assertIn("date_invalid", self.reasons(self.plan()))
+
+
+# --------------------------------------------------------------------------- #
+# Warnings and labels.
+# --------------------------------------------------------------------------- #
+class WarningAndLabelTests(DryRunTestCase):
+    def test_no_quote_and_deposit_amount_missing_warn_without_holding(self):
+        self.hub.deals["D1"] = make_deal(deposit_amount="")
+        plan = self.plan()
+        self.assertIn("no_quote", plan["warnings"])
+        self.assertIn("deposit_amount_missing", plan["warnings"])
+        self.assertEqual(plan["status"], "ready")  # warnings never hold
+        # Left Nursery gets no deposit, so a missing amount is not a warning there.
+        self.hub.stages["s-left"] = ("Operations", "Left Nursery")
+        self.hub.deals["D1"] = make_deal(dealstage="s-left", deposit_amount="",
+                                         end_date="2026-06-30")
+        self.assertNotIn("deposit_amount_missing", self.plan()["warnings"])
+        self.hub.deals["D1"] = make_deal()
+        self.assertNotIn("deposit_amount_missing", self.plan()["warnings"])
+
+    def test_every_contact_lists_its_link_labels_by_name_and_type_id(self):
+        contacts = self.plan()["contacts"]
+        self.assertEqual(contacts[0]["labels"], [
+            {"typeId": 91, "label": "Bill Payer", "direction": "deal_to_contact"}])
+        self.assertEqual(contacts[1]["labels"], [
+            {"typeId": 3, "label": None, "direction": "deal_to_contact"}])
 
 
 if __name__ == "__main__":

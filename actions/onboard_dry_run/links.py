@@ -130,6 +130,15 @@ class DealContact:
     hubspot_id: str
     email: str  # held in memory only; never put in a plan
     is_bill_payer: bool
+    # The labels on this contact's link to the deal: names and type ids only.
+    labels: list[dict] = field(default_factory=list)
+
+
+def _label_rows(types: list[dict], direction: str) -> list[dict]:
+    return [
+        {"typeId": t.get("typeId"), "label": t.get("label"), "direction": direction}
+        for t in types
+    ]
 
 
 def _link_is_bill_payer(types: list[dict], deal_side_ids: set[int]) -> bool:
@@ -149,10 +158,13 @@ def deal_contacts(client: HubSpotClient, labels: LabelMap, deal_id: str) -> list
     out: list[DealContact] = []
     for link in client.associations("deals", deal_id, "contacts"):
         is_bill_payer = _link_is_bill_payer(link["types"], deal_side_ids)
+        link_labels = _label_rows(link["types"], DEAL_TO_CONTACT)
 
         if not is_bill_payer and labels.bill_payer_contact_side:
             # Defined from the contact's side: read the contact's links to deals.
             for back in client.associations("contacts", link["id"], "deals"):
+                if back["id"] == str(deal_id):
+                    link_labels += _label_rows(back["types"], CONTACT_TO_DEAL)
                 if back["id"] == str(deal_id) and any(
                     matches_label(t, hubspot.BILL_PAYER_LABEL, hubspot.BILL_PAYER_INTERNAL_NAME)
                     or (isinstance(t.get("typeId"), int) and t["typeId"] in contact_side_ids)
@@ -161,7 +173,7 @@ def deal_contacts(client: HubSpotClient, labels: LabelMap, deal_id: str) -> list
                     is_bill_payer = True
 
         email = (client.get_contact(link["id"]).get("email") or "").strip()
-        out.append(DealContact(link["id"], email, is_bill_payer))
+        out.append(DealContact(link["id"], email, is_bill_payer, link_labels))
     return out
 
 
