@@ -1,0 +1,10 @@
+# READ-ONLY. ChildrenQueries.listByExternalSystemReference(foreignId, system).
+query ProbeChildByRef($foreignId: String!, $system: String!) {
+  children {
+    listByExternalSystemReference(foreignId: $foreignId, system: $system) {
+      result {
+        id
+      }
+    }
+  }
+}
