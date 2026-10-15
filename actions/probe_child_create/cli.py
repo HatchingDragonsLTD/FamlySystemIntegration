@@ -29,11 +29,22 @@ def add_args(parser: argparse.ArgumentParser) -> None:
             f"and {runner.MAX_WRITES} write requests in total"
         ),
     )
+    parser.add_argument(
+        "--no-delete",
+        action="store_true",
+        help=(
+            "Skip the delete step. The created test children stay in Famly: their ids "
+            "are printed and MUST be deleted afterwards (see probe-child-delete)"
+        ),
+    )
 
 
 def handle(args: argparse.Namespace):
     try:
-        result = runner.run_probe(args.confirm, RestClient(), _public_client(), GraphQLClient())
+        result = runner.run_probe(
+            args.confirm, RestClient(), _public_client(), GraphQLClient(),
+            no_delete=args.no_delete,
+        )
     except runner.ProbeRefused as exc:
         print(str(exc), file=sys.stderr)
         raise SystemExit(3) from None
