@@ -1,0 +1,11 @@
+# THE WRITE. Confirmed against the live public API schema (2026-10-15):
+# ChildrenMutation.create(children: [ChildInput!]!) -> [Child!]!. Only `id` and
+# `externalId` are selected; everything else is read back separately.
+mutation ProbeChildCreate($children: [ChildInput!]!) {
+  children {
+    create(children: $children) {
+      id
+      externalId
+    }
+  }
+}

@@ -1,0 +1,21 @@
+# READ-ONLY schema introspection of the children create/delete mutations and the
+# input types they take.
+query ProbeChildIntrospect {
+  mutation: __type(name: "ChildrenMutation") {
+    fields {
+      name
+      description
+      args { name type { kind name ofType { kind name ofType { kind name ofType { kind name } } } } }
+      type { kind name ofType { kind name ofType { kind name ofType { kind name } } } }
+    }
+  }
+  input: __type(name: "ChildInput") {
+    inputFields { name type { kind name ofType { kind name ofType { kind name ofType { kind name } } } } }
+  }
+  siteRelation: __type(name: "SiteRelationInput") {
+    inputFields { name type { kind name ofType { kind name ofType { kind name } } } }
+  }
+  reference: __type(name: "ForeignIdReferenceInput") {
+    inputFields { name type { kind name ofType { kind name ofType { kind name } } } }
+  }
+}

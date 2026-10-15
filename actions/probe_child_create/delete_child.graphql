@@ -1,0 +1,10 @@
+# THE DELETE. ChildrenMutation.delete(childIds: [ChildId!], siteIds: [SiteId!])
+# -> [ChildId!]!. DANGER, from the schema's own description: it "soft-deletes the
+# given children, OR EVERY CHILD IN THE GIVEN SITES that is not already deleted".
+# This document therefore declares ONLY `childIds`; `siteIds` can never be sent
+# from here (and runner.py asserts that too).
+mutation ProbeChildDelete($childIds: [ChildId!]) {
+  children {
+    delete(childIds: $childIds)
+  }
+}

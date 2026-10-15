@@ -1,0 +1,21 @@
+# READ-ONLY, INTERNAL API (FAMLY_GRAPHQL_URL). childrenList(siteId, filter,
+# limit, cursor) -> { children: [Child!]!, next }. Used only to see whether a
+# test child's id is in a site's CURRENT / UPCOMING list; the caller prints
+# presence, never other children.
+query ProbeChildrenList(
+  $siteId: SiteId!
+  $filter: ChildrenListFilter
+  $limit: Int
+  $cursor: ChildOverviewListCursor
+) {
+  childrenList(siteId: $siteId, filter: $filter, limit: $limit, cursor: $cursor) {
+    children {
+      id
+      status
+      startDate
+      endDate
+      isTestChild
+    }
+    next
+  }
+}
