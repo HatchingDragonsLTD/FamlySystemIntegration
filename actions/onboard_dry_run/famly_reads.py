@@ -28,16 +28,44 @@ HERE = Path(__file__).parent
 CHILD_BY_EXT_REF_QUERY = HERE / "child_by_ext_ref.graphql"
 CHILD_CONTACTS_QUERY = HERE / "child_contacts.graphql"
 CONTACTS_SCAN_QUERY = HERE / "contacts_scan.graphql"
+SITE_CHILDREN_QUERY = HERE / "site_children.graphql"
 
 CHILD_BY_EXT_REF_OP = "OnboardChildByExternalRef"
 CHILD_CONTACTS_OP = "OnboardChildContacts"
 CONTACTS_SCAN_OP = "OnboardContactsScan"
+SITE_CHILDREN_OP = "OnboardSiteChildren"
 
 HUBSPOT_SYSTEM = "HUBSPOT"
 
 
+GMAIL_DOMAINS = {"gmail.com", "googlemail.com"}
+
+
 def normalise_email(value: Any) -> str:
-    return _normalise(value)
+    """Trim + casefold (the roster's convention), and treat googlemail.com as
+    gmail.com. FOR COMPARISON ONLY: the address itself is never rewritten
+    anywhere. No other fuzzy matching: dots and "+tags" in the local part count."""
+    email = _normalise(value)
+    local, at, domain = email.rpartition("@")
+    if at and domain in GMAIL_DOMAINS:
+        return f"{local}@gmail.com"
+    return email
+
+
+def local_part(value: Any) -> str:
+    """The normalised part before the @ ("" if there is none)."""
+    email = normalise_email(value)
+    local, at, _ = email.rpartition("@")
+    return local if at else ""
+
+
+@dataclass(frozen=True)
+class SiteChild:
+    """A child at a site, for the duplicate check. Held in memory only."""
+
+    child_id: str
+    birthday: str | None
+    full_name: str
 
 
 @dataclass(frozen=True)
@@ -83,6 +111,7 @@ class FamlyReads:
         self._site_ids = site_ids
         self._scan: dict[str, list[ContactCopy]] | None = None
         self._urn_roster: list | None = None
+        self._site_children: dict[str, list[SiteChild]] = {}
 
     def _public(self) -> GraphQLClient:
         if self._client is None:
@@ -113,6 +142,54 @@ class FamlyReads:
             self._urn_roster = urn_runner.fetch_roster(self._public())
         return _distinct(row.id for row in urn_runner.find_matches(urn, self._urn_roster))
 
+    def child_exists(self, child_id: str) -> bool:
+        """Whether a child with this id exists in Famly NOW (any site, past and
+        future included), from the same live roster the urn fallback uses.
+        (`children.listByChildIds` was not used: it answers HTTP 500 for an
+        unknown id, which cannot be told apart from an outage.)"""
+        if self._urn_roster is None:
+            self._urn_roster = urn_runner.fetch_roster(self._public())
+        return any(row.id == child_id for row in self._urn_roster)
+
+    def children_at_site(self, site_id: str) -> list[SiteChild]:
+        """Every child at `site_id`, live, past and future included. Once per
+        site per run."""
+        if site_id in self._site_children:
+            return self._site_children[site_id]
+
+        out: list[SiteChild] = []
+        cursor: str | None = None
+        while True:
+            body = self._public().execute(
+                query_path=SITE_CHILDREN_QUERY,
+                variables={
+                    "siteIds": [site_id],
+                    "next": cursor,
+                    "timeRange": dict(ROSTER_TIME_RANGE),
+                },
+                operation_name=SITE_CHILDREN_OP,
+            )
+            listing = _dig(body, "data", "children", "listBySiteIds")
+            if not isinstance(listing, dict):
+                break
+            for node in listing.get("result") or []:
+                if not isinstance(node, dict) or not node.get("id"):
+                    continue
+                name = node.get("name")
+                out.append(
+                    SiteChild(
+                        child_id=str(node["id"]),
+                        birthday=(str(node["birthday"])[:10] if node.get("birthday") else None),
+                        full_name=str(name.get("fullName") or "") if isinstance(name, dict) else "",
+                    )
+                )
+            cursor = listing.get("next") or None
+            if not cursor:
+                break
+
+        self._site_children[site_id] = out
+        return out
+
     # -- contacts -------------------------------------------------------- #
     def child_contacts(self, child_id: str) -> list[tuple[str, str]]:
         """(contact id, normalised email) for each contact on the child."""
@@ -129,7 +206,7 @@ class FamlyReads:
                 break
             for row in listing.get("result") or []:
                 if isinstance(row, dict) and row.get("id"):
-                    out.append((str(row["id"]), _normalise(row.get("email"))))
+                    out.append((str(row["id"]), normalise_email(row.get("email"))))
             cursor = listing.get("next") or None
             if not cursor:
                 break
@@ -138,7 +215,7 @@ class FamlyReads:
     def copies_of_email(self, email: str, exclude_child_id: str | None) -> list[ContactCopy]:
         """Every contact record carrying `email` on a child other than
         `exclude_child_id`, one per distinct contact id."""
-        target = _normalise(email)
+        target = normalise_email(email)
         if not target:
             return []
         found: dict[str, ContactCopy] = {}
@@ -172,7 +249,7 @@ class FamlyReads:
                 for node in child.get("contacts") or []:
                     if not isinstance(node, dict) or not node.get("id"):
                         continue
-                    email = _normalise(node.get("email"))
+                    email = normalise_email(node.get("email"))
                     if not email:
                         continue
                     index.setdefault(email, []).append(

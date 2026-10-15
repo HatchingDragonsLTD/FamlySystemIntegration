@@ -992,6 +992,13 @@ and the quotes. Anything unsafe is a HOLD with a reason code (`site_unmapped`,
 Output holds ids, codes and counts only: no names, emails, phone numbers or
 dates of birth. It never uses `roster_cache.db`.
 
+On a child that already exists, a HubSpot parent whose email is not one of its
+contacts is a hold (`contact_unmatched_on_existing_child`); copy/create is only
+planned for a child that does not exist yet. `googlemail.com` and `gmail.com`
+compare equal; nothing else is fuzzy. Left Nursery deals use Voyagers and need a
+start date and an end date (`end_date`, the Leave Date); the output says only
+whether each date is present.
+
 ## Tests
 
 ```bash

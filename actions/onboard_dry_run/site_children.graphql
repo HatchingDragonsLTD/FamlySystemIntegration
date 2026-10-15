@@ -1,0 +1,22 @@
+# READ-ONLY live list of one site's children (past and future included), for the
+# possible-duplicate check before a child would be created. `birthday` and
+# `name.fullName` are held in memory and compared there; they are never printed,
+# logged or stored.
+query OnboardSiteChildren(
+  $siteIds: [SiteId!]!
+  $next: ChildCursor
+  $timeRange: NonEmptyLocalDateRangeInput
+) {
+  children {
+    listBySiteIds(siteIds: $siteIds, nextToken: $next, timeRange: $timeRange) {
+      result {
+        id
+        birthday
+        name {
+          fullName
+        }
+      }
+      next
+    }
+  }
+}
