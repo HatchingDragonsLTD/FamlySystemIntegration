@@ -178,11 +178,11 @@ def _process(job: store.Job, deps: Deps, run_mode: str) -> dict:
             return {}
 
     context: dict = {}
-    # The child id in the job record, if THIS job created a child: the plan then
-    # knows the child is ours and not one that already existed.
-    own_child_id = job.child_id if job.child_create_sent else None
+    # The job HISTORY for the deal (this job and earlier ones): which children a
+    # create this pipeline sent produced. A child found by lookup that is not one
+    # of them already existed, and is handled more strictly.
     plan = DryRun(deps.hubspot, deps.famly()).plan_deal(
-        deal_id, context, created_child_id=own_child_id
+        deal_id, context, created_child_ids=store.created_child_ids_for_deal(deal_id)
     )
     if plan["status"] == "error":
         raise StopJob(store.FAILED, "plan_read_failed")
@@ -195,7 +195,8 @@ def _process(job: store.Job, deps: Deps, run_mode: str) -> dict:
         return {}
 
     if run_mode == config.MODE_DRY:
-        deps.notifier.notice(notifier_mod.gate_text(plan, digest, run_mode))
+        deps.notifier.notice(notifier_mod.gate_text(
+            plan, digest, run_mode, this_job_child_id=_this_jobs_child(job)))
         store.set_status(job.id, store.DRY_DONE, plan_hash=digest)
         return {}
 
@@ -206,6 +207,11 @@ def _process(job: store.Job, deps: Deps, run_mode: str) -> dict:
         return {}
 
     return _write_phase(job, deps, plan, context, digest)
+
+
+def _this_jobs_child(job) -> str | None:
+    """The child THIS job created, if it has (for the Slack wording only)."""
+    return job.child_id if job.child_create_sent else None
 
 
 def famly_writes_planned(plan: dict) -> bool:
@@ -245,7 +251,9 @@ def _webhook_hold_reason(deps, deal_id: str) -> str | None:
 
 def _ask_for_approval(job, deps, plan, digest, run_mode, plan_changed: bool) -> None:
     store.set_status(job.id, store.AWAITING_APPROVAL, plan_hash=digest, approved_hash=None)
-    text = notifier_mod.gate_text(plan, digest, run_mode, plan_changed=plan_changed)
+    text = notifier_mod.gate_text(
+        plan, digest, run_mode, plan_changed=plan_changed,
+        this_job_child_id=_this_jobs_child(job))
     ref = deps.notifier.gate(text, job.id, digest)
     if ref is None:
         # Nobody can approve a message that never arrived: do not wait for it.
@@ -275,10 +283,14 @@ def _write_phase(job, deps, plan, context, digest) -> dict:
 
     store.set_status(job.id, store.CREATING_CHILD, plan_hash=digest)
     deal = context["deal"]
-    child_id, created = _ensure_child(job, deps, plan, deal)
+    child_id, created, via = _ensure_child(job, deps, plan, deal)
     store.update(job.id, child_id=child_id)
-    # Ours if this job created it now, or created it earlier (the job record).
-    own_child = created or (job.child_create_sent and job.child_id == child_id)
+    # The same history-based rule as the plan, applied at the last moment: ours if
+    # this job just created it, or if it was found by the deal-id reference and a
+    # create this pipeline sent (an earlier job, or this one) produced that id.
+    own_child = created or (
+        via == VIA_DEAL and child_id in store.created_child_ids_for_deal(deal_id)
+    )
 
     _write_back(deps, deal_id, hubspot_sync.STATUS_CHILD_READY, "child_ready",
                 plan["warnings"], child_id)
@@ -312,24 +324,31 @@ def _clean(value) -> str:
     return " ".join(str(value or "").split())
 
 
-def _lookup_child(deps, deal: dict, deal_id: str, urn_fallback: bool) -> list[str]:
+VIA_DEAL = "external_system_reference"
+VIA_URN = "urn"
+
+
+def _lookup_child(deps, deal: dict, deal_id: str, urn_fallback: bool) -> tuple[list[str], str]:
+    """(child ids, how they were found: the deal-id reference or the URN)."""
     famly = deps.famly()
     ids = famly.children_by_deal_id(deal_id)
-    if not ids and urn_fallback and _clean(deal.get("child_urn")):
-        ids = famly.children_by_urn(_clean(deal.get("child_urn")))
-    return ids
+    if ids:
+        return ids, VIA_DEAL
+    if urn_fallback and _clean(deal.get("child_urn")):
+        return famly.children_by_urn(_clean(deal.get("child_urn"))), VIA_URN
+    return [], VIA_DEAL
 
 
-def _ensure_child(job, deps, plan, deal) -> tuple[str, bool]:
-    """(child id, whether this job created it)."""
+def _ensure_child(job, deps, plan, deal) -> tuple[str, bool, str]:
+    """(child id, whether this job created it, how it was found)."""
     deal_id = job.deal_id
 
     # The live lookup immediately before the write. A child that now exists wins.
-    ids = _lookup_child(deps, deal, deal_id, urn_fallback=True)
+    ids, via = _lookup_child(deps, deal, deal_id, urn_fallback=True)
     if len(ids) > 1:
         raise StopJob(store.NEEDS_REVIEW, "child_ambiguous")
     if ids:
-        return ids[0], False
+        return ids[0], False, via
 
     is_test = config.is_test_deal(deal_id)
     try:
@@ -347,15 +366,18 @@ def _ensure_child(job, deps, plan, deal) -> tuple[str, bool]:
         raise StopJob(store.FAILED, exc.code) from None
     except famly_writes.OutcomeUnknown:
         # Did it land? Look; never send again.
-        landed = _lookup_child(deps, deal, deal_id, urn_fallback=False)
+        landed, _via = _lookup_child(deps, deal, deal_id, urn_fallback=False)
         if len(landed) > 1:
             raise StopJob(store.NEEDS_REVIEW, "child_ambiguous") from None
         if not landed:
             raise StopJob(store.FAILED, "child_create_unknown_not_landed") from None
         child_id = landed[0]
 
+    # Recorded AT ONCE, before the read-back: this is the job history that tells a
+    # later job the child is the pipeline's. A read-back failure must not lose it.
+    store.update(job.id, child_id=child_id)
     _verify_child(deps, deal, deal_id, plan, child_id, is_test)
-    return child_id, True
+    return child_id, True, VIA_DEAL
 
 
 def _verify_child(deps, deal, deal_id, plan, child_id, is_test) -> None:

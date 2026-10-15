@@ -14,8 +14,16 @@ from . import approval, config
 logger = logging.getLogger(__name__)
 
 
-def gate_text(plan: dict, plan_hash: str, mode: str, plan_changed: bool = False) -> str:
-    """The Gate A message body for a plan."""
+def gate_text(
+    plan: dict,
+    plan_hash: str,
+    mode: str,
+    plan_changed: bool = False,
+    this_job_child_id: str | None = None,
+) -> str:
+    """The Gate A message body for a plan. `this_job_child_id` is the child this
+    very job created (if any), to tell `created by this job` from `created by
+    pipeline` (a child an EARLIER job created)."""
     deal_id = plan["dealId"]
     link = config.deal_link(deal_id)
     contacts = plan.get("contacts") or []
@@ -40,8 +48,9 @@ def gate_text(plan: dict, plan_hash: str, mode: str, plan_changed: bool = False)
     )
     if child.get("status") == "child_would_create":
         child_state = "would be created"
-    elif child.get("origin") == "created_by_this_job":
-        child_state = "created by this job"
+    elif child.get("origin") == "created_by_pipeline":
+        mine = this_job_child_id and child.get("famlyChildId") == this_job_child_id
+        child_state = "created by this job" if mine else "created by pipeline"
     else:
         child_state = "already in Famly"
     child_writes = 1 if child.get("status") == "child_would_create" else 0

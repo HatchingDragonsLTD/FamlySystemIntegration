@@ -359,6 +359,24 @@ def mark_child_create_sent(job_id: str) -> bool:
     return cursor.rowcount == 1
 
 
+def created_child_ids_for_deal(deal_id: str) -> frozenset[str]:
+    """Child ids that a job for THIS deal recorded as the result of a create it
+    SENT (`child_create_sent` and a persisted `child_id`). The job history is how
+    the plan knows a child was created by the pipeline rather than found:
+
+      * a job that merely found an existing child sets `child_id` but never
+        `child_create_sent`, so it does not count;
+      * a job for another deal does not count, even for the same child id.
+    """
+    with _open() as connection:
+        rows = connection.execute(
+            "SELECT DISTINCT child_id FROM onboard_jobs "
+            "WHERE deal_id = ? AND child_create_sent = 1 AND child_id IS NOT NULL",
+            (str(deal_id),),
+        ).fetchall()
+    return frozenset(row["child_id"] for row in rows)
+
+
 def recover_in_flight() -> int:
     """A job found mid-write (creating_child / creating_contacts) means a worker
     died after it may have written. It is NEVER replayed: it becomes

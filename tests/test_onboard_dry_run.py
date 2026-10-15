@@ -516,22 +516,31 @@ class ContactPlanTests(DryRunTestCase):
         for text in ("example.org", "other.com", "parent.two", "@"):
             self.assertNotIn(text, blob)           # no email, not even a fragment
 
-    def test_a_child_created_by_this_job_keeps_would_create_for_an_unmatched_contact(self):
+    def test_a_pipeline_created_child_keeps_would_create_for_an_unmatched_contact(self):
         self.famly.ext_refs["D1"] = ["child-1"]
         self.famly.child_contacts["child-1"] = [("fc-1", "parent.one@example.org")]
         plan = self.dry_with_own_child("child-1")
-        self.assertEqual(plan["child"]["origin"], "created_by_this_job")
+        self.assertEqual(plan["child"]["origin"], "created_by_pipeline")
         self.assertEqual([c["status"] for c in plan["contacts"]], ["present", "would_create"])
         self.assertEqual(plan["holds"], [])
-        # A DIFFERENT child id in the job record is not this child: it existed already.
+        # A DIFFERENT child id in the job history is not this child: it existed already.
         other = self.dry_with_own_child("some-other-child")
         self.assertEqual(other["child"]["origin"], "existing")
         self.assertEqual(self.reasons(other), ["contact_unmatched_on_existing_child"])
 
+    def test_a_child_found_only_by_the_urn_is_existing_even_if_the_history_names_it(self):
+        from actions.onboard_dry_run.runner import DryRun
+        self.famly.urn_children = [("child-9", "URN-1")]      # no HUBSPOT reference at all
+        self.famly.child_contacts["child-9"] = [("fc-1", "parent.one@example.org")]
+        plan = DryRun(self.hub, FamlyReads(self.famly, site_ids=[WEST_ID])).plan_deal(
+            "D1", None, created_child_ids={"child-9"})
+        self.assertEqual((plan["child"]["via"], plan["child"]["origin"]), ("urn", "existing"))
+        self.assertEqual(self.reasons(plan), ["contact_unmatched_on_existing_child"])
+
     def dry_with_own_child(self, child_id):
         from actions.onboard_dry_run.runner import DryRun
         return DryRun(self.hub, FamlyReads(self.famly, site_ids=[WEST_ID])).plan_deal(
-            "D1", None, created_child_id=child_id)
+            "D1", None, created_child_ids={child_id})
 
     def test_googlemail_and_gmail_match_and_nothing_else_is_fuzzy(self):
         from actions.onboard_dry_run.famly_reads import normalise_email

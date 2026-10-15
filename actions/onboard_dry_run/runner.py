@@ -88,7 +88,7 @@ class DryRun:
         self,
         deal_id: str,
         context: dict | None = None,
-        created_child_id: str | None = None,
+        created_child_ids=None,
     ) -> dict:
         """The dry-run plan for one deal. Never raises for a read failure: that
         becomes `status: error` so one bad deal cannot stop a batch.
@@ -98,15 +98,17 @@ class DryRun:
         personal data for the phase-2 writer, held in memory only. It is never
         part of the returned plan.
 
-        `created_child_id` is the child THIS JOB created, if it has created one
-        (the child id in the job record). A child found by lookup that is not
-        that one already existed when the job started, and is handled more
-        strictly: see `_existing_child_contact`."""
+        `created_child_ids` is the job HISTORY for this deal: the child ids that
+        a job (an earlier one, or this one) recorded as the result of a create it
+        sent. A child found by the live lookup on the deal id whose id is in that
+        set has origin `created_by_pipeline`; any other child, including one found
+        only by the URN fallback or one no job record mentions, is `existing` and
+        handled more strictly: see `_existing_child_contact`."""
         deal_id = str(deal_id).strip()
         plan: dict[str, Any] = {"dealId": deal_id, "holds": [], "warnings": []}
         context = context if context is not None else {}
         try:
-            self._plan(deal_id, plan, context, created_child_id)
+            self._plan(deal_id, plan, context, created_child_ids)
         except HubSpotError as exc:
             if exc.status_code == 404:
                 plan["holds"].append({"reason": DEAL_NOT_FOUND})
@@ -123,7 +125,7 @@ class DryRun:
         return plan
 
     def _plan(
-        self, deal_id: str, plan: dict, context: dict, created_child_id: str | None = None
+        self, deal_id: str, plan: dict, context: dict, created_child_ids=None
     ) -> None:
         deal = self._hubspot.get_deal(deal_id)
         context["deal"] = deal
@@ -136,10 +138,13 @@ class DryRun:
         self._derive_dates(deal, left_nursery, plan)
         plan["child"] = self._child(deal, deal_id, plan)
         if plan["child"]["status"] == CHILD_FOUND:
-            # Existing when the job started, or created by this very job.
+            # `created_by_pipeline` needs BOTH: found by the deal-id reference (a
+            # pipeline-created child always carries it) and an id the job history
+            # says a create produced. Everything else is `existing`.
             plan["child"]["origin"] = (
-                "created_by_this_job"
-                if created_child_id and plan["child"]["famlyChildId"] == created_child_id
+                "created_by_pipeline"
+                if plan["child"]["via"] == "external_system_reference"
+                and plan["child"]["famlyChildId"] in (created_child_ids or ())
                 else "existing"
             )
         if plan["child"]["status"] == CHILD_WOULD_CREATE:
@@ -370,7 +375,7 @@ class DryRun:
             elif child["status"] == CHILD_FOUND:
                 self._existing_child_contact(
                     contact, on_child, entry, holds,
-                    own_child=child.get("origin") == "created_by_this_job",
+                    own_child=child.get("origin") == "created_by_pipeline",
                 )
             elif child["status"] == CHILD_WOULD_CREATE:
                 self._new_child_contact(contact, entry)
@@ -391,8 +396,9 @@ class DryRun:
             child that share the part before the @ (ids only: evidence for a
             person, never a match). A contact is never added to a child somebody
             else created on a guess.
-          * on a child THIS JOB created: `would_create`, as the child was ours
-            and these are the contacts we are putting on it.
+          * on a child the PIPELINE created (per the job history): `would_create`,
+            as the child was ours; this is how a re-run after a partial failure
+            completes the contacts that are missing.
         """
         target = normalise_email(contact.email)
         here = list(dict.fromkeys(cid for cid, mail in on_child if mail == target))
