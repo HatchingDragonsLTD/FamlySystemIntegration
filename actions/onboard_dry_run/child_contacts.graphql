@@ -1,0 +1,15 @@
+# READ-ONLY. ContactQueries.list(childIds: [ChildId!]!, nextToken:
+# ContactCursor) -> ContactListResult { result: [Contact!]!, next }. Selects the
+# contact id and email only (the email is held in memory to be matched, never
+# printed or logged).
+query OnboardChildContacts($childIds: [ChildId!]!, $next: ContactCursor) {
+  contacts {
+    list(childIds: $childIds, nextToken: $next) {
+      result {
+        id
+        email
+      }
+      next
+    }
+  }
+}

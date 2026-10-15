@@ -968,6 +968,30 @@ This is a **lookup** for linking HubSpot records to existing Famly ids. It must
 never be the existence check for the contact-creation pipeline (see the
 warning above).
 
+## Onboarding dry run (`onboard-dry-run`, phase 1)
+
+`python main.py onboard-dry-run --deal-id <id>` (or `--deal-ids a,b,c` for a
+batch with a counts-only summary at the end) prints, as JSON, what onboarding a
+HubSpot deal into Famly would do. **It makes no writes to Famly or HubSpot.**
+Design: `docs/famly_onboarding_pipeline_design.md`.
+
+Needs `HUBSPOT_TOKEN` (private app Famly_Server_Key; read scopes only) and the
+usual `FAMLY_ACCESS_TOKEN`. HubSpot is read through `core/hubspot.py`, which can
+only send GET, always asks for an explicit property allow-list and never logs
+values. Association labels (Bill Payer, Sales) are matched by label/internal
+name and read from the v4 labels endpoints first; the run prints the labels and
+type ids it found. Override with `HUBSPOT_BILL_PAYER_LABEL`,
+`HUBSPOT_BILL_PAYER_TYPE_ID`, `HUBSPOT_SALES_LABEL` and friends.
+
+Per deal it reports the stage and deposit state, site (from
+`location_of_interest`: Westminster/City/Canada Water only), room (age in
+completed months at the start date), the child lookup (deal-id reference, then
+urn, both live), a status per contact (`present`, `would_copy`, `would_create`)
+and the quotes. Anything unsafe is a HOLD with a reason code (`site_unmapped`,
+`group_missing`, `dob_missing`, `child_ambiguous`, `bill_payer_unclear`, ...).
+Output holds ids, codes and counts only: no names, emails, phone numbers or
+dates of birth. It never uses `roster_cache.db`.
+
 ## Tests
 
 ```bash

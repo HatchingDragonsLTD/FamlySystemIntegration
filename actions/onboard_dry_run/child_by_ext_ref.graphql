@@ -1,0 +1,14 @@
+# READ-ONLY. Confirmed against the live public API schema (2026-10-15):
+# ChildrenQueries.listByExternalSystemReference(foreignId: String!, system:
+# String!) -> ChildrenListResult { result: [Child!]!, next }. Searches every
+# site, includes past and future children, is not paginated and matches
+# case-insensitively. Only `id` is selected.
+query OnboardChildByExternalRef($foreignId: String!, $system: String!) {
+  children {
+    listByExternalSystemReference(foreignId: $foreignId, system: $system) {
+      result {
+        id
+      }
+    }
+  }
+}
