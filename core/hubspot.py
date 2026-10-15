@@ -68,8 +68,24 @@ CHILD_NAME_PROPERTIES = tuple(
 DEAL_PROPERTIES = DEAL_PROPERTIES + tuple(
     p for p in CHILD_NAME_PROPERTIES if p not in DEAL_PROPERTIES
 )
-# Only what is needed to know the contact has an email, and to match it.
-CONTACT_PROPERTIES = ("email",)
+# The contact's email (to match it) plus the fields a Famly contact would be
+# built from. Values are read into memory only to derive booleans and codes;
+# the plan never carries them. The WhatsApp property name is HubSpot's standard
+# one ("WhatsApp phone number"); override with HUBSPOT_WHATSAPP_PROPERTY.
+WHATSAPP_PROPERTY = os.environ.get("HUBSPOT_WHATSAPP_PROPERTY", "hs_whatsapp_phone_number")
+CONTACT_PROPERTIES = (
+    "email",
+    "firstname",
+    "lastname",
+    "mobilephone",
+    "phone",
+    WHATSAPP_PROPERTY,
+    "address",
+    "city",
+    "zip",
+    "state",
+    "country",
+)
 QUOTE_PROPERTIES = ("hs_status", "hs_quote_esign_status", "hs_manually_signed")
 
 # Association labels (verified by Drew in HubSpot's API details, 2026-10-15).

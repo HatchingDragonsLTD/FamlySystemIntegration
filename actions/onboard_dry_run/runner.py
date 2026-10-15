@@ -102,6 +102,7 @@ class DryRun:
             # Never the message: it can echo a response body.
             plan["error"] = {"source": "famly", "type": type(exc).__name__}
 
+        plan["warnings"] = list(dict.fromkeys(plan["warnings"]))
         plan["status"] = (
             "error" if "error" in plan else "held" if plan["holds"] else "ready"
         )
@@ -302,7 +303,19 @@ class DryRun:
                 "hubspotContactId": contact.hubspot_id,
                 "isBillPayer": contact.is_bill_payer,
                 "labels": contact.labels,
+                "phoneSource": contact.phone_source,
+                "phoneType": links.phone_type(contact.phone_source),
+                "hasEmail": bool(contact.email),
+                "hasCompleteAddress": contact.has_complete_address,
+                "hasFirstAndLastName": contact.has_first_and_last_name,
+                # Only the bill payer is the emergency contact.
+                "emergencyContact": contact.is_bill_payer,
+                "records": [{"key": "RELATION", "value": "Parent"}],
             }
+            if contact.phone_source == "none":
+                warnings.append("phone_missing")
+            if not contact.has_complete_address:
+                warnings.append("address_incomplete")
             if not contact.email:
                 entry["status"] = NO_EMAIL
                 holds.append({"reason": CONTACT_NO_EMAIL, "hubspotContactId": contact.hubspot_id})
