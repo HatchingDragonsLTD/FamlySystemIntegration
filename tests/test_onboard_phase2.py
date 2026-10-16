@@ -636,19 +636,22 @@ class ChildCreateTests(Phase2Case):
         self.assertEqual(result["status"], store.DONE)
         self.assertEqual(self.job().child_id, "child-1")
 
-    def test_an_unknown_outcome_that_did_not_land_fails_without_a_second_create(self):
+    def test_an_unknown_outcome_that_did_not_land_needs_review_without_a_second_create(self):
         for error in (requests.exceptions.ConnectionError(),
                       GraphQLHTTPError("boom", 503, "")):
             with self.subTest(error=type(error).__name__):
                 store._reset_for_tests()
                 self.famly.children.clear()
                 self.famly.child_creates.clear()
+                self.notify.notices.clear()
                 self.famly.child_effect = mock.Mock(side_effect=error)   # fails BEFORE landing
                 result = self.run_through()
                 self.assertEqual(len(self.famly.child_creates), 1)
                 self.assertEqual((result["status"], result["code"]),
-                                 (store.FAILED, "child_create_unknown_not_landed"))
+                                 (store.NEEDS_REVIEW, "create_outcome_unknown"))
                 self.assertEqual(self.famly.contact_creates, [])
+                self.assertTrue(any("check Famly for the deal id before re-running" in n
+                                    for n in self.notify.notices))
 
     def test_a_job_never_sends_a_second_child_create(self):
         job = self.run_to_approval()
@@ -838,6 +841,19 @@ class ContactTests(Phase2Case):
         written = self.written()
         self.assertEqual(written["famly_sync_status"], "needs_attention")
         self.assertIn("contact_name_incomplete", written["famly_sync_note"])
+
+    def test_an_unknown_contact_outcome_that_did_not_land_needs_review(self):
+        def lose_ada(payload):
+            if payload["email"] == "ada.l@example.org":
+                raise requests.exceptions.Timeout()          # fails BEFORE landing
+        self.famly.contact_effect = lose_ada
+        result = self.run_through()
+        self.assertEqual([p["email"] for p in self.famly.contact_creates],
+                         ["ada.l@example.org", "ben.b@example.org"])    # none sent twice
+        self.assertEqual(self.job().outcomes, ["c1:create_outcome_unknown", "c2:created"])
+        self.assertEqual(result["status"], store.NEEDS_REVIEW)
+        self.assertTrue(any("check Famly for the deal id before re-running" in n
+                            for n in self.notify.notices))
 
     def test_a_rejected_contact_does_not_stop_the_others_and_is_not_retried(self):
         def reject_ada(payload):
@@ -1545,6 +1561,50 @@ class ContactOrderAndLookupTests(Phase2Case):
         self.assertEqual(self.job().status, store.DONE)
         first = self.calls_between(famly_writes.CREATE_CHILD_OP, famly_writes.CREATE_CONTACT_OP, other.calls)
         self.assertIn("OnboardChildContacts", first)
+
+
+# --------------------------------------------------------------------------- #
+# Transport: a create is sent exactly once, whatever the failure
+# --------------------------------------------------------------------------- #
+class CreateSentOnceTests(unittest.TestCase):
+    """Patches requests.post BELOW GraphQLClient, so a retry in any layer shows."""
+
+    @staticmethod
+    def _response(status, body):
+        response = mock.Mock()
+        response.status_code = status
+        response.text = json.dumps(body)
+        response.json.return_value = body
+        return response
+
+    def _client(self):
+        from core.client import GraphQLClient
+        session = mock.Mock()
+        session.auth_headers.return_value = {"x-famly-accesstoken": "t"}
+        config = mock.Mock(graphql_url="https://famly.invalid/graphql")
+        return GraphQLClient(session=session, config=config)
+
+    def test_each_failure_sends_one_request_and_is_classified(self):
+        transient = {"errors": [{"message": "x", "extensions": {"display": "Transient"}}]}
+        cases = [
+            ("timeout", mock.Mock(side_effect=requests.Timeout()), famly_writes.OutcomeUnknown),
+            ("connection", mock.Mock(side_effect=requests.ConnectionError()),
+             famly_writes.OutcomeUnknown),
+            ("http_500", mock.Mock(return_value=self._response(500, {})), famly_writes.OutcomeUnknown),
+            ("http_429", mock.Mock(return_value=self._response(429, {})), famly_writes.CreateRejected),
+            ("transient_200", mock.Mock(return_value=self._response(200, transient)),
+             famly_writes.CreateRejected),
+        ]
+        calls = (("create_child", famly_writes.create_child, {"name": "x"}),
+                 ("create_contact", famly_writes.create_contact, {"email": "a@b.co"}))
+        for label, post, expected in cases:
+            for call_name, func, payload in calls:
+                with self.subTest(case=label, call=call_name):
+                    post.reset_mock()
+                    with mock.patch("core.client.requests.post", post):
+                        with self.assertRaises(expected):
+                            func(self._client(), payload)
+                    self.assertEqual(post.call_count, 1)
 
 
 if __name__ == "__main__":

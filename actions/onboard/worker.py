@@ -82,6 +82,10 @@ POLL_SECONDS = 5
 CREATED, PRESENT = "created", "present"
 OK_OUTCOMES = (CREATED, PRESENT)
 
+# A create whose outcome is unknown and whose follow-up lookup finds nothing.
+UNKNOWN_OUTCOME = "create_outcome_unknown"
+UNKNOWN_OUTCOME_ADVICE = "check Famly for the deal id before re-running"
+
 
 class StopJob(Exception):
     """End the job in `status` with `code`. Nothing further is written."""
@@ -332,8 +336,10 @@ def _write_phase(job, deps, plan, context, digest) -> dict:
     detail = bad_codes + syncer.critical_failed + flags + syncer.reports
     if failures:
         store.set_status(job.id, store.NEEDS_REVIEW, last_error_code=",".join(failures))
-        deps.notifier.notice(notifier_mod.notice_text(
-            deal_id, "the child is in Famly but the job needs a person", failures + detail))
+        headline = "the child is in Famly but the job needs a person"
+        if UNKNOWN_OUTCOME in bad_codes:
+            headline += f"; {UNKNOWN_OUTCOME_ADVICE}"
+        deps.notifier.notice(notifier_mod.notice_text(deal_id, headline, failures + detail))
     else:
         store.set_status(job.id, store.DONE, last_error_code=None)
         deps.notifier.notice(notifier_mod.notice_text(
@@ -405,7 +411,8 @@ def _ensure_child(job, deps, plan, deal) -> ChildResult:
         if len(landed) > 1:
             raise StopJob(store.NEEDS_REVIEW, "child_ambiguous") from None
         if not landed:
-            raise StopJob(store.FAILED, "child_create_unknown_not_landed") from None
+            # The request may have landed and the lookup is blind to it: a person looks.
+            raise StopJob(store.NEEDS_REVIEW, UNKNOWN_OUTCOME) from None
         child_id = landed[0]
 
     # Recorded AT ONCE, before the read-back: this is the job history that tells a
@@ -546,7 +553,7 @@ def _create_one(deps, famly, contact, child_id, target, matches) -> tuple[str, l
         return exc.code, contact_warnings, 1
     except famly_writes.OutcomeUnknown:
         if len(matches(famly.child_contacts(child_id), target)) != 1:
-            return "create_unknown_not_landed", contact_warnings, 1
+            return UNKNOWN_OUTCOME, contact_warnings, 1
 
     # Read-back: exactly once on the child, with the expected email.
     if len(matches(famly.child_contacts(child_id), target)) != 1:
@@ -570,6 +577,7 @@ def _held(job, deps, reasons: list[str], write_back: bool) -> None:
 def _end(job, deps, status: str, code: str) -> None:
     store.set_status(job.id, status, last_error_code=code)
     try:
-        deps.notifier.notice(notifier_mod.notice_text(job.deal_id, f"{status}", [code]))
+        headline = f"{status}, {UNKNOWN_OUTCOME_ADVICE}" if code == UNKNOWN_OUTCOME else f"{status}"
+        deps.notifier.notice(notifier_mod.notice_text(job.deal_id, headline, [code]))
     except Exception:  # noqa: BLE001 - a notice must never mask the outcome
         logger.warning("onboard: notice failed for job %s", job.id)
