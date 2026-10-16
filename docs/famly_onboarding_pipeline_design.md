@@ -225,4 +225,47 @@ Dry-run first build is specified in `/mnt/user-data/outputs/onboard_phase1_promp
 - Bill payer: label "Bill Payer" / inverse "Childcare Account", internal name `bill_payer_childcare_account`, id 91, limits 1-to-1.
 - Sales deal link: label "Operations" / inverse "Sales", internal name `sales_operations`, id 138, limits 1-to-many.
 - Direction of each label is unconfirmed; phase 1 dry run must read the labels from the v4 API and report which direction carries which.
-- RISK: Bill Payer is 1-to-1. If that limit applies per contact as well as per deal, a parent with two children (two deals) cannot carry the Bill Payer label on both deals, so the second sibling's deal would have no labelled bill payer. The dry run reports `bill_payer_unclear` for these rather than guessing. Decision needed on how to handle siblings.
+- CLARIFIED by Drew: each deal has at most one Bill Payer contact, but one contact can be the bill payer ("Childcare Account") on as many deals as they like. Siblings are therefore fine. A deal with no labelled bill payer HOLDs (`bill_payer_unclear`).
+- Drew changed the Operations/Sales label to 1-to-1, so an Operations deal has at most one Sales deal.
+
+## 16. Create-time field decisions (Drew, 2026-10-15)
+
+Child (ChildInput):
+- name from `child_first_name` and `child_last_name`; birthday from `child_date_of_birth`; currentGroupId derived (age at start; Voyagers if Left Nursery); externalId = `child_urn`; externalSystemsReferences = HUBSPOT deal id (and URN).
+- sitesRelation: siteId from `location_of_interest`, firstDay = `actual_start_date_1`, lastDay = `end_date` ("Leave Date") when set. Left Nursery with empty `end_date` HOLDs, because a child with no lastDay counts as current. Every stage: `end_date` before start HOLDs.
+- gender: DECIDED "not specified". `Gender` has only FEMALE, MALE, DIVERSE, and gender is optional, so OMIT the field. Do not use DIVERSE.
+- No nationality, language, birthplace or extra-info records. No sensitive records. These will be collected from parents by forms after they join.
+- isTestChild false (true only for the test child).
+
+Contact (ContactInput, per docs): required `name`, `phoneNumbers`, `records`, `childIds`, `roles`; optional `email`, `address`, `emergencyContact`. Adding a role to a contact without a login creates a login, so `roles` is EMPTY here. Other roles for the later app-access pipeline: Parent d27c12e8-e1bf-4cb6-b10e-def7a83e3350, Parent (limited access) d8632ad6-0b47-4479-8f1d-fcb0477ff4db, Family 2a8c1370-3ea7-40e8-9a60-8773bbe66c5e.
+- Fields: first and last name, email, address (street, zip, city, state, country), ONE phone number (mobile preferred, then work; none valid means omit with a warning, not a hold), `emergencyContact` true for the bill payer only, records: RELATION = "Parent". OCCUPATION and EXTRA_INFO later.
+- Email comparison treats googlemail.com and gmail.com as the same. Existing children never get auto-created contacts that fail to match (see section 14 follow-ups).
+
+Open: HubSpot source properties for contact name, address and phone (standard contact properties or the `parent_N_*` EY Man fields); `AddressInput` field names; `NameInput` shape; phone number format Famly accepts.
+
+## 17. Probe results, contact create (2026-10-15, test child only)
+
+- `contacts { create(contacts: [ContactInput!]!) }` returns `[Contact!]!`; `contacts { update(...) }` exists with separate lists for names, records, roles, emails, phones, emergencyContacts. No delete in the public schema (test contacts are deleted by hand in Famly).
+- `NameInput` ACCEPTS A PLAIN STRING ("First Last"). Objects {firstName,lastName} and {firstName,lastName,fullName} were rejected at variable coercion. So the name sent is a single string; how Famly splits it into first and last is NOT yet verified (3-part names and double-barrelled surnames are the risk).
+- `roles: []` was accepted. Login and app state of the created contacts is NOT yet verified (the readback returned null).
+- Phone: "+447700900123", "07700 900123" and "+44 7700 900123" all accepted (validation is loose). We normalise to +44 anyway.
+- Address country: both "United Kingdom" and "GB" accepted. Match what existing contacts use.
+- `RELATION` accepted in records on create; stored value NOT yet verified (readback returned null).
+- Errors at variable coercion come back as HTTP 400 with display "Transient". The worker must not retry on that.
+- Test contacts created (delete in Famly only after the read-only check): 2396388e-d266-44c8-bde1-cf9472946c1d, 24500501-ec65-42bd-9594-f6a99a1025fd, 6e44cba6-4c39-4121-b3af-28b02b65c66e, 6c329a13-2997-4b11-833e-dc3a043f2b60.
+
+## 18. Probe results, child create, and decisions (2026-10-15)
+
+Probe results (two test children, since to be deleted):
+- `children.create` works with birthday as `%Y-%m-%d`, sitesRelation firstDay and lastDay, gender omitted, and both external references (HUBSPOT deal id, URN).
+- `listByExternalSystemReference` finds the child by either reference, exact, upper case, lower case or padded with spaces.
+- A child with a future start date appears under UPCOMING. A child with a past lastDay appears in none of CURRENT, UPCOMING or the combination; it is only visible with the "withdrawn" filter in the Famly UI. This confirms that Left Nursery children with a past `end_date` are inactive and will not count in rotas.
+- Internal summary shows gender "Dreng" (genderId 0) when gender is omitted, while the UI shows the field blank. Drew's view: test children show no gender, so this is the default response, not stored data. Treated as harmless; the create step does not check gender.
+- Room move history started on the creation date, not the start date, even for a child who had already left. Drew has since changed the room move logic. NOT yet verified by us; phase 2 read-back asserts the current room move starts on the child's start date and stops the job (`room_move_mismatch`) if not.
+- Leaving reason defaults to "Other". Accepted for now.
+- Errors at variable coercion return HTTP 400 with display "Transient". Never retry.
+
+Decisions:
+- CopyContacts is dropped. Contacts are always created from HubSpot, empty roles. `would_copy` no longer exists in the plan.
+- Sibling linking is still needed later. Not designed: we do not yet know how Famly represents siblings or whether the public API can set it. Needs its own probe before any build. Siblings can be found from HubSpot via the deal-to-deal and shared contact associations; Famly sibling data currently comes from batch upload.
+- Phase 2 (create child and contacts, queued, Slack Gate A, deal allowlist, test deals only first) is specified in `onboard_phase2_prompt.md`. Out of scope there: bill payer, plans, deposit, invoice, contract, app access, siblings, backfill batching.
