@@ -73,22 +73,38 @@ class FakeHub(FakeHubSpot):
         }
         self.defs = {name: {"type": "string", "fieldType": "text", "options": []}
                      for name in ("famly_childid", "famly_sync_status", "famly_sync_note",
-                                  "famly_sync_gaps", "dealname")}
+                                  "famly_sync_gaps", "end_date", "dealname")}
         self.writes = []
         self.write_error = None
-        self.fail_write_numbers = set()    # fail these (1-based) write attempts
-        self.write_attempts = 0
+        self.defs_error = None
+        self.fail_props = set()            # writes to these properties fail
+        self.events = []                   # shared with FakeFamly: the order things happened
+        self.get_deal_hooks = {}           # nth get_deal call -> callable run AFTER it answers
+        self.get_deal_calls = 0
 
     def deal_property_definitions(self):
+        if self.defs_error:
+            raise self.defs_error
         return dict(self.defs)
+
+    def get_deal(self, deal_id):
+        deal = super().get_deal(deal_id)
+        self.get_deal_calls += 1
+        hook = self.get_deal_hooks.pop(self.get_deal_calls, None)
+        if hook:
+            hook()
+        return deal
 
     def write_deal_properties(self, deal_id, properties):
         if set(properties) - hubspot.WRITABLE_DEAL_PROPERTIES:
             raise AssertionError("write of a property outside the sync four")
-        self.write_attempts += 1
-        if self.write_error or self.write_attempts in self.fail_write_numbers:
+        if self.write_error or set(properties) & self.fail_props:
             raise self.write_error or HubSpotError("PATCH failed with HTTP 500", 500)
         self.writes.append((deal_id, dict(properties)))
+        for prop, value in properties.items():
+            self.events.append(("hubspot", prop))
+            if prop == "end_date":
+                self.deals[deal_id]["end_date"] = value
 
 
 class FakeFamly:
@@ -105,6 +121,8 @@ class FakeFamly:
         self.contact_effect = None
         self.hide_created_contacts = False
         self.site_children = []
+        self.events = []
+        self.blind_after_create = False   # the next by-deal-id lookup finds nothing
         self.after_first = {}     # operation -> callable run after its FIRST call
         self._n = 0
 
@@ -124,6 +142,8 @@ class FakeFamly:
             self.child_creates.append(payload)
             if self.child_effect:
                 self.child_effect(payload)
+            self.events.append("child_create")
+            self._blind = self.blind_after_create
             child_id = self._new_id("child")
             self.children[child_id] = payload
             self.contacts.setdefault(child_id, [])
@@ -137,6 +157,7 @@ class FakeFamly:
             self.contact_creates.append(payload)
             if self.contact_effect:
                 self.contact_effect(payload)
+            self.events.append("contact_create")
             contact_id = self._new_id("contact")
             if not self.hide_created_contacts:
                 self.contacts[payload["childIds"][0]].append((contact_id, payload["email"]))
@@ -147,6 +168,8 @@ class FakeFamly:
             ids = [cid for cid, p in self.children.items() if any(
                 (r["system"].upper(), r["foreignId"].casefold()) == wanted
                 for r in p.get("externalSystemsReferences", []))]
+            if getattr(self, "_blind", False):
+                self._blind, ids = False, []
             response = {"data": {"children": {"listByExternalSystemReference": {
                 "result": [{"id": i} for i in ids]}}}}
             hook = self.after_first.pop(operation_name, None)
@@ -176,8 +199,9 @@ class FakeRest:
 
     def __init__(self, famly):
         self.famly = famly
-        self.bad_room_move = False
         self.wrong_group = False
+        self.custom = None          # a summary to return as it is
+        self.moves_start_early = False   # a room move that starts on the creation date
         self.error = None
         self.gets = []
 
@@ -185,12 +209,14 @@ class FakeRest:
         self.gets.append(path)
         if self.error:
             raise self.error
+        if self.custom is not None:
+            return self.custom
         child_id = path.split("/")[3]
         payload = self.famly.children.get(child_id)
         if payload is None:
             raise RestHTTPError("not found", 404, "")
         relation = payload["sitesRelation"][0]
-        move_start = "2026-10-15" if self.bad_room_move else relation["firstDay"]
+        move_start = "2026-10-15" if self.moves_start_early else relation["firstDay"]
         child = {"id": child_id, "isTestChild": payload.get("isTestChild", False),
                  "groupId": "other-group" if self.wrong_group else payload["currentGroupId"],
                  "startDate": relation["firstDay"], "gender": "Dreng"}
@@ -240,6 +266,8 @@ class Phase2Case(unittest.TestCase):
 
         self.hub, self.famly = FakeHub(), FakeFamly()
         self.rest, self.notify = FakeRest(self.famly), FakeNotifier()
+        self.events = []
+        self.hub.events = self.famly.events = self.events
         self.deps = worker.Deps(self.hub, self.famly, self.rest, self.notify,
                                 famly_factory=lambda: FamlyReads(self.famly, site_ids=[SITE_ID]))
 
@@ -270,6 +298,13 @@ class Phase2Case(unittest.TestCase):
 
     def run_worker(self):
         return worker.run_once(self.deps)
+
+    def written(self):
+        """Everything written to the deal, property -> last value."""
+        out = {}
+        for _deal, props in self.hub.writes:
+            out.update(props)
+        return out
 
     def job(self, deal=DEAL):
         return store.latest_for_deal(deal)
@@ -364,6 +399,7 @@ class ModeAndAllowlistTests(Phase2Case):
         self.assertEqual(self.job().status, store.DONE)
 
         other = FakeFamly()
+        other.events = self.events
         self.famly, self.rest = other, FakeRest(other)
         self.deps = worker.Deps(self.hub, other, self.rest, self.notify,
                                 famly_factory=lambda: FamlyReads(other, site_ids=[SITE_ID]))
@@ -495,8 +531,8 @@ class GateATests(Phase2Case):
         self.assertFalse(self.famly.child_creates or self.famly.contact_creates)
         self.assertTrue(any("site_unmapped" in n for n in self.notify.notices))
         # Live + allowlisted: the held state is also written to HubSpot, as codes.
-        self.assertEqual(self.hub.writes[0][1]["famly_sync_status"], "needs_attention")
-        self.assertEqual(self.hub.writes[0][1]["famly_sync_note"], "held:site_unmapped")
+        self.assertEqual(self.written()["famly_sync_status"], "needs_attention")
+        self.assertEqual(self.written()["famly_sync_note"], "held:site_unmapped")
 
 
 # --------------------------------------------------------------------------- #
@@ -522,11 +558,12 @@ class ChildCreateTests(Phase2Case):
         })
         self.assertNotIn("gender", payload)
 
-    def test_no_end_date_means_no_last_day_and_no_urn_means_no_urn_reference(self):
+    def test_no_urn_means_no_urn_reference_and_a_missing_end_date_is_defaulted(self):
         self.hub.deals[DEAL]["child_urn"] = ""
         self.run_through()
         payload = self.famly.child_creates[0]
-        self.assertNotIn("lastDay", payload["sitesRelation"][0])
+        # Born 2024-01-15: 4th birthday 2028-01-15, so the first 31 August after it.
+        self.assertEqual(payload["sitesRelation"][0]["lastDay"], "2028-08-31")
         self.assertNotIn("externalId", payload)
         self.assertEqual(payload["externalSystemsReferences"],
                          [{"foreignId": DEAL, "system": "HUBSPOT"}])
@@ -628,57 +665,75 @@ class ChildCreateTests(Phase2Case):
 # Read-back
 # --------------------------------------------------------------------------- #
 class ReadBackTests(Phase2Case):
-    def test_a_room_move_that_starts_on_the_creation_date_stops_everything(self):
-        self.rest.bad_room_move = True
+    def test_the_room_move_is_not_checked_at_all(self):
+        self.rest.moves_start_early = True      # a room move dated the creation day
         result = self.run_through()
-        self.assertEqual((result["status"], result["code"]),
-                         (store.NEEDS_REVIEW, "room_move_mismatch"))
-        self.assertEqual(len(self.famly.child_creates), 1)
-        self.assertEqual(self.famly.contact_creates, [])           # no further writes
-        self.assertEqual(self.hub.writes, [])                       # nor to HubSpot
-        self.assertTrue(any("room_move_mismatch" in n for n in self.notify.notices))
+        self.assertEqual(result["status"], store.DONE)              # nothing stops
+        self.assertEqual(len(self.famly.contact_creates), 2)
+        self.assertNotIn("room_move_mismatch", self.all_output())
+        self.assertFalse(hasattr(summary_check, "ROOM_MOVE_MISMATCH"))
+        self.assertFalse(hasattr(summary_check, "_moves"))          # the check is gone, not hidden
 
-    def test_other_summary_mismatches_also_stop_further_writes(self):
-        for tweak, code in [("wrong_group", "summary_group_mismatch")]:
-            with self.subTest(code=code):
-                store._reset_for_tests()
-                self.famly.children.clear()
-                self.famly.child_creates.clear()
-                self.rest.wrong_group = True
-                result = self.run_through()
-                self.assertEqual((result["status"], result["code"]), (store.NEEDS_REVIEW, code))
-                self.assertEqual(self.famly.contact_creates, [])
-                self.rest.wrong_group = False
+    def test_a_summary_mismatch_is_a_flag_not_a_hold_and_never_stops_the_job(self):
+        self.rest.wrong_group = True
+        result = self.run_through()
+        self.assertEqual(result["status"], store.DONE)              # not held, not stopped
+        self.assertEqual(len(self.famly.contact_creates), 2)
+        self.assertIn("summary_group_mismatch", self.written()["famly_sync_gaps"])
+        self.assertTrue(any("summary_group_mismatch" in n for n in self.notify.notices))
 
-    def test_summary_check_unit_cases(self):
-        base = {"child": {"groupId": "g", "startDate": "2026-01-15", "isTestChild": False},
-                "groupMoves": [{"startDate": "2026-01-15", "groupId": "g"}]}
-        ok = dict(expected_group_id="g", expected_start="2026-01-15", expected_end=None,
+    def test_an_unrecognised_or_unreadable_summary_is_flagged_too(self):
+        self.rest.custom = {"weird": {"shape": 1}}
+        self.assertEqual(self.run_through()["status"], store.DONE)
+        self.assertIn("summary_unrecognised", self.written()["famly_sync_gaps"])
+        store._reset_for_tests()
+        self.famly.children.clear()
+        self.famly.child_creates.clear()
+        self.hub.writes.clear()
+        self.rest.custom = None
+        self.rest.error = RestHTTPError("boom", 500, "")
+        self.assertEqual(self.run_through()["status"], store.DONE)
+        self.assertIn("summary_unreadable", self.written()["famly_sync_gaps"])
+
+    def test_summary_flags_unit_cases(self):
+        base = {"child": {"groupId": "g", "startDate": "2026-01-15", "endDate": "2028-08-31",
+                          "isTestChild": False}}
+        ok = dict(expected_group_id="g", expected_start="2026-01-15", expected_end="2028-08-31",
                   expected_test=False)
-        self.assertIsNone(summary_check.check(base, **ok))
-        self.assertEqual(summary_check.check(base, **{**ok, "expected_test": True}),
-                         "test_flag_mismatch")
-        self.assertEqual(summary_check.check(base, **{**ok, "expected_end": "2026-12-31"}),
-                         "summary_end_mismatch")
-        self.assertEqual(summary_check.check(base, **{**ok, "expected_start": "2026-01-16"}),
-                         "summary_start_mismatch")
-        # An unrecognised shape fails closed and logs key NAMES only.
-        self.assertEqual(summary_check.check({"weird": {"a": 1}}, **ok), "summary_unrecognised")
-        self.assertEqual(summary_check.check("nope", **ok), "summary_unrecognised")
-        # Moves with an earlier move than the start date are a mismatch.
-        early = {**base, "groupMoves": [{"startDate": "2026-01-01", "groupId": "g"},
-                                        {"startDate": "2026-01-15", "groupId": "g"}]}
-        self.assertEqual(summary_check.check(early, **ok), "room_move_mismatch")
+        self.assertEqual(summary_check.flags(base, **ok), [])
+        self.assertEqual(summary_check.flags(base, **{**ok, "expected_test": True}),
+                         ["test_flag_mismatch"])
+        self.assertEqual(summary_check.flags(base, **{**ok, "expected_end": "2029-08-31"}),
+                         ["summary_end_mismatch"])
+        self.assertEqual(summary_check.flags(base, **{**ok, "expected_start": "2026-01-16"}),
+                         ["summary_start_mismatch"])
+        self.assertEqual(summary_check.flags(base, **{**ok, "expected_group_id": "x"}),
+                         ["summary_group_mismatch"])
+        # Several differences give several flags; an unknown shape is one flag.
+        self.assertEqual(summary_check.flags(base, expected_group_id="x", expected_start="2026-01-16",
+                                             expected_end=None, expected_test=True),
+                         ["summary_group_mismatch", "summary_start_mismatch",
+                          "summary_end_mismatch", "test_flag_mismatch"])
+        self.assertEqual(summary_check.flags({"weird": {"a": 1}}, **ok),
+                         ["summary_unrecognised"])
+        self.assertEqual(summary_check.flags("nope", **ok), ["summary_unrecognised"])
+        # A room move, early or not, is simply not looked at.
+        early = {**base, "groupMoves": [{"startDate": "2026-01-01", "groupId": "g"}]}
+        self.assertEqual(summary_check.flags(early, **ok), [])
 
-    def test_a_contact_that_does_not_read_back_stops_further_contacts(self):
-        self.famly.hide_created_contacts = True
+    def test_a_contact_that_does_not_read_back_does_not_stop_the_others(self):
+        calls = {"n": 0}
+        real = self.famly.contact_effect
+
+        def hide_the_first(payload):
+            calls["n"] += 1
+            self.famly.hide_created_contacts = calls["n"] == 1     # only the first one vanishes
+        self.famly.contact_effect = hide_the_first
         result = self.run_through()
-        self.assertEqual(len(self.famly.contact_creates), 1)       # the second is never sent
+        self.assertEqual(len(self.famly.contact_creates), 2)          # the second IS attempted
+        self.assertEqual(self.job().outcomes, ["c1:readback_failed", "c2:created"])
         self.assertEqual(result["status"], store.NEEDS_REVIEW)
-        self.assertEqual(self.job().outcomes, ["c1:readback_failed", "c2:not_attempted"])
-        self.assertEqual(self.job().child_id, "child-1")            # the child is not rolled back
-        self.assertTrue(any("readback_failed" in n for n in self.notify.notices))
-
+        self.assertEqual(self.job().child_id, "child-1")               # the child is not rolled back
 
 # --------------------------------------------------------------------------- #
 # Contacts
@@ -780,16 +835,21 @@ class ContactTests(Phase2Case):
         self.assertEqual(self.job().outcomes, ["c1:created", "c2:contact_name_incomplete"])
         self.assertEqual(result["status"], store.NEEDS_REVIEW)
         self.assertEqual(self.job().child_id, "child-1")             # the child stays
-        last = self.hub.writes[-1][1]
-        self.assertEqual(last["famly_sync_status"], "needs_attention")
-        self.assertIn("contact_name_incomplete", last["famly_sync_note"])
+        written = self.written()
+        self.assertEqual(written["famly_sync_status"], "needs_attention")
+        self.assertIn("contact_name_incomplete", written["famly_sync_note"])
 
-    def test_a_rejected_contact_stops_the_rest_and_is_not_retried(self):
-        self.famly.contact_effect = mock.Mock(side_effect=GraphQLHTTPError("bad", 400, "{}"))
+    def test_a_rejected_contact_does_not_stop_the_others_and_is_not_retried(self):
+        def reject_ada(payload):
+            if payload["email"] == "ada.l@example.org":      # the BILL PAYER, tried first
+                raise GraphQLHTTPError("bad", 400, "{}")
+        self.famly.contact_effect = reject_ada
         result = self.run_through()
-        self.assertEqual(len(self.famly.contact_creates), 1)
-        self.assertEqual(self.job().outcomes, ["c1:contact_http_400", "c2:not_attempted"])
+        self.assertEqual([p["email"] for p in self.famly.contact_creates],
+                         ["ada.l@example.org", "ben.b@example.org"])    # both tried, once each
+        self.assertEqual(self.job().outcomes, ["c1:contact_http_400", "c2:created"])
         self.assertEqual(result["status"], store.NEEDS_REVIEW)
+        self.assertEqual(self.job().last_error_code, "contact_outcomes")
 
     def test_an_existing_contact_on_the_child_is_skipped_as_present(self):
         self.famly.children["child-9"] = {
@@ -834,15 +894,15 @@ class RerunTests(Phase2Case):
         self.assertEqual(len(self.famly.contact_creates), 2)    # c1 once, c2 once
 
     def test_a_rerun_after_our_own_contact_creation_creates_nothing(self):
-        # The first job creates the child and both contacts, then its FINAL
-        # write-back fails, so it ends needs_review although Famly is complete.
-        self.hub.fail_write_numbers = {2}
+        # The first job creates the child and both contacts, but the child id cannot be
+        # written to the deal, so it ends needs_review although Famly is complete.
+        self.hub.fail_props = {"famly_childid"}
         self.run_through()
         self.assertEqual((self.job().status, self.job().last_error_code),
                          (store.NEEDS_REVIEW, "hubspot_writeback_failed"))
         self.assertEqual((len(self.famly.child_creates), len(self.famly.contact_creates)), (1, 2))
 
-        self.hub.fail_write_numbers = set()
+        self.hub.fail_props = set()
         self.assertEqual(self.enqueue().outcome, store.CREATED)
         gates_before = len(self.notify.gates)
         result = self.run_worker()
@@ -850,7 +910,8 @@ class RerunTests(Phase2Case):
         self.assertEqual(len(self.notify.gates), gates_before)
         self.assertEqual((len(self.famly.child_creates), len(self.famly.contact_creates)), (1, 2))
         self.assertEqual(self.job().outcomes, ["c1:present", "c2:present"])
-        self.assertEqual(self.hub.writes[-1][1]["famly_sync_status"], "contacts_linked")
+        self.assertEqual(self.written()["famly_childid"], "child-1")     # the write-back finished
+        self.assertEqual(self.written()["famly_sync_status"], "contacts_linked")
 
     def test_a_rerun_after_a_failed_create_does_not_double_create(self):
         self.famly.child_land_then_raise = None
@@ -878,53 +939,97 @@ class RerunTests(Phase2Case):
 # HubSpot write-back
 # --------------------------------------------------------------------------- #
 class WriteBackTests(Phase2Case):
-    def test_write_back_fails_closed_when_a_property_is_missing(self):
+    def test_missing_hubspot_properties_warn_but_never_block_famly(self):
         del self.hub.defs["famly_sync_gaps"]
-        self.run_to_approval()
-        self.approve()
-        result = self.run_worker()
-        self.assertEqual((result["status"], result["code"]),
-                         (store.FAILED, "hubspot_property_missing"))
-        self.assertFalse(self.sent_anything)           # nothing in Famly, nothing in HubSpot
+        del self.hub.defs["famly_sync_note"]
+        result = self.run_through()
+        self.assertEqual(result["status"], store.DONE)              # not blocked, not review
+        self.assertEqual((len(self.famly.child_creates), len(self.famly.contact_creates)), (1, 2))
         self.assertEqual(result["hubspotSyncPropertiesFound"],
-                         ["famly_childid", "famly_sync_note", "famly_sync_status"])
-        self.assertTrue(any("missing:famly_sync_gaps" in n for n in self.notify.notices))
+                         ["famly_childid", "famly_sync_status"])
+        warned = " ".join(self.notify.notices)
+        self.assertIn("missing:famly_sync_gaps", warned)             # in Slack ...
+        self.assertIn("missing:famly_sync_note", warned)
+        self.assertTrue(any("missing:famly_sync_gaps" in line for line in self.logs))   # ... and the log
+        written = self.written()
+        self.assertNotIn("famly_sync_gaps", written)                 # their writes were skipped
+        self.assertNotIn("famly_sync_note", written)
+        self.assertEqual((written["famly_childid"], written["famly_sync_status"]),
+                         ("child-1", "contacts_linked"))
+        self.assertIn("skipped:famly_sync_gaps", warned)             # and the skip is reported
 
-    def test_a_dropdown_status_property_must_offer_our_values(self):
+    def test_a_missing_child_id_or_end_date_property_is_needs_review_after_famly_is_done(self):
+        for missing in ("famly_childid", "end_date"):
+            with self.subTest(missing=missing):
+                store._reset_for_tests()
+                self.famly.children.clear()
+                self.famly.child_creates.clear()
+                self.famly.contact_creates.clear()
+                self.hub.writes.clear()
+                self.hub.deals[DEAL].pop("end_date", None)
+                self.hub.defs = {k: v for k, v in FakeHub().defs.items() if k != missing}
+                result = self.run_through()
+                self.assertEqual((result["status"], result["code"]),
+                                 (store.NEEDS_REVIEW, "hubspot_writeback_failed"))
+                self.assertEqual((len(self.famly.child_creates), len(self.famly.contact_creates)),
+                                 (1, 2))                              # all of Famly was done
+                self.assertEqual(self.job().outcomes, ["c1:created", "c2:created"])
+
+    def test_a_status_dropdown_that_does_not_offer_a_value_skips_only_that_write(self):
         self.hub.defs["famly_sync_status"]["options"] = ["queued", "child_ready"]
-        self.run_to_approval()
-        self.approve()
-        result = self.run_worker()
-        self.assertEqual(result["code"], "hubspot_property_missing")
-        self.assertFalse(self.sent_anything)
-        self.assertTrue(any("option_missing:contacts_linked" in n for n in self.notify.notices))
+        result = self.run_through()
+        self.assertEqual(result["status"], store.DONE)
+        self.assertEqual(self.written()["famly_sync_status"], "child_ready")   # contacts_linked skipped
+        self.assertIn("value_not_offered:famly_sync_status:contacts_linked", " ".join(self.notify.notices))
+        self.assertEqual(len(self.famly.contact_creates), 2)
 
-    def test_a_failed_write_back_after_the_child_exists_never_creates_more(self):
-        self.hub.write_error = HubSpotError("PATCH failed with HTTP 500", 500)
+    def test_a_gaps_checkbox_only_gets_the_codes_it_offers(self):
+        self.hub.defs["famly_sync_gaps"]["options"] = ["phone_missing", "address_incomplete"]
+        self.rest.wrong_group = True                                 # adds a summary flag
+        self.run_through()
+        gaps = self.written()["famly_sync_gaps"].split(";")
+        self.assertLessEqual(set(gaps), {"phone_missing", "address_incomplete"})
+        self.assertIn("gap_not_offered:summary_group_mismatch", " ".join(self.notify.notices))
+
+    def test_a_property_listing_failure_never_blocks_famly_either(self):
+        self.hub.defs_error = HubSpotError("GET failed with HTTP 500", 500)
+        result = self.run_through()
+        self.assertEqual(result["status"], store.DONE)
+        self.assertEqual((len(self.famly.child_creates), len(self.famly.contact_creates)), (1, 2))
+        self.assertIn("preflight_failed", " ".join(self.notify.notices))
+        self.assertEqual(self.written()["famly_childid"], "child-1")   # writes were still attempted
+
+    def test_a_failed_advisory_write_is_reported_but_the_job_is_still_done(self):
+        self.hub.fail_props = {"famly_sync_status", "famly_sync_note", "famly_sync_gaps"}
+        result = self.run_through()
+        self.assertEqual(result["status"], store.DONE)
+        self.assertIn("write_failed:famly_sync_status", " ".join(self.notify.notices))
+        self.assertEqual(self.written()["famly_childid"], "child-1")
+
+    def test_a_failed_child_id_write_ends_needs_review_but_never_blocks_famly(self):
+        self.hub.write_error = HubSpotError("PATCH failed with HTTP 500", 500)   # every write fails
         result = self.run_through()
         self.assertEqual((result["status"], result["code"]),
                          (store.NEEDS_REVIEW, "hubspot_writeback_failed"))
         self.assertEqual(len(self.famly.child_creates), 1)
-        self.assertEqual(self.famly.contact_creates, [])
+        self.assertEqual(len(self.famly.contact_creates), 2)           # the contacts were still created
+        self.assertEqual(self.job().outcomes, ["c1:created", "c2:created"])
         self.assertEqual(self.job().child_id, "child-1")
 
-    def test_write_back_writes_only_the_four_properties_and_is_idempotent(self):
+    def test_hubspot_writes_are_one_property_per_request_and_only_allow_listed_ones(self):
         self.run_through()
         for _deal, props in self.hub.writes:
+            self.assertEqual(len(props), 1)                            # one per request
             self.assertLessEqual(set(props), hubspot.WRITABLE_DEAL_PROPERTIES)
-        first, last = self.hub.writes[0][1], self.hub.writes[-1][1]
-        self.assertEqual((first["famly_childid"], first["famly_sync_status"]),
-                         ("child-1", "child_ready"))
-        self.assertEqual((last["famly_sync_status"], last["famly_sync_note"]),
-                         ("contacts_linked", "phase2_done"))
-        # Re-running a write-back on its own sends the same values.
-        before = len(self.hub.writes)
+        order = [p for _d, props in self.hub.writes for p in props]
+        self.assertEqual(order[:3], ["famly_childid", "end_date", "famly_sync_status"])
+        self.assertEqual(self.written()["famly_sync_note"], "phase2_done")
+        # Re-running a property write sends the same value.
+        syncer = hubspot_sync.Syncer(self.hub, DEAL)
         for _ in range(2):
-            hubspot_sync.write_back(self.hub, DEAL, status="contacts_linked", note="phase2_done",
-                                    gaps=["b", "a", "a"], child_id="child-1")
-        a, b = self.hub.writes[before][1], self.hub.writes[before + 1][1]
-        self.assertEqual(a, b)
-        self.assertEqual(a["famly_sync_gaps"], "a;b")
+            syncer.write("famly_sync_status", "contacts_linked")
+            syncer.write_gaps(["b", "a", "a"])
+        self.assertEqual(self.hub.writes[-1][1], {"famly_sync_gaps": "a;b"})
 
     def test_there_is_no_write_back_in_dry_mode(self):
         self.mode("dry")
@@ -1058,7 +1163,7 @@ class ExistingChildRuleTests(Phase2Case):
         self.assertEqual(self.notify.gates, [])                    # nothing to approve
         self.assertFalse(self.famly.child_creates or self.famly.contact_creates)
         self.assertTrue(any("contact_unmatched_on_existing_child" in n for n in self.notify.notices))
-        self.assertEqual(self.hub.writes[0][1]["famly_sync_note"],
+        self.assertEqual(self.written()["famly_sync_note"],
                          "held:contact_unmatched_on_existing_child")
         # Candidate ids live in the plan only; no email or name reaches Slack or the DB.
         blob = self.all_output()
@@ -1192,14 +1297,14 @@ class OriginFromHistoryTests(Phase2Case):
         self.assertFalse(self.job().child_create_sent)             # the second job sent no create
 
     def test_a_child_whose_read_back_failed_is_still_the_pipelines_on_the_next_job(self):
-        self.rest.bad_room_move = True
+        self.famly.blind_after_create = True       # the read-back lookup finds nothing
         self.run_through()
-        self.assertEqual(self.job().last_error_code, "room_move_mismatch")
+        self.assertEqual(self.job().last_error_code, "readback_child_lookup_failed")
         # Recorded at once, before the read-back, so the failure did not lose it.
         self.assertEqual(store.created_child_ids_for_deal(DEAL), frozenset({"child-1"}))
-        self.assertEqual(self.famly.contact_creates, [])
+        self.assertEqual(self.famly.contact_creates, [])            # the one stopping read-back
 
-        self.rest.bad_room_move = False
+        self.famly.blind_after_create = False
         self.enqueue()
         self.assertEqual(self.run_worker()["status"], store.AWAITING_APPROVAL)
         self.assertIn("created by pipeline", self.notify.gates[-1][0])
@@ -1264,6 +1369,182 @@ class OriginFromHistoryTests(Phase2Case):
         self.assertIn("Child: created by this job", text(mine, this_job="c"))
         self.assertIn("Child: created by pipeline", text(mine, this_job="other"))
         self.assertIn("Child: created by pipeline", text(mine))
+
+
+# --------------------------------------------------------------------------- #
+# Drew's review: the end date, flags, independent contacts, the lookup rule
+# --------------------------------------------------------------------------- #
+class EndDateTests(Phase2Case):
+    def test_a_missing_end_date_is_defaulted_and_sent_as_last_day(self):
+        self.run_through()
+        # Born 2024-01-15: the 4th birthday is 2028-01-15, so the first 31 August on or after it.
+        self.assertEqual(self.famly.child_creates[0]["sitesRelation"][0]["lastDay"], "2028-08-31")
+
+    def test_an_existing_end_date_is_used_and_never_overwritten(self):
+        self.hub.deals[DEAL]["end_date"] = "2027-03-31"
+        self.run_through()
+        self.assertEqual(self.famly.child_creates[0]["sitesRelation"][0]["lastDay"], "2027-03-31")
+        self.assertNotIn("end_date", self.written())                 # the deal is left alone
+        self.assertEqual(self.hub.deals[DEAL]["end_date"], "2027-03-31")
+
+    def test_the_default_is_written_to_the_deal_only_after_the_famly_write_succeeds(self):
+        self.run_through()
+        self.assertEqual(self.hub.deals[DEAL]["end_date"], "2028-08-31")
+        self.assertLess(self.events.index("child_create"), self.events.index(("hubspot", "end_date")))
+        self.assertLess(self.events.index("child_create"), self.events.index(("hubspot", "famly_childid")))
+        self.assertIn(("hubspot", "end_date"), self.events)
+
+    def test_nothing_is_written_to_the_deal_if_the_child_was_not_created(self):
+        self.famly.child_effect = mock.Mock(side_effect=GraphQLHTTPError("bad", 400, "{}"))
+        self.run_through()
+        self.assertEqual(self.job().last_error_code, "child_http_400")
+        self.assertNotIn("end_date", self.hub.deals[DEAL])           # still empty
+        self.assertEqual(self.hub.writes, [])
+
+    def test_an_existing_child_gets_no_end_date_written(self):
+        self.famly.children["child-9"] = {
+            "name": "x", "externalId": "URN-1", "currentGroupId": GROUP_ID,
+            "sitesRelation": [{"siteId": SITE_ID, "firstDay": "2026-01-15"}],
+            "externalSystemsReferences": [{"foreignId": DEAL, "system": "HUBSPOT"}]}
+        self.famly.contacts["child-9"] = [("fc-1", "ada.l@example.org"), ("fc-2", "ben.b@example.org")]
+        self.enqueue()
+        self.assertEqual(self.run_worker()["status"], store.DONE)
+        self.assertNotIn("end_date", self.written())                 # no Famly write, so none here
+
+    def test_it_is_never_overwritten_even_if_it_was_filled_in_between_the_plan_and_the_write(self):
+        self.run_to_approval()
+        self.approve()
+        # After the plan read of the next run (call 1), somebody types an end date.
+        self.hub.get_deal_hooks[self.hub.get_deal_calls + 1] = (
+            lambda: self.hub.deals[DEAL].__setitem__("end_date", "2030-01-01"))
+        self.assertEqual(self.run_worker()["status"], store.DONE)
+        self.assertEqual(self.hub.deals[DEAL]["end_date"], "2030-01-01")   # theirs, untouched
+        self.assertNotIn("end_date", self.written())
+        self.assertIn("end_date_already_set", " ".join(self.notify.notices))
+
+    def test_a_defaulted_end_date_that_cannot_be_written_is_needs_review(self):
+        self.hub.fail_props = {"end_date"}
+        result = self.run_through()
+        self.assertEqual((result["status"], result["code"]),
+                         (store.NEEDS_REVIEW, "hubspot_writeback_failed"))
+        self.assertEqual(len(self.famly.contact_creates), 2)         # Famly was not held up
+        self.assertEqual(self.written()["famly_childid"], "child-1")
+
+    def test_an_end_date_before_the_start_holds_with_no_writes(self):
+        self.hub.deals[DEAL]["child_date_of_birth"] = "2022-01-15"     # default end: 2026-08-31
+        self.hub.deals[DEAL]["actual_start_date_1"] = "2026-10-01"     # already past it
+        self.enqueue()
+        result = self.run_worker()
+        self.assertEqual((result["status"], result["code"]), (store.HELD, "end_date_before_start"))
+        self.assertFalse(self.famly.child_creates or self.famly.contact_creates)
+        self.assertEqual(self.notify.gates, [])
+
+    def test_the_gate_message_says_when_the_end_date_was_defaulted(self):
+        self.run_to_approval()
+        self.assertIn("End date: defaulted (31 August after the 4th birthday)", self.notify.gates[0][0])
+        store._reset_for_tests()
+        self.hub.deals[DEAL]["end_date"] = "2027-03-31"
+        self.run_to_approval()
+        self.assertIn("End date: present", self.notify.gates[1][0])
+        self.assertNotIn("defaulted", self.notify.gates[1][0])
+        for value in PII + ["2028-08-31", "2027-03-31"]:
+            self.assertNotIn(value, self.notify.gates[0][0] + self.notify.gates[1][0])
+
+
+class ContactOrderAndLookupTests(Phase2Case):
+    def test_the_bill_payer_is_created_first_whatever_the_order_on_the_deal(self):
+        self.hub.assoc[("deals", DEAL, "contacts")] = [
+            {"id": "c2", "types": [{"typeId": 3, "label": None}]},                    # not the bill payer
+            {"id": "c1", "types": [{"typeId": 91, "label": "Bill Payer"}]},
+        ]
+        self.run_through()
+        self.assertEqual([p["email"] for p in self.famly.contact_creates],
+                         ["ada.l@example.org", "ben.b@example.org"])
+        self.assertEqual(self.job().outcomes, ["c1:created", "c2:created"])
+
+    def test_one_failing_contact_never_stops_or_holds_the_others(self):
+        self.hub.contacts["c3"] = {"email": "cy.c@example.org", "firstname": "Cy", "lastname": "Cade"}
+        self.hub.assoc[("deals", DEAL, "contacts")].append(
+            {"id": "c3", "types": [{"typeId": 3, "label": None}]})
+        seen = []
+
+        def effect(payload):
+            seen.append(payload["email"])
+            if payload["email"] == "ada.l@example.org":
+                raise GraphQLHTTPError("bad", 400, "{}")         # the bill payer is rejected
+            if payload["email"] == "ben.b@example.org":
+                raise RuntimeError("an unexpected failure")      # ... and so is an odd error
+        self.famly.contact_effect = effect
+        self.hub.contacts["c2"]["lastname"] = "Babbage"
+        result = self.run_through()
+        self.assertEqual(seen, ["ada.l@example.org", "ben.b@example.org", "cy.c@example.org"])
+        self.assertEqual(self.job().outcomes,
+                         ["c1:contact_http_400", "c2:contact_error", "c3:created"])
+        self.assertEqual(result["status"], store.NEEDS_REVIEW)
+        self.assertEqual(self.job().last_error_code, "contact_outcomes")
+        self.assertFalse(any("Babbage" in n or "ben.b@" in n for n in self.notify.notices))
+
+    def calls_between(self, start_marker, end_marker, calls=None):
+        calls = calls if calls is not None else self.famly.calls
+        a = calls.index(start_marker)
+        b = calls.index(end_marker, a + 1)
+        return calls[a + 1:b]
+
+    def test_the_existing_contact_lookup_is_skipped_only_for_the_first_contact_of_a_new_child(self):
+        self.run_through()
+        calls = self.famly.calls
+        self.assertEqual(calls.count(famly_writes.CREATE_CONTACT_OP), 2)
+        # No contact lookup between creating the child and the first contact create ...
+        first = self.calls_between(famly_writes.CREATE_CHILD_OP, famly_writes.CREATE_CONTACT_OP)
+        self.assertNotIn("OnboardChildContacts", first)
+        # ... but once a contact create has been sent, the next contact is looked up first.
+        a = calls.index(famly_writes.CREATE_CONTACT_OP)
+        b = calls.index(famly_writes.CREATE_CONTACT_OP, a + 1)
+        self.assertIn("OnboardChildContacts", calls[a + 1:b])
+
+    def test_the_lookup_is_used_on_a_re_run(self):
+        self.famly.contact_effect = mock.Mock(side_effect=[GraphQLHTTPError("bad", 400, "{}"), None])
+        self.run_through()                                          # c1 rejected, c2 created
+        self.assertEqual(self.job().outcomes, ["c1:contact_http_400", "c2:created"])
+        mark = len(self.famly.calls)
+        self.famly.contact_effect = None
+        self.enqueue()
+        self.run_worker()
+        self.approve()
+        self.run_worker()
+        again = self.famly.calls[mark:]
+        before_first_create = again[:again.index(famly_writes.CREATE_CONTACT_OP)]
+        self.assertIn("OnboardChildContacts", before_first_create)   # looked up first
+        self.assertEqual(self.job().outcomes, ["c1:created", "c2:present"])   # and c2 is not duplicated
+        self.assertEqual(sorted(e for _, e in self.famly.contacts["child-1"]),
+                         ["ada.l@example.org", "ben.b@example.org"])
+
+    def test_the_lookup_is_used_for_an_existing_child_and_after_an_unknown_child_outcome(self):
+        # An existing child: looked up (and found present), no contact create at all.
+        self.famly.children["child-9"] = {
+            "name": "x", "externalId": "URN-1", "currentGroupId": GROUP_ID,
+            "sitesRelation": [{"siteId": SITE_ID, "firstDay": "2026-01-15"}],
+            "externalSystemsReferences": [{"foreignId": DEAL, "system": "HUBSPOT"}]}
+        self.famly.contacts["child-9"] = [("fc-1", "ada.l@example.org"), ("fc-2", "ben.b@example.org")]
+        self.enqueue()
+        self.run_worker()
+        self.assertGreaterEqual(self.famly.calls.count("OnboardChildContacts"), 2)
+        self.assertEqual(self.famly.contact_creates, [])
+
+        # A child create whose outcome was unknown (timeout, then found by lookup): the
+        # first contact is looked up before it is created.
+        store._reset_for_tests()
+        other = FakeFamly()
+        other.events = self.events
+        self.famly, self.rest = other, FakeRest(other)
+        self.deps = worker.Deps(self.hub, other, self.rest, self.notify,
+                                famly_factory=lambda: FamlyReads(other, site_ids=[SITE_ID]))
+        self.hub.deals[DEAL]["end_date"] = "2028-08-31"
+        other.child_land_then_raise = requests.exceptions.Timeout()
+        self.run_through()
+        self.assertEqual(self.job().status, store.DONE)
+        first = self.calls_between(famly_writes.CREATE_CHILD_OP, famly_writes.CREATE_CONTACT_OP, other.calls)
+        self.assertIn("OnboardChildContacts", first)
 
 
 if __name__ == "__main__":

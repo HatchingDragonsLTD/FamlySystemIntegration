@@ -41,10 +41,16 @@ def gate_text(
     if plan_changed:
         lines.append("⚠️ The plan changed since it was last approved; approval is needed again.")
     lines.append(f"Deal: <{link}|{deal_id}>" if link else f"Deal: {deal_id} (set HUBSPOT_PORTAL_ID for a link)")
+    if dates.get("lastDayDefaulted") and child.get("status") == "child_would_create":
+        end_text = "defaulted (31 August after the 4th birthday)"
+    elif dates.get("lastDayDefaulted"):
+        end_text = "none on the deal"          # an existing child: no end date is sent
+    else:
+        end_text = "present" if dates.get("lastDayPresent") else "none"
     lines.append(
         f"Site: {plan.get('siteCode')} · Room: {plan.get('groupTitle')} · "
         f"Start date: {'present' if dates.get('firstDayPresent') else 'missing'} · "
-        f"End date: {'present' if dates.get('lastDayPresent') else 'none'}"
+        f"End date: {end_text}"
     )
     if child.get("status") == "child_would_create":
         child_state = "would be created"

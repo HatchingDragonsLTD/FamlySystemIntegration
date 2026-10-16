@@ -1,23 +1,24 @@
-"""Check the internal child summary (GET /api/v2/children/{id}/summary) after a
-child is created.
+"""Compare the internal child summary (GET /api/v2/children/{id}/summary) with what
+was sent, and return FLAGS. A flag is a code for a human to look at: it never
+stops or holds a job, and it is never a reason to refuse a write.
 
-THE SUMMARY'S EXACT SHAPE IS NOT DOCUMENTED here (the design doc says it holds
-the child with start and end dates, isTestChild, group and onApp). So the
-lookups below are tolerant and listed in the constants, and the check FAILS
-CLOSED: a field it cannot find is `summary_unrecognised`, never a pass. Only
-KEY NAMES are ever logged about an unrecognised summary, never values.
+THE SUMMARY'S EXACT SHAPE IS NOT DOCUMENTED here (the design doc says it holds the
+child with start and end dates, isTestChild and group). The lookups below are
+tolerant and listed in the constants. A field that cannot be found is the flag
+`summary_unrecognised` (once), not a failure; only KEY NAMES are ever logged about
+an unrecognised summary, never values.
 
-What must be true:
-  * the group is the expected group;
-  * the start date and end date are the expected ones (no end date when none was
-    sent);
-  * isTestChild is true for a test deal and NOT true otherwise;
-  * the child's earliest room move STARTS ON THE CHILD'S START DATE, in the
-    expected group. (A room move that starts on the creation date, as the first
-    probe saw, is `room_move_mismatch`.)
+What is compared, and the flag when it differs:
+  * the group                                  `summary_group_mismatch`
+  * the start date                             `summary_start_mismatch`
+  * the end date (the one sent as lastDay)     `summary_end_mismatch`
+  * isTestChild (true for a test deal, not
+    true otherwise)                            `test_flag_mismatch`
 
-Gender is deliberately not checked: the summary reports a Famly default for an
-unset gender.
+NOT checked: the child's room move. (The first probe saw a room move start on the
+creation date; that was fixed in Famly and is no longer something this pipeline
+reads or stops on.) NOT checked either: gender, which the summary reports as a
+Famly default when unset.
 """
 
 import logging
@@ -29,17 +30,13 @@ GROUP_ID_KEYS = ("groupId", "currentGroupId")
 GROUP_OBJECT_KEYS = ("group", "currentGroup")
 START_KEYS = ("startDate", "start_date", "firstDay")
 END_KEYS = ("endDate", "end_date", "lastDay")
-MOVE_LIST_KEYS = ("groupMoves", "groups", "roomMoves", "moves", "groupHistory", "groupMovements")
-MOVE_DATE_KEYS = ("startDate", "date", "from", "startsAt", "moveDate", "start")
-MOVE_GROUP_KEYS = ("groupId", "id", "roomId")
 
-OK = None
 UNRECOGNISED = "summary_unrecognised"
+UNREADABLE = "summary_unreadable"
 GROUP_MISMATCH = "summary_group_mismatch"
 START_MISMATCH = "summary_start_mismatch"
 END_MISMATCH = "summary_end_mismatch"
 TEST_FLAG_MISMATCH = "test_flag_mismatch"
-ROOM_MOVE_MISMATCH = "room_move_mismatch"
 
 
 def _walk(node: Any):
@@ -53,8 +50,8 @@ def _walk(node: Any):
 
 
 def _first(node: Any, keys) -> Any:
-    """The first non-null value under any of `keys`, searching the document
-    breadth-first in dict order."""
+    """The first non-null value under any of `keys`, searching the document in
+    dict order."""
     for item in _walk(node):
         for key in keys:
             if item.get(key) is not None:
@@ -88,32 +85,6 @@ def _group_id(summary: Any) -> str | None:
     return None
 
 
-def _moves(summary: Any) -> list[dict]:
-    for item in _walk(summary):
-        for key in MOVE_LIST_KEYS:
-            value = item.get(key)
-            if isinstance(value, list) and value and all(isinstance(v, dict) for v in value):
-                return value
-    return []
-
-
-def _move_date(move: dict) -> str | None:
-    for key in MOVE_DATE_KEYS:
-        if move.get(key):
-            return _date_part(move[key])
-    return None
-
-
-def _move_group(move: dict) -> str | None:
-    for key in MOVE_GROUP_KEYS:
-        value = move.get(key)
-        if isinstance(value, dict):
-            value = value.get("id")
-        if value:
-            return str(value)
-    return None
-
-
 def is_test_child(summary: Any) -> bool:
     values = [item["isTestChild"] for item in _walk(summary) if "isTestChild" in item]
     return bool(values) and all(v is True for v in values)
@@ -126,48 +97,41 @@ def _key_names(summary: Any) -> list[str]:
     return sorted(names)
 
 
-def check(
+def flags(
     summary: Any,
     *,
     expected_group_id: str,
     expected_start: str,
     expected_end: str | None,
     expected_test: bool,
-) -> str | None:
-    """None if the summary matches, else the code of the first mismatch.
+) -> list[str]:
+    """The flags for this summary: an empty list if everything matches.
 
-    Dates are compared as `YYYY-MM-DD`.
+    Dates are compared as `YYYY-MM-DD`. Never raises.
     """
     if not isinstance(summary, (dict, list)):
-        return UNRECOGNISED
+        return [UNRECOGNISED]
 
+    child = _child_node(summary)
     group = _group_id(summary)
-    start = _date_part(_first(_child_node(summary), START_KEYS))
-    end = _date_part(_first(_child_node(summary), END_KEYS))
-    moves = _moves(summary)
+    start = _date_part(_first(child, START_KEYS))
+    end = _date_part(_first(child, END_KEYS))
 
-    if group is None or start is None or not moves:
+    found: list[str] = []
+    if group is None or start is None:
         # Key names only, never values: enough to learn the shape on a first run.
         logger.warning(
-            "onboard: child summary shape not recognised (group=%s start=%s moves=%s); "
-            "keys seen: %s",
-            group is not None, start is not None, bool(moves), _key_names(summary),
+            "onboard: child summary shape not recognised (group=%s start=%s); keys seen: %s",
+            group is not None, start is not None, _key_names(summary),
         )
-        return UNRECOGNISED
+        found.append(UNRECOGNISED)
 
-    if group != expected_group_id:
-        return GROUP_MISMATCH
-    if start != expected_start:
-        return START_MISMATCH
-    if (end or None) != (expected_end or None):
-        return END_MISMATCH
+    if group is not None and group != expected_group_id:
+        found.append(GROUP_MISMATCH)
+    if start is not None and start != expected_start:
+        found.append(START_MISMATCH)
+    if start is not None and (end or None) != (expected_end or None):
+        found.append(END_MISMATCH)
     if is_test_child(summary) != bool(expected_test):
-        return TEST_FLAG_MISMATCH
-
-    dated = [(_move_date(m), _move_group(m)) for m in moves]
-    if any(d is None for d, _ in dated):
-        return UNRECOGNISED
-    earliest_date, earliest_group = min(dated, key=lambda item: item[0])
-    if earliest_date != expected_start or (earliest_group and earliest_group != expected_group_id):
-        return ROOM_MOVE_MISMATCH
-    return OK
+        found.append(TEST_FLAG_MISMATCH)
+    return found

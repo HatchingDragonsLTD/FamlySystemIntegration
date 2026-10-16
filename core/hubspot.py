@@ -9,7 +9,7 @@ HARD RULES, each pinned by tests:
     write to HubSpot. Contacts and quotes are read one at a time with GET rather
     than via the POST batch-read endpoint for exactly this reason.
   * `HubSpotDealWriter` (below) is the ONE writer: it can PATCH a deal, and only
-    the four sync properties in WRITABLE_DEAL_PROPERTIES (phase 2). Nothing else
+    the sync properties and `end_date` in WRITABLE_DEAL_PROPERTIES (phase 2). Nothing else
     is writable through it: not another property, not a contact, not a quote.
   * EXPLICIT ALLOW-LISTS. Every object read names the properties it wants
     (`DEAL_PROPERTIES`, `CONTACT_PROPERTIES`, `QUOTE_PROPERTIES`). Never "all
@@ -281,13 +281,23 @@ FAMLY_CHILDID_PROPERTY = "famly_childid"
 SYNC_STATUS_PROPERTY = "famly_sync_status"
 SYNC_NOTE_PROPERTY = "famly_sync_note"
 SYNC_GAPS_PROPERTY = "famly_sync_gaps"
+# The deal's own end date: written ONLY when it was empty and the pipeline
+# DEFAULTED one (after the Famly write succeeded); never overwritten.
+END_DATE_PROPERTY = "end_date"
 WRITABLE_DEAL_PROPERTIES = frozenset(
-    {FAMLY_CHILDID_PROPERTY, SYNC_STATUS_PROPERTY, SYNC_NOTE_PROPERTY, SYNC_GAPS_PROPERTY}
+    {
+        FAMLY_CHILDID_PROPERTY,
+        SYNC_STATUS_PROPERTY,
+        SYNC_NOTE_PROPERTY,
+        SYNC_GAPS_PROPERTY,
+        END_DATE_PROPERTY,
+    }
 )
 
 
 class HubSpotDealWriter(HubSpotClient):
-    """A HubSpotClient that can also write the four sync properties on a deal.
+    """A HubSpotClient that can also write the sync properties (and a defaulted
+    `end_date`) on a deal.
 
     `write_deal_properties` refuses any other property name before sending
     anything, and the values are codes and a Famly child id (no personal data).
