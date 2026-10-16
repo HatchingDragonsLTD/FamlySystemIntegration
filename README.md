@@ -986,7 +986,7 @@ type ids it found. Override with `HUBSPOT_BILL_PAYER_LABEL`,
 Per deal it reports the stage and deposit state, site (from
 `location_of_interest`: Westminster/City/Canada Water only), room (age in
 completed months at the start date), the child lookup (deal-id reference, then
-urn, both live), a status per contact (`present`, `would_copy`, `would_create`)
+urn, both live), a status per contact (`present`, `would_create`, or a hold on an existing child)
 and the quotes. Anything unsafe is a HOLD with a reason code (`site_unmapped`,
 `group_missing`, `dob_missing`, `child_ambiguous`, `bill_payer_unclear`, ...).
 Output holds ids, codes and counts only: no names, emails, phone numbers or
@@ -1027,11 +1027,14 @@ python main.py onboard-status --deal-id <id>      # counts and codes only
 ends `dry_done`. `live` posts an Approve/Reject request (Gate A); on approve the
 worker re-runs the plan and writes only if its hash is unchanged. It then creates
 the child (one request, never retried; an unknown outcome is settled by a live
-lookup, never a second create), reads it back (including that the room move starts
-on the start date), creates each contact with **empty roles**, reads each back, and
-writes `famly_childid`, `famly_sync_status`, `famly_sync_note` and
-`famly_sync_gaps` to the deal (it fails closed before any Famly write if one of
-those four properties does not exist). Names, emails, phones, addresses and dates
+lookup, never a second create; `lastDay` is always sent: the deal's end date, or
+the first 31 August on or after the 4th birthday), checks it is the one child the
+deal-id lookup finds, compares the internal summary (differences are only flags),
+creates each contact with **empty roles** (all of them tried independently, bill
+payer first), reads each back, and writes `famly_childid`, a defaulted `end_date`
+(only if still empty), `famly_sync_status`, `famly_sync_note` and
+`famly_sync_gaps` to the deal. HubSpot never blocks Famly: a missing property is
+warned about and its write skipped. Names, emails, phones, addresses and dates
 of birth are held in memory only; the jobs table, Slack and the logs carry ids,
 codes and hashes. See `actions/onboard/worker.py` and
 `docs/famly_onboarding_pipeline_design.md`.

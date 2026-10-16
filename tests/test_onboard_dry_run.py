@@ -223,6 +223,35 @@ class DryRunTestCase(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 # Group derivation: exact at every boundary (wrong-room risk).
 # --------------------------------------------------------------------------- #
+class DefaultEndDateTests(unittest.TestCase):
+    def test_the_first_31_august_on_or_after_the_fourth_birthday(self):
+        cases = [
+            ("2022-01-15", "2026-08-31"),   # born before 31 Aug: 4th birthday 15 Jan 2026
+            ("2022-08-30", "2026-08-31"),
+            ("2022-08-31", "2026-08-31"),   # born ON 31 Aug: the same date
+            ("2022-09-01", "2027-08-31"),   # born after 31 Aug: 4th birthday is past 31 Aug
+            ("2022-12-31", "2027-08-31"),
+            ("2021-12-31", "2026-08-31"),
+            ("2024-02-29", "2028-08-31"),   # leap day: 4th birthday clamps to 28 Feb 2028
+            ("2020-02-29", "2024-08-31"),   # leap day to a leap year: 29 Feb 2024
+        ]
+        for dob, expected in cases:
+            with self.subTest(dob=dob):
+                self.assertEqual(derive.default_end_date(date.fromisoformat(dob)),
+                                 date.fromisoformat(expected))
+
+    def test_resolve_never_replaces_a_given_end_date(self):
+        deal = {"child_date_of_birth": "2022-01-15", "end_date": "2027-03-31"}
+        self.assertEqual(derive.resolve_end_date(deal), (date(2027, 3, 31), False))
+        deal["end_date"] = ""
+        self.assertEqual(derive.resolve_end_date(deal), (date(2026, 8, 31), True))
+        self.assertEqual(derive.resolve_end_date({"end_date": ""}), (None, False))
+        with self.assertRaises(ValueError):
+            derive.resolve_end_date({"end_date": "soon"})
+        # An epoch-milliseconds end date from HubSpot is also "given".
+        self.assertEqual(derive.resolve_end_date({"end_date": "1801440000000"})[1], False)
+
+
 class GroupDerivationTests(unittest.TestCase):
     def test_room_boundaries_at_23_24_35_36_months(self):
         cases = [
@@ -860,26 +889,37 @@ class LeftNurseryAndDatesTests(DryRunTestCase):
         self.assertEqual(self.plan()["groupReason"], "left_nursery_voyagers")
         self.assertEqual(derive.deposit_state("OPERATIONS ", " deposit   pending"), "unpaid")
 
-    def test_left_nursery_without_an_end_date_holds_as_it_would_look_active(self):
+    def test_left_nursery_with_no_end_date_no_longer_holds_it_is_defaulted(self):
         self.left()
         self.hub.deals["D1"]["end_date"] = ""
-        self.assertEqual(self.reasons(self.plan()), ["end_date_missing"])
+        plan = self.plan()
+        self.assertEqual(self.reasons(plan), [])
+        self.assertEqual(plan["dates"], {"firstDayPresent": True, "lastDayPresent": True,
+                                         "lastDayDefaulted": True})
 
     def test_left_nursery_without_a_start_date_holds(self):
         self.left(actual_start_date_1="")
         self.assertEqual(self.reasons(self.plan()), ["start_date_missing"])
-        self.hub.deals["D1"]["end_date"] = ""
-        self.assertEqual(sorted(self.reasons(self.plan())),
-                         ["end_date_missing", "start_date_missing"])
 
-    def test_an_end_date_before_the_start_date_is_inconsistent_at_any_stage(self):
+    def test_an_end_date_before_the_start_date_holds_at_any_stage(self):
         self.hub.deals["D1"] = make_deal(end_date="2025-12-31")  # start is 2026-01-15
-        self.assertEqual(self.reasons(self.plan()), ["dates_inconsistent"])
+        self.assertEqual(self.reasons(self.plan()), ["end_date_before_start"])
         self.left(end_date="2025-12-31")
-        self.assertEqual(self.reasons(self.plan()), ["dates_inconsistent"])
+        self.assertEqual(self.reasons(self.plan()), ["end_date_before_start"])
         # An end date equal to the start date is allowed.
         self.hub.deals["D1"]["end_date"] = "2026-01-15"
         self.assertEqual(self.reasons(self.plan()), [])
+
+    def test_a_defaulted_end_date_already_past_at_the_start_holds(self):
+        # Born 2022-01-15: the default is 2026-08-31.
+        self.hub.deals["D1"] = make_deal(child_date_of_birth="2022-01-15",
+                                         actual_start_date_1="2026-10-01")
+        plan = self.plan()
+        self.assertEqual(self.reasons(plan), ["end_date_before_start"])
+        self.assertTrue(plan["dates"]["lastDayDefaulted"])
+        # Starting ON the default date is allowed (end == start).
+        self.hub.deals["D1"]["actual_start_date_1"] = "2026-08-31"
+        self.assertNotIn("end_date_before_start", self.reasons(self.plan()))
 
     def test_an_end_date_in_the_future_warns(self):
         self.left()
@@ -890,16 +930,23 @@ class LeftNurseryAndDatesTests(DryRunTestCase):
             self.hub.deals["D1"]["end_date"] = "2026-10-15"  # today is not the future
             self.assertNotIn("end_date_in_future", self.plan()["warnings"])
 
-    def test_a_current_child_needs_no_end_date_and_reports_only_presence(self):
+    def test_the_plan_reports_presence_and_whether_it_was_defaulted_never_the_dates(self):
         plan = self.plan()
-        self.assertEqual(plan["dates"], {"firstDayPresent": True, "lastDayPresent": False})
+        self.assertEqual(plan["dates"], {"firstDayPresent": True, "lastDayPresent": True,
+                                         "lastDayDefaulted": True})
         self.assertEqual(plan["holds"], [])
         self.hub.deals["D1"]["end_date"] = "2027-03-31"
         plan = self.plan()
-        self.assertEqual(plan["dates"], {"firstDayPresent": True, "lastDayPresent": True})
+        self.assertEqual(plan["dates"], {"firstDayPresent": True, "lastDayPresent": True,
+                                         "lastDayDefaulted": False})
         blob = json.dumps(plan)
-        for text in ("2027-03-31", "2026-01-15", "2024-01-15"):
+        for text in ("2027-03-31", "2026-01-15", "2024-01-15", "2028-08-31"):
             self.assertNotIn(text, blob)
+        # No end date and no birth date: nothing to default from.
+        self.hub.deals["D1"]["end_date"] = ""
+        self.hub.deals["D1"]["child_date_of_birth"] = ""
+        self.famly.ext_refs["D1"] = ["child-1"]    # an existing child, so no dob hold
+        self.assertEqual(self.plan()["dates"]["lastDayPresent"], False)
 
     def test_an_unparseable_end_date_holds(self):
         self.hub.deals["D1"]["end_date"] = "soon"

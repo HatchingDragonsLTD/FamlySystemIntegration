@@ -18,7 +18,7 @@ site_unmapped, site_id_missing, group_missing, group_ambiguous, dob_missing,
 start_date_missing, date_invalid, dates_inconsistent, child_ambiguous,
 contact_no_email, contact_ambiguous_on_child, contact_unmatched_on_existing_child,
 bill_payer_unclear, famly_childid_not_found, child_possible_duplicate,
-end_date_missing, deal_not_found.
+end_date_before_start, deal_not_found.
 A deal with any hold is `held`; one without is `ready`; one a read failed for is
 `error`.
 """
@@ -211,13 +211,16 @@ class DryRun:
             plan["holds"].append({"reason": hold.reason, **hold.detail})
 
     def _derive_dates(self, deal: dict, left_nursery: bool, plan: dict) -> None:
-        """firstDay = actual_start_date_1, lastDay = end_date (Leave Date) when
-        set. The plan says only whether each is present, never the dates.
+        """firstDay = actual_start_date_1, lastDay = the deal's `end_date`, or, when
+        it is empty, the first 31 August on or after the child's 4th birthday. The
+        plan says only whether each is present and whether the last day was
+        DEFAULTED, never the dates.
 
-        Left Nursery: a missing start date or a missing end date is a HOLD (a
-        child with no end date would count as an active child). Any stage: an
-        end date before the start date is `dates_inconsistent`. An end date after
-        today is a warning (`end_date_in_future`)."""
+        HOLDS: a Left Nursery deal without a start date; an end date (given or
+        defaulted) BEFORE the start date (`end_date_before_start`, e.g. a child
+        already past the default date when they start); an unparseable date.
+        WARNING: a GIVEN end date after today (`end_date_in_future`; a defaulted
+        one is normally in the future and says nothing)."""
         holds, warnings = plan["holds"], plan["warnings"]
 
         def hold_once(reason: str) -> None:
@@ -226,21 +229,22 @@ class DryRun:
 
         try:
             start = derive.parse_hubspot_date(deal.get("actual_start_date_1"))
-            end = derive.parse_hubspot_date(deal.get("end_date"))
+            end, defaulted = derive.resolve_end_date(deal)
         except ValueError:
             hold_once(derive.DATE_INVALID)
-            start = end = None
+            start, end, defaulted = None, None, False
 
-        plan["dates"] = {"firstDayPresent": start is not None, "lastDayPresent": end is not None}
+        plan["dates"] = {
+            "firstDayPresent": start is not None,
+            "lastDayPresent": end is not None,
+            "lastDayDefaulted": defaulted,
+        }
 
-        if left_nursery:
-            if start is None and not deal.get("actual_start_date_1"):
-                hold_once(derive.START_DATE_MISSING)
-            if end is None and not deal.get("end_date"):
-                hold_once(derive.END_DATE_MISSING)
+        if left_nursery and start is None and not deal.get("actual_start_date_1"):
+            hold_once(derive.START_DATE_MISSING)
         if start is not None and end is not None and end < start:
-            hold_once(derive.DATES_INCONSISTENT)
-        if end is not None and end > derive.today():
+            hold_once(derive.END_DATE_BEFORE_START)
+        if end is not None and not defaulted and end > derive.today():
             warnings.append("end_date_in_future")
 
     # -- child ----------------------------------------------------------- #

@@ -48,7 +48,7 @@ DOB_MISSING = "dob_missing"
 START_DATE_MISSING = "start_date_missing"
 DATE_INVALID = "date_invalid"
 DATES_INCONSISTENT = "dates_inconsistent"
-END_DATE_MISSING = "end_date_missing"
+END_DATE_BEFORE_START = "end_date_before_start"
 
 
 def today() -> date:
@@ -91,6 +91,40 @@ def _add_months(start: date, months: int) -> date:
     year, month = divmod(index, 12)
     month += 1
     return date(year, month, min(start.day, calendar.monthrange(year, month)[1]))
+
+
+def default_end_date(dob: date) -> date:
+    """The end date used when the deal has none: the FIRST 31 AUGUST ON OR AFTER the
+    child's 4th birthday (date of birth + 48 months, a 29 February birth day
+    clamping to 28 February as everywhere else here). A child whose 4th birthday is
+    exactly 31 August leaves on that same day.
+
+    Born 15 Jan 2022 -> 31 Aug 2026 (4th birthday 15 Jan 2026).
+    Born 31 Aug 2022 -> 31 Aug 2026 (the same date).
+    Born  1 Sep 2022 -> 31 Aug 2027 (4th birthday 1 Sep 2026, so the next 31 Aug).
+    """
+    fourth = _add_months(dob, 48)
+    year = fourth.year if (fourth.month, fourth.day) <= (8, 31) else fourth.year + 1
+    return date(year, 8, 31)
+
+
+def resolve_end_date(deal: dict) -> tuple[date | None, bool]:
+    """(the end date to use, whether it was DEFAULTED).
+
+    The deal's `end_date` when it has one (never replaced); otherwise the
+    4th-birthday default; None only if the deal has neither an end date nor a date
+    of birth to default from.
+
+    Raises:
+        ValueError: an unparseable `end_date` or date of birth.
+    """
+    given = parse_hubspot_date(deal.get("end_date"))
+    if given is not None:
+        return given, False
+    dob = parse_hubspot_date(deal.get("child_date_of_birth"))
+    if dob is None:
+        return None, False
+    return default_end_date(dob), True
 
 
 def completed_months(dob: date, on: date) -> int:

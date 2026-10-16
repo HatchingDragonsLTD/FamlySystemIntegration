@@ -7,7 +7,8 @@ functions return payloads and codes; nothing here logs or stores a value.
 
 CHILD: name as a plain "First Last" string; birthday `%Y-%m-%d`; currentGroupId
 from the derivation; `records: []`, `sensitiveRecords: []`; gender OMITTED;
-sitesRelation [{siteId, firstDay, lastDay?}]; externalId and externalSystems
+sitesRelation [{siteId, firstDay, lastDay}] (lastDay is ALWAYS sent: the deal's
+`end_date`, or the first 31 August on or after the 4th birthday); externalId and externalSystems
 References for HUBSPOT (deal id) and URN (child_urn, if present). `isTestChild`
 is added ONLY for a test deal; otherwise the field is not sent. No nationality,
 language, birth place or extra info.
@@ -55,7 +56,8 @@ def build_child_input(deal: dict, deal_id: str, plan: dict, is_test_child: bool)
     try:
         birthday = derive.parse_hubspot_date(deal.get("child_date_of_birth"))
         start = derive.parse_hubspot_date(deal.get("actual_start_date_1"))
-        end = derive.parse_hubspot_date(deal.get("end_date"))
+        # The deal's end date, or the 4th-birthday default: lastDay is ALWAYS sent.
+        end, _defaulted = derive.resolve_end_date(deal)
     except ValueError:
         raise InputIncomplete("date_invalid") from None
     if birthday is None:
@@ -65,9 +67,15 @@ def build_child_input(deal: dict, deal_id: str, plan: dict, is_test_child: bool)
     if not plan.get("groupId") or not plan.get("siteId"):
         raise InputIncomplete("group_missing")
 
-    relation = {"siteId": plan["siteId"], "firstDay": start.strftime("%Y-%m-%d")}
-    if end is not None:
-        relation["lastDay"] = end.strftime("%Y-%m-%d")
+    if end is None:
+        raise InputIncomplete("end_date_missing")     # no end date and no birth date to default from
+    if end < start:
+        raise InputIncomplete("end_date_before_start")
+    relation = {
+        "siteId": plan["siteId"],
+        "firstDay": start.strftime("%Y-%m-%d"),
+        "lastDay": end.strftime("%Y-%m-%d"),
+    }
 
     payload = {
         "name": name,
