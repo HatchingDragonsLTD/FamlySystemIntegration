@@ -22,7 +22,7 @@ def _list(inner):
 
 
 def schema(include_deleted=True, children="childShares", external_id=True, deleted_at=True,
-           query_type="BillPayerQueries", root_link=True):
+           query_type="BillPayerQueries", root_link=True, nested=False):
     """The public schema's shape: `listBySiteIds(siteIds, nextToken,
     includeDeleted: Boolean! = true)`, on an object whose name does NOT begin with
     "BillPayers" (the old detector looked for that and so found nothing)."""
@@ -34,7 +34,11 @@ def schema(include_deleted=True, children="childShares", external_id=True, delet
         bill_payer_fields.append({"name": "externalId", "args": [], "type": _t("SCALAR", "String")})
     if deleted_at:
         bill_payer_fields.append({"name": "deletedAt", "args": [], "type": _t("SCALAR", "DateTime")})
-    if children:
+    if nested:
+        # The live nesting: BillPayer.children -> BillPayerChild.share -> ChildShare.multiplier
+        bill_payer_fields.append({"name": "children", "args": [],
+                                  "type": _nn(_list(_nn(_t("OBJECT", "BillPayerChild"))))})
+    elif children:
         bill_payer_fields.append({"name": children, "args": [],
                                   "type": _nn(_list(_nn(_t("OBJECT", "ChildShare"))))})
     list_args = [
@@ -60,9 +64,13 @@ def schema(include_deleted=True, children="childShares", external_id=True, delet
                     {"name": "children", "type": _nn(_list(_nn(_t("INPUT_OBJECT", "BillPayerChildInput"))))}],
                  "type": _t("OBJECT", "BillPayer")}]},
             {"kind": "OBJECT", "name": "BillPayer", "fields": bill_payer_fields},
-            {"kind": "OBJECT", "name": "ChildShare", "fields": [
+            {"kind": "OBJECT", "name": "ChildShare", "fields": (
+                [{"name": "multiplier", "args": [], "type": _nn(_t("SCALAR", "Float"))}] if nested else
+                [{"name": "childId", "args": [], "type": _nn(_t("SCALAR", "ChildId"))},
+                 {"name": "multiplier", "args": [], "type": _nn(_t("SCALAR", "Float"))}])},
+            {"kind": "OBJECT", "name": "BillPayerChild", "fields": [
                 {"name": "childId", "args": [], "type": _nn(_t("SCALAR", "ChildId"))},
-                {"name": "multiplier", "args": [], "type": _nn(_t("SCALAR", "Float"))}]},
+                {"name": "share", "args": [], "type": _nn(_t("OBJECT", "ChildShare"))}]},
             {"kind": "INPUT_OBJECT", "name": "BillPayerChildInput", "inputFields": [
                 {"name": "childId", "type": _nn(_t("SCALAR", "ChildId"))},
                 {"name": "share", "type": _nn(_t("INPUT_OBJECT", "ChildShareInput"))}]},
@@ -139,14 +147,99 @@ class ShapeTests(unittest.TestCase):
 
     def test_the_children_deleted_at_and_multiplier_are_discovered(self):
         shape = self.shape()
-        self.assertEqual((shape["children_field"], shape["child_path"], shape["multiplier_field"]),
-                         ("childShares", "childId", "multiplier"))
+        self.assertEqual((shape["children_field"], shape["child_path"], shape["multiplier_path"]),
+                         ("childShares", "childId", ["multiplier"]))
+        self.assertEqual(shape["multiplier_chain"], "ChildShare.multiplier")
         self.assertTrue(shape["deleted_at"] and shape["external_id"])
         text = runner.build_query(shape, True)
         self.assertIn("childShares { childId multiplier }", text)
         self.assertIn("deletedAt", text)
         self.assertNotIn("mutation", text.lower())
         self.assertNotIn("includeDeleted", runner.build_query(shape, False))
+
+
+def to_nested(n: dict) -> dict:
+    """A flat test node as the live schema nests it: children[{childId, share{multiplier}}]."""
+    out = {k: v for k, v in n.items() if k != "childShares"}
+    out["children"] = [{"childId": c["childId"], "share": {"multiplier": c["multiplier"]}}
+                       for c in n["childShares"]]
+    return out
+
+
+class NestedMultiplierTests(unittest.TestCase):
+    """The multiplier is nested: BillPayerChild.share -> ChildShare.multiplier (Float!)."""
+
+    def shape(self):
+        return runner.discover_shape({"data": {"__schema": schema(nested=True)}})
+
+    def test_discovery_follows_the_share_field_one_level(self):
+        shape = self.shape()
+        self.assertEqual(shape["children_field"], "children")
+        self.assertEqual(shape["child_path"], "childId")
+        self.assertEqual(shape["multiplier_path"], ["share", "multiplier"])
+        self.assertEqual(shape["multiplier_chain"], "BillPayerChild.share -> ChildShare.multiplier")
+        self.assertFalse([n for n in shape["notes"] if "multiplier" in n])
+        self.assertIn("children { childId share { multiplier } }", runner.build_query(shape, True))
+
+    def test_the_path_chosen_is_printed_in_the_shape_section(self):
+        data = {"S": {False: [], True: []}}
+        client = FakeClient(data, schema(nested=True))
+        result = runner.audit(client, {"AAA": "S"})
+        self.assertEqual(result["shape"]["multiplier_path"], ["share", "multiplier"])
+        self.assertEqual(result["shape"]["multiplier_chain"], "BillPayerChild.share -> ChildShare.multiplier")
+
+    def test_multiplier_entries_fill_in_from_the_nested_field(self):
+        flat = AuditTests().live()
+        data = {"S1": {False: [to_nested(n) for n in flat], True: [to_nested(n) for n in flat]}}
+        client = FakeClient(data, schema(nested=True))
+        result = runner.audit(client, {"AAA": "S1"})
+        false_ = result["sites"]["AAA"]["includeDeletedFalse"]
+        self.assertEqual(false_["multiplierEntries"], {"0.333": 3, "0.500": 4, "1.000": 6})
+        self.assertNotIn("@", json.dumps(result))
+
+    def test_a_missing_nested_multiplier_is_reported_not_guessed(self):
+        base = schema(nested=True)
+        for t in base["types"]:
+            if t["name"] == "ChildShare":
+                t["fields"] = [{"name": "other", "args": [], "type": _t("SCALAR", "String")}]
+        shape = runner.discover_shape({"data": {"__schema": base}})
+        self.assertIsNone(shape["multiplier_path"])
+        self.assertTrue(any("no multiplier" in n for n in shape["notes"]))
+
+
+class EqualMultiplierTests(unittest.TestCase):
+    def counts(self, nodes):
+        data = {"S": {False: nodes, True: nodes}}
+        client = FakeClient(data, schema(nested=True))
+        return runner.audit(client, {"AAA": "S"})["sites"]["AAA"]["includeDeletedFalse"]
+
+    def test_live_payers_with_two_or_more_children_by_equal_multipliers(self):
+        nodes = [to_nested(n) for n in [
+            node("a", "a@x.org", ["k1", "k2"], multipliers=[0.5, 0.5]),            # equal
+            node("b", "b@x.org", ["k3", "k4", "k5"], multipliers=[0.3333, 0.3333, 0.3334]),  # equal at 3 dp
+            node("c", "c@x.org", ["k6", "k7"], multipliers=[0.25, 0.75]),            # unequal
+            node("d", "d@x.org", ["k8"], multipliers=[1.0]),                          # one child: not counted
+            node("e", "e@x.org", ["k9", "k10"], multipliers=[0.5, 0.5], deleted=True),  # deleted: not counted
+        ]]
+        counts = self.counts(nodes)
+        self.assertEqual(counts["liveWith2PlusChildren"], 3)
+        self.assertEqual(counts["liveWith2PlusAllEqualMultipliers"], 2)
+        self.assertEqual(counts["liveWith2PlusUnequalMultipliers"], 1)
+        self.assertEqual(counts["liveWith2PlusMultiplierUnavailable"], 0)
+
+    def test_an_entry_without_a_readable_multiplier_is_counted_as_unavailable(self):
+        broken = to_nested(node("a", "a@x.org", ["k1", "k2"], multipliers=[0.5, 0.5]))
+        broken["children"][1]["share"] = None
+        counts = self.counts([broken])
+        self.assertEqual(counts["liveWith2PlusMultiplierUnavailable"], 1)
+        self.assertEqual(counts["liveWith2PlusAllEqualMultipliers"], 0)
+
+    def test_the_definitions_explain_the_new_counts(self):
+        data = {"S": {False: [], True: []}}
+        result = runner.audit(FakeClient(data, schema(nested=True)), {"AAA": "S"})
+        for key in ("liveWith2PlusAllEqualMultipliers", "liveWith2PlusUnequalMultipliers",
+                    "liveWith2PlusMultiplierUnavailable"):
+            self.assertIn(key, result["definitions"])
 
 
 class AuditTests(unittest.TestCase):
