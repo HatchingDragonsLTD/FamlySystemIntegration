@@ -1,0 +1,26 @@
+# READ-ONLY schema introspection. The runner keeps only the types whose name
+# mentions "bill", the root fields that mention it, and the fields of other types
+# that point at a bill payer; names, argument names and type names only.
+query ProbeBillPayerSchema {
+  __schema {
+    queryType { name }
+    mutationType { name }
+    types {
+      kind
+      name
+      fields {
+        name
+        args { name type { ...TypeRef } }
+        type { ...TypeRef }
+      }
+      inputFields { name type { ...TypeRef } }
+      enumValues { name }
+    }
+  }
+}
+
+fragment TypeRef on __Type {
+  kind
+  name
+  ofType { kind name ofType { kind name ofType { kind name ofType { kind name } } } }
+}
