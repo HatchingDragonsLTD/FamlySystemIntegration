@@ -23,6 +23,7 @@ could carry data.
     attempts           how many times a worker has taken the job
     last_error_code    a code
     approval_ref       the Slack message ref of the approval request
+    approval_nonce     random token of the CURRENT approval request; only its buttons count
     child_create_sent  1 once a child create request has been SENT for this job:
                        a job never sends a second one
     outcomes           JSON list of contact outcome codes
@@ -89,7 +90,8 @@ CREATE TABLE IF NOT EXISTS onboard_jobs (
     claimed_at        TEXT,
     created_at        TEXT NOT NULL,
     updated_at        TEXT NOT NULL,
-    source            TEXT NOT NULL DEFAULT 'cli'
+    source            TEXT NOT NULL DEFAULT 'cli',
+    approval_nonce    TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS onboard_one_active_per_deal
     ON onboard_jobs (deal_id)
@@ -100,7 +102,7 @@ CREATE INDEX IF NOT EXISTS onboard_jobs_by_status ON onboard_jobs (status, creat
 # Columns that update() may set.
 _UPDATABLE = {
     "plan_hash", "approved_hash", "child_id", "last_error_code", "approval_ref",
-    "outcomes", "mode",
+    "outcomes", "mode", "approval_nonce",
 }
 
 
@@ -121,6 +123,7 @@ class Job:
     created_at: str | None = None
     updated_at: str | None = None
     source: str = "cli"
+    approval_nonce: str | None = None
 
 
 def store_path() -> Path:
@@ -156,6 +159,8 @@ def _migrate(connection: sqlite3.Connection) -> None:
         connection.execute(
             "ALTER TABLE onboard_jobs ADD COLUMN source TEXT NOT NULL DEFAULT 'cli'"
         )
+    if "approval_nonce" not in columns:
+        connection.execute("ALTER TABLE onboard_jobs ADD COLUMN approval_nonce TEXT")
 
 
 SOURCES = ("cli", "webhook")
@@ -173,7 +178,7 @@ def _to_job(row: sqlite3.Row) -> Job:
         last_error_code=row["last_error_code"], approval_ref=row["approval_ref"],
         child_create_sent=bool(row["child_create_sent"]), outcomes=outcomes,
         created_at=row["created_at"], updated_at=row["updated_at"],
-        source=row["source"],
+        source=row["source"], approval_nonce=row["approval_nonce"],
     )
 
 

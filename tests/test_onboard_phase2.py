@@ -229,11 +229,13 @@ class FakeRest:
 class FakeNotifier:
     def __init__(self):
         self.gates = []      # (text, job_id, plan_hash)
+        self.nonces = []
         self.notices = []
         self.gate_ok = True
 
-    def gate(self, text, job_id, plan_hash):
+    def gate(self, text, job_id, plan_hash, nonce):
         self.gates.append((text, job_id, plan_hash))
+        self.nonces.append(nonce)
         return f"C1:{len(self.gates)}" if self.gate_ok else None
 
     def notice(self, text):
@@ -312,7 +314,7 @@ class Phase2Case(unittest.TestCase):
     def approve(self, job=None):
         job = store.get((job or self.job()).id)
         return approval.handle_click(
-            slack.ACTION_ONBOARD_APPROVE, approval.button_value(job.id, job.plan_hash), "U1")
+            slack.ACTION_ONBOARD_APPROVE, approval.button_value(job.id, job.plan_hash, job.approval_nonce), "U1")
 
     def run_to_approval(self):
         self.enqueue()
@@ -490,13 +492,56 @@ class GateATests(Phase2Case):
         self.assertIsNone(second.approved_hash)
         # The OLD message's button no longer works.
         stale = approval.handle_click(slack.ACTION_ONBOARD_APPROVE,
-                                      approval.button_value(first.id, first.plan_hash), "U1")
+                                      approval.button_value(first.id, first.plan_hash, first.approval_nonce), "U1")
         self.assertEqual(stale, approval.MSG_STALE)
         self.assertEqual(self.job().status, store.AWAITING_APPROVAL)
 
+    def test_an_old_message_for_the_same_plan_is_stale_once_the_job_asks_again(self):
+        first = self.run_to_approval()
+        old = approval.button_value(first.id, first.plan_hash, first.approval_nonce)
+        # The job goes back to waiting with the SAME plan hash and a new request.
+        store.set_status(first.id, store.QUEUED, approved_hash=None)
+        self.assertEqual(self.run_worker()["status"], store.AWAITING_APPROVAL)
+        again = self.job()
+        self.assertEqual(again.plan_hash, first.plan_hash)
+        self.assertNotEqual(again.approval_nonce, first.approval_nonce)
+        self.assertEqual(approval.handle_click(slack.ACTION_ONBOARD_APPROVE, old, "U1"),
+                         approval.MSG_STALE)
+        self.assertEqual(approval.handle_click(slack.ACTION_ONBOARD_REJECT, old, "U1"),
+                         approval.MSG_STALE)
+        self.assertEqual(self.job().status, store.AWAITING_APPROVAL)       # untouched
+        # The current message works, and a redelivery of the same click does nothing.
+        new = approval.button_value(again.id, again.plan_hash, again.approval_nonce)
+        self.assertEqual(approval.handle_click(slack.ACTION_ONBOARD_APPROVE, new, "U1"),
+                         approval.MSG_APPROVED)
+        self.assertEqual(approval.handle_click(slack.ACTION_ONBOARD_APPROVE, new, "U1"),
+                         approval.MSG_HANDLED)
+        self.assertEqual(self.run_worker()["status"], store.DONE)           # proceeds, no re-ask
+        self.assertEqual(len(self.famly.child_creates), 1)
+
+    def test_a_click_without_the_nonce_never_approves(self):
+        job = self.run_to_approval()
+        for value in (f"{job.id}:{job.plan_hash[:16]}", f"{job.id}:{job.plan_hash[:16]}:",
+                      f"{job.id}:{job.plan_hash[:16]}:wrong"):
+            self.assertEqual(approval.handle_click(slack.ACTION_ONBOARD_APPROVE, value, "U1"),
+                             approval.MSG_STALE)
+        self.assertEqual(self.job().status, store.AWAITING_APPROVAL)
+
+    def test_a_changed_plan_asks_once_not_in_a_loop_and_logs_the_changed_section(self):
+        self.run_to_approval()
+        self.approve()
+        self.hub.deals[DEAL]["actual_start_date_1"] = "2026-02-15"
+        self.hub.deals[DEAL]["child_date_of_birth"] = "2023-02-15"
+        self.assertEqual(self.run_worker()["status"], store.AWAITING_APPROVAL)     # asks once
+        self.assertEqual(len(self.notify.gates), 2)
+        self.assertTrue(any("sections=" in line and "digest=" in line for line in self.logs))
+        self.approve()                                       # the NEW message is approved
+        self.assertEqual(self.run_worker()["status"], store.DONE)    # and nothing asks again
+        self.assertEqual(len(self.notify.gates), 2)
+
     def test_clicks_are_idempotent_and_reject_writes_nothing(self):
         job = self.run_to_approval()
-        value = approval.button_value(job.id, job.plan_hash)
+        value = approval.button_value(job.id, job.plan_hash, job.approval_nonce)
         self.assertEqual(approval.handle_click(slack.ACTION_ONBOARD_APPROVE, value, "U1"),
                          approval.MSG_APPROVED)
         self.assertEqual(approval.handle_click(slack.ACTION_ONBOARD_APPROVE, value, "U1"),
@@ -508,7 +553,7 @@ class GateATests(Phase2Case):
 
         store._reset_for_tests()
         job = self.run_to_approval()
-        value = approval.button_value(job.id, job.plan_hash)
+        value = approval.button_value(job.id, job.plan_hash, job.approval_nonce)
         self.assertEqual(approval.handle_click(slack.ACTION_ONBOARD_REJECT, value, "U1"),
                          approval.MSG_REJECTED)
         self.assertEqual((self.job().status, self.job().last_error_code),
@@ -1109,7 +1154,7 @@ class GuaranteeTests(Phase2Case):
         self.assertEqual(columns, ["id", "deal_id", "status", "mode", "plan_hash", "approved_hash",
                                    "child_id", "attempts", "last_error_code", "approval_ref",
                                    "child_create_sent", "outcomes", "claimed_at", "created_at",
-                                   "updated_at", "source"])
+                                   "updated_at", "source", "approval_nonce"])
 
     def test_the_famly_writers_are_create_only_and_the_fake_would_catch_anything_else(self):
         for path in (famly_writes.CREATE_CHILD_QUERY, famly_writes.CREATE_CONTACT_QUERY):
@@ -1137,7 +1182,8 @@ class GuaranteeTests(Phase2Case):
         import web_registry
         job = self.run_to_approval()
         text = web_registry.handle_slack_click(
-            slack.ACTION_ONBOARD_APPROVE, approval.button_value(job.id, job.plan_hash), "U1")
+            slack.ACTION_ONBOARD_APPROVE,
+            approval.button_value(job.id, job.plan_hash, job.approval_nonce), "U1")
         self.assertEqual(text, approval.MSG_APPROVED)
         server_source = Path("server.py").read_text(encoding="utf-8")
         self.assertIn("*slack.ONBOARD_ACTIONS", server_source)

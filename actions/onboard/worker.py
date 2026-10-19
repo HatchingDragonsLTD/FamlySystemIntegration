@@ -54,7 +54,10 @@ that needs it, and never stored, logged or put in Slack. A log line here carries
 codes, ids and exception TYPE names only.
 """
 
+import hashlib
+import json
 import logging
+import secrets
 import time
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -102,7 +105,7 @@ class Deps:
     hubspot: Any                 # HubSpotDealWriter: the reads, plus the one writer
     public: Any                  # public-API GraphQL client (reads and the two creates)
     rest: Any                    # internal REST client (the child summary)
-    notifier: Any                # .gate(text, job_id, plan_hash) -> ref | None; .notice(text)
+    notifier: Any                # .gate(text, job_id, plan_hash, nonce) -> ref | None; .notice(text)
     famly_factory: Callable[[], FamlyReads] | None = None
 
     def famly(self) -> FamlyReads:
@@ -263,12 +266,26 @@ def _webhook_hold_reason(deps, deal_id: str) -> str | None:
     return STAGE_NOT_ELIGIBLE
 
 
+def plan_section_hashes(plan: dict) -> dict:
+    """A short hash per top-level plan section (hashes only, no personal data), logged
+    on every ask so a plan that changes between runs names the section that did."""
+    return {
+        key: hashlib.sha256(json.dumps(value, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:8]
+        for key, value in sorted(plan.items())
+    }
+
+
 def _ask_for_approval(job, deps, plan, digest, run_mode, plan_changed: bool) -> None:
-    store.set_status(job.id, store.AWAITING_APPROVAL, plan_hash=digest, approved_hash=None)
+    # A fresh nonce per ask: only THIS message's buttons can approve it.
+    nonce = secrets.token_hex(8)
+    store.set_status(job.id, store.AWAITING_APPROVAL, plan_hash=digest, approved_hash=None,
+                     approval_nonce=nonce)
+    logger.info("onboard: approval asked job=%s plan_changed=%s digest=%s sections=%s",
+                job.id, plan_changed, digest, plan_section_hashes(plan))
     text = notifier_mod.gate_text(
         plan, digest, run_mode, plan_changed=plan_changed,
         this_job_child_id=_this_jobs_child(job))
-    ref = deps.notifier.gate(text, job.id, digest)
+    ref = deps.notifier.gate(text, job.id, digest, nonce)
     if ref is None:
         # Nobody can approve a message that never arrived: do not wait for it.
         store.set_status(job.id, store.HELD, last_error_code="approval_request_not_posted")
