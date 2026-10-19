@@ -79,7 +79,7 @@ Child origin (decides what happens to unmatched contacts):
 6. Read-back per contact: appears exactly once with the expected email. A rejected or unlanded create stops the remaining contacts and the job ends needs_review. The child is never rolled back.
 
 ### H. HubSpot write-back (live only)
-- Before any Famly write, list the deal properties and fail closed if any of the four are missing: `famly_childid`, `famly_sync_status`, `famly_sync_note`, `famly_sync_gaps`. Status must accept `child_ready`, `contacts_linked`, `needs_attention` as internal values.
+- Before any Famly write, list the deal properties and fail closed if any of the four are missing: `famly_childid`, `famly_sync_status`, `famly_sync_note`, `famly_sync_gaps`. Status must accept `child_ready`, `contacts_linked`, `needs_attention` as internal values. `famly_sync_note` and `famly_sync_gaps` are plain multi-line text (the job writes plain-English sentences, no codes).
 - Note and gaps hold codes only.
 - A write-back failure after Famly writes is needs_review (`hubspot_writeback_failed`) and never causes a Famly retry. The write-back alone is idempotent.
 

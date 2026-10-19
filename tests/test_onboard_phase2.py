@@ -25,7 +25,7 @@ from unittest import mock
 import requests
 
 from actions.onboard import (
-    approval, config, famly_writes, hubspot_sync, inputs, notifier, phone, store,
+    approval, config, famly_writes, hubspot_sync, inputs, messages, notifier, phone, store,
     summary_check, worker,
 )
 from actions.onboard import cli_enqueue
@@ -673,7 +673,9 @@ class GateATests(Phase2Case):
         self.assertTrue(any("site_unmapped" in n for n in self.notify.notices))
         # Live + allowlisted: the held state is also written to HubSpot, as codes.
         self.assertEqual(self.written()["famly_sync_status"], "needs_attention")
-        self.assertEqual(self.written()["famly_sync_note"], "held:site_unmapped")
+        self.assertEqual(self.written()["famly_sync_note"],
+                         "Not started. Nothing was created in Famly. "
+                         + messages.lookup("site_unmapped")[1])
 
 
 # --------------------------------------------------------------------------- #
@@ -823,13 +825,13 @@ class ReadBackTests(Phase2Case):
         result = self.run_through()
         self.assertEqual(result["status"], store.DONE)              # not held, not stopped
         self.assertEqual(len(self.famly.contact_creates), 2)
-        self.assertIn("summary_group_mismatch", self.written()["famly_sync_gaps"])
+        self.assertIn(messages.lookup("summary_group_mismatch")[1], self.written()["famly_sync_gaps"])
         self.assertTrue(any("summary_group_mismatch" in n for n in self.notify.notices))
 
     def test_an_unrecognised_or_unreadable_summary_is_flagged_too(self):
         self.rest.custom = {"weird": {"shape": 1}}
         self.assertEqual(self.run_through()["status"], store.DONE)
-        self.assertIn("summary_unrecognised", self.written()["famly_sync_gaps"])
+        self.assertIn(messages.lookup("summary_unrecognised")[1], self.written()["famly_sync_gaps"])
         store._reset_for_tests()
         self.famly.children.clear()
         self.famly.child_creates.clear()
@@ -837,7 +839,7 @@ class ReadBackTests(Phase2Case):
         self.rest.custom = None
         self.rest.error = RestHTTPError("boom", 500, "")
         self.assertEqual(self.run_through()["status"], store.DONE)
-        self.assertIn("summary_unreadable", self.written()["famly_sync_gaps"])
+        self.assertIn(messages.lookup("summary_unreadable")[1], self.written()["famly_sync_gaps"])
 
     def test_summary_flags_unit_cases(self):
         base = {"child": {"groupId": "g", "startDate": "2026-01-15", "endDate": "2028-08-31",
@@ -914,7 +916,7 @@ class ContactTests(Phase2Case):
                                             "city": "London", "country": "United Kingdom"})
         self.assertNotIn("address", second)            # c2 has none: the whole address is omitted
         gaps = [w for d, w in self.hub.writes][-1]["famly_sync_gaps"]
-        self.assertIn("address_incomplete", gaps)
+        self.assertIn(messages.lookup("address_incomplete")[1], gaps)
 
     def test_address_and_country_rules_unit(self):
         def contact(**props):
@@ -981,7 +983,8 @@ class ContactTests(Phase2Case):
         self.assertEqual(self.job().child_id, "child-1")             # the child stays
         written = self.written()
         self.assertEqual(written["famly_sync_status"], "needs_attention")
-        self.assertIn("contact_name_incomplete", written["famly_sync_note"])
+        self.assertIn(messages.lookup("contact_name_incomplete")[1], written["famly_sync_note"])
+        self.assertTrue(written["famly_sync_note"].startswith("Needs attention. Child created in Famly."))
 
     def test_an_unknown_contact_outcome_that_did_not_land_needs_review(self):
         def lose_ada(payload):
@@ -1133,20 +1136,28 @@ class WriteBackTests(Phase2Case):
                 self.assertEqual(self.job().outcomes, ["c1:created", "c2:created"])
 
     def test_a_status_dropdown_that_does_not_offer_a_value_skips_only_that_write(self):
-        self.hub.defs["famly_sync_status"]["options"] = ["queued", "child_ready"]
+        self.hub.defs["famly_sync_status"]["options"] = ["child_ready", "needs_attention"]
         result = self.run_through()
         self.assertEqual(result["status"], store.DONE)
         self.assertEqual(self.written()["famly_sync_status"], "child_ready")   # contacts_linked skipped
         self.assertIn("value_not_offered:famly_sync_status:contacts_linked", " ".join(self.notify.notices))
         self.assertEqual(len(self.famly.contact_creates), 2)
 
-    def test_a_gaps_checkbox_only_gets_the_codes_it_offers(self):
-        self.hub.defs["famly_sync_gaps"]["options"] = ["phone_missing", "address_incomplete"]
+    def test_gaps_and_note_are_plain_english_text_and_status_is_one_of_three_values(self):
         self.rest.wrong_group = True                                 # adds a summary flag
         self.run_through()
-        gaps = self.written()["famly_sync_gaps"].split(";")
-        self.assertLessEqual(set(gaps), {"phone_missing", "address_incomplete"})
-        self.assertIn("gap_not_offered:summary_group_mismatch", " ".join(self.notify.notices))
+        written = self.written()
+        self.assertIn(written["famly_sync_status"], hubspot_sync.STATUS_OPTIONS)
+        self.assertEqual(hubspot_sync.STATUS_OPTIONS,
+                         ("child_ready", "contacts_linked", "needs_attention"))
+        gaps = written["famly_sync_gaps"]
+        for line in gaps.split("\n"):
+            self.assertTrue(line.endswith("."), line)                # sentences, one per line
+        self.assertIn(messages.lookup("summary_group_mismatch")[1], gaps.split("\n"))
+        for text in (gaps, written["famly_sync_note"]):
+            self.assertNotRegex(text, r"[a-z]+_[a-z_]+")             # no raw code in the text
+            self.assertNotIn(";", text)
+        self.assertNotIn("gap_not_offered", " ".join(self.notify.notices))
 
     def test_a_property_listing_failure_never_blocks_famly_either(self):
         self.hub.defs_error = HubSpotError("GET failed with HTTP 500", 500)
@@ -1180,13 +1191,17 @@ class WriteBackTests(Phase2Case):
             self.assertLessEqual(set(props), hubspot.WRITABLE_DEAL_PROPERTIES)
         order = [p for _d, props in self.hub.writes for p in props]
         self.assertEqual(order[:3], ["famly_childid", "end_date", "famly_sync_status"])
-        self.assertEqual(self.written()["famly_sync_note"], "phase2_done")
+        self.assertEqual(self.written()["famly_sync_note"],
+                         "Done. Child created in Famly. 2 contact(s) created, 0 already present.")
         # Re-running a property write sends the same value.
         syncer = hubspot_sync.Syncer(self.hub, DEAL)
         for _ in range(2):
             syncer.write("famly_sync_status", "contacts_linked")
-            syncer.write_gaps(["b", "a", "a"])
-        self.assertEqual(self.hub.writes[-1][1], {"famly_sync_gaps": "a;b"})
+            syncer.write_gaps(["phone_missing", "no_quote", "no_quote", "value_not_offered:x:y"])
+        self.assertEqual(self.hub.writes[-1][1], {"famly_sync_gaps": (
+            messages.lookup("no_quote")[1] + "\n" + messages.lookup("phone_missing")[1])})
+        # Configuration (admin) items are never written to the deal.
+        self.assertNotIn("HubSpot", self.hub.writes[-1][1]["famly_sync_gaps"])
 
     def test_there_is_no_write_back_in_dry_mode(self):
         self.mode("dry")
@@ -1393,7 +1408,8 @@ class ExistingChildRuleTests(Phase2Case):
         self.assertFalse(self.famly.child_creates or self.famly.contact_creates)
         self.assertTrue(any("contact_unmatched_on_existing_child" in n for n in self.notify.notices))
         self.assertEqual(self.written()["famly_sync_note"],
-                         "held:contact_unmatched_on_existing_child")
+                         "Not started. Nothing was created in Famly. "
+                         + messages.lookup("contact_unmatched_on_existing_child")[1])
         # Candidate ids live in the plan only; no email or name reaches Slack or the DB.
         blob = self.all_output()
         for value in PII:

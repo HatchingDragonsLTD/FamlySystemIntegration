@@ -29,15 +29,18 @@ Nothing is retried by the job. (The HubSpot client's own transport backoff on a
 import logging
 from dataclasses import dataclass, field
 
+from actions.onboard import messages
 from core import hubspot
 from core.hubspot import HubSpotDealWriter, HubSpotError
 
 logger = logging.getLogger(__name__)
 
-STATUS_QUEUED = "queued"
-STATUS_CHILD_READY = "child_ready"
-STATUS_CONTACTS_LINKED = "contacts_linked"
-STATUS_NEEDS_ATTENTION = "needs_attention"
+# `famly_sync_status` is a HubSpot DROPDOWN with exactly these internal values
+# (labels in the comment): the only values this job ever writes.
+STATUS_CHILD_READY = "child_ready"                # "Child created in Famly"
+STATUS_CONTACTS_LINKED = "contacts_linked"        # "Child and contacts in Famly"
+STATUS_NEEDS_ATTENTION = "needs_attention"        # "Needs attention"
+STATUS_OPTIONS = (STATUS_CHILD_READY, STATUS_CONTACTS_LINKED, STATUS_NEEDS_ATTENTION)
 
 # The properties the pre-flight looks for.
 CHECKED = tuple(sorted(hubspot.WRITABLE_DEAL_PROPERTIES))
@@ -81,9 +84,32 @@ def preflight(writer: HubSpotDealWriter) -> Preflight:
 
 
 def gaps_value(codes) -> str:
-    """Codes as one value: sorted, de-duplicated, ';' separated (the format a
-    HubSpot multiple-checkbox property takes)."""
-    return ";".join(sorted({str(c) for c in codes if c}))
+    """The things to check, as plain-English sentences, one per line, for the
+    `famly_sync_gaps` TEXT property. Staff-facing items only: configuration (admin)
+    codes are never written to the deal. Empty when there is nothing to check."""
+    return "\n".join(messages.classify(codes)[messages.CHECK])
+
+
+def _sentences(codes) -> str:
+    shown = messages.classify(codes)
+    return " ".join(shown[messages.NOT_DONE] + shown[messages.CHECK])
+
+
+def note_done(summary: str) -> str:
+    """The `famly_sync_note` text when everything was done."""
+    return f"Done. {summary}"
+
+
+def note_needs_attention(summary: str, codes) -> str:
+    """The note when the Famly work is done but something was not."""
+    detail = _sentences(codes)
+    return f"Needs attention. {summary}" + (f" {detail}" if detail else "")
+
+
+def note_not_started(codes) -> str:
+    """The note when the deal was held and nothing was created."""
+    detail = _sentences(codes)
+    return "Not started. Nothing was created in Famly." + (f" {detail}" if detail else "")
 
 
 class Syncer:
@@ -121,18 +147,11 @@ class Syncer:
         return True
 
     def write_gaps(self, codes) -> bool:
-        """The gap codes. If the property is a checkbox that offers fixed values,
-        only the offered ones are written and the rest are reported."""
-        wanted = sorted({str(c) for c in codes if c})
-        offered = self.pre.options.get(hubspot.SYNC_GAPS_PROPERTY)
-        if offered:
-            for code in wanted:
-                if code not in offered:
-                    self.reports.append(f"gap_not_offered:{code}")
-            wanted = [c for c in wanted if c in offered]
-        return self.write(hubspot.SYNC_GAPS_PROPERTY, gaps_value(wanted))
+        """The things to check, as plain-English sentences (see `gaps_value`)."""
+        return self.write(hubspot.SYNC_GAPS_PROPERTY, gaps_value(codes))
 
     def write_status(self, status: str, note: str, gaps) -> None:
+        """`status` is one of STATUS_OPTIONS; `note` and the gaps are plain English."""
         self.write(hubspot.SYNC_STATUS_PROPERTY, status)
         self.write(hubspot.SYNC_NOTE_PROPERTY, note)
         self.write_gaps(gaps)
