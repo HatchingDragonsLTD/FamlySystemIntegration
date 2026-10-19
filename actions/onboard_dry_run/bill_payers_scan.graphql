@@ -1,0 +1,24 @@
+# READ-ONLY. One site's bill payers for the onboarding bill payer stage.
+# includeDeleted is ALWAYS passed explicitly (the server default is TRUE and returns
+# archived payers). Never select socialSecurityNumber, accountNumber or sortCode (the
+# token cannot read the first and none is needed). `# DETAILS` is replaced by the
+# optional ONBOARD_BILL_PAYER_DETAIL_SELECTION (the name / phone fields to compare).
+query OnboardBillPayers($siteIds: [SiteId!]!, $next: BillPayerCursor, $includeDeleted: Boolean!) {
+  billPayers {
+    listBySiteIds(siteIds: $siteIds, nextToken: $next, includeDeleted: $includeDeleted) {
+      result {
+        billPayerId
+        email
+        deletedAt
+        children {
+          childId
+          share {
+            multiplier
+          }
+        }
+        # DETAILS
+      }
+      next
+    }
+  }
+}

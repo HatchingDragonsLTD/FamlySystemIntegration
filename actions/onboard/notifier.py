@@ -67,6 +67,15 @@ def gate_text(
         f"Child: {child_state} · Contacts: {len(contacts)} ({creating} to create, "
         f"{present} present) · Bill payer identified: {'yes' if bill_payer else 'no'}"
     )
+    bill_payer = plan.get("billPayer")
+    if isinstance(bill_payer, dict):
+        status = bill_payer.get("status")
+        lines.append("Bill payer: " + {
+            "would_create": "would be created in Famly",
+            "would_attach": "an existing bill payer would be linked to the child",
+            "present": "already linked to the child in Famly",
+        }.get(status, "needs a person (see the warnings)")
+            + (f" · different details: {', '.join(bill_payer['differs'])}" if bill_payer.get("differs") else ""))
     shown = messages.classify(plan.get("warnings") or [])
     sentences = shown[messages.NOT_DONE] + shown[messages.CHECK]
     lines.append("Warnings: " + (" ".join(sentences) if sentences else "none"))

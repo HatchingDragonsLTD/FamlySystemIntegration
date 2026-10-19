@@ -27,7 +27,7 @@ import logging
 from collections import Counter
 from typing import Any
 
-from actions.onboard_dry_run import derive, links
+from actions.onboard_dry_run import bill_payers, derive, links
 from actions.onboard_dry_run.famly_reads import (
     FamlyReads,
     local_part,
@@ -151,6 +151,8 @@ class DryRun:
             self._check_creatable(deal, plan)
             self._check_possible_duplicate(deal, plan)
         plan["contacts"] = self._contacts(deal_id, plan["child"], plan, context)
+        if bill_payers.enabled() and plan.get("siteId"):
+            self._bill_payer(plan, context)
         plan["quotes"], quote_warnings = links.quote_summary(
             self._hubspot, self.labels(), deal_id
         )
@@ -162,6 +164,19 @@ class DryRun:
             plan["stage"]["depositAmount"] is None
         ):
             warnings.append("deposit_amount_missing")
+
+    def _bill_payer(self, plan: dict, context: dict) -> None:
+        """The bill payer decision at PLAN time (ONBOARD_BILL_PAYER=on): the child's site
+        only, live payers, canonical email. Flags never hold the plan: they are warnings
+        and the stage ends `needs_review`. The plan carries a status, a flag code, the
+        matched id and a match count (ids and counts only)."""
+        child = plan["child"]
+        child_id = child.get("famlyChildId") if child.get("status") == CHILD_FOUND else None
+        payers = self._famly.bill_payers(plan["siteId"])
+        decision = bill_payers.decide(context.get("contacts") or [], payers, child_id)
+        plan["billPayer"] = decision.as_plan()
+        if decision.flag:
+            plan["warnings"].append(decision.flag)
 
     # -- derivations ---------------------------------------------------- #
     def _stage(self, deal: dict) -> dict:
@@ -536,6 +551,10 @@ def hashed_plan(plan: dict) -> dict:
     """The part of the plan that is hashed: the plan without the display-only
     contact fields. Everything else, every list in it in canonical order, is in."""
     view = dict(plan)
+    if isinstance(view.get("billPayer"), dict):
+        # The field NAMES that differ are shown, not approved: only the decision, the
+        # matched id and the candidate count are part of the digest.
+        view["billPayer"] = {k: v for k, v in view["billPayer"].items() if k != "differs"}
     if isinstance(view.get("contacts"), list):
         view["contacts"] = [
             {k: v for k, v in c.items() if k not in UNHASHED_CONTACT_FIELDS}

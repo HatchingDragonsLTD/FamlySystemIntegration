@@ -84,6 +84,16 @@ class FamlyReads:
             self._site_ids = urn_runner._all_institution_ids()
         return self._site_ids
 
+    def bill_payers(self, site_id: str):
+        """The site's LIVE bill payers (all pages, includeDeleted false), or None if the
+        scan failed. A fresh read every call: never cached, never the roster cache."""
+        from actions.onboard_dry_run import bill_payers as scan
+
+        try:
+            return scan.scan_site(self._public(), site_id)
+        except scan.ScanFailed:
+            return None
+
     # -- child lookup --------------------------------------------------- #
     def children_by_deal_id(self, deal_id: str) -> list[str]:
         """Child ids whose external system reference is HUBSPOT = `deal_id`."""
