@@ -282,8 +282,12 @@ def plan_section_hashes(plan: dict) -> dict:
 def _ask_for_approval(job, deps, plan, digest, run_mode, plan_changed: bool) -> None:
     # A fresh nonce per ask: only THIS message's buttons can approve it.
     nonce = secrets.token_hex(8)
-    store.set_status(job.id, store.AWAITING_APPROVAL, plan_hash=digest, approved_hash=None,
-                     approval_nonce=nonce)
+    # Compare-and-set: only the run that still holds the claim may ask. A run that
+    # lagged (the job was approved, re-claimed or finished meanwhile) does nothing.
+    if not store.begin_approval_wait(job.id, job.claimed_at, digest, nonce):
+        logger.warning("onboard: approval ask skipped job=%s: the job moved on or was re-claimed",
+                       job.id)
+        return
     logger.info("onboard: approval asked job=%s plan_changed=%s digest=%s sections=%s",
                 job.id, plan_changed, digest, plan_section_hashes(plan))
     text = notifier_mod.gate_text(
@@ -292,9 +296,10 @@ def _ask_for_approval(job, deps, plan, digest, run_mode, plan_changed: bool) -> 
     ref = deps.notifier.gate(text, job.id, digest, nonce)
     if ref is None:
         # Nobody can approve a message that never arrived: do not wait for it.
-        store.set_status(job.id, store.HELD, last_error_code="approval_request_not_posted")
+        store.transition(job.id, store.AWAITING_APPROVAL, store.HELD,
+                         last_error_code="approval_request_not_posted", approval_nonce=None)
         return
-    store.update(job.id, approval_ref=ref)
+    store.set_approval_ref(job.id, nonce, ref)
 
 
 def _write_phase(job, deps, plan, context, digest) -> dict:

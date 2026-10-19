@@ -519,6 +519,44 @@ class GateATests(Phase2Case):
         self.assertEqual(self.run_worker()["status"], store.DONE)           # proceeds, no re-ask
         self.assertEqual(len(self.famly.child_creates), 1)
 
+    def _lagging_ask(self, job):
+        plan = {"dealId": DEAL, "contacts": [], "child": {}, "dates": {}, "warnings": []}
+        worker._ask_for_approval(job, self.deps, plan, "f" * 64, "live", plan_changed=False)
+
+    def test_a_lagging_run_cannot_clear_an_approval_or_drag_a_job_back_to_waiting(self):
+        self.enqueue()
+        lagging = store.claim_next()                       # a run that is slow to finish
+        # Meanwhile the job was asked and approved by another run and a click.
+        store.set_status(lagging.id, store.AWAITING_APPROVAL, plan_hash="a" * 64,
+                         approval_nonce="n1")
+        self.assertTrue(store.transition(lagging.id, store.AWAITING_APPROVAL, store.QUEUED,
+                                         approved_hash="a" * 64, approval_nonce=None))
+        self._lagging_ask(lagging)
+        after = self.job()
+        self.assertEqual((after.status, after.approved_hash), (store.QUEUED, "a" * 64))
+        self.assertEqual(self.notify.gates, [])            # nothing was posted
+
+    def test_a_run_whose_claim_was_taken_again_cannot_ask(self):
+        self.enqueue()
+        old = store.claim_next()
+        store.set_status(old.id, store.QUEUED)             # released, then claimed anew
+        current = store.claim_next()
+        self.assertNotEqual(old.claimed_at, current.claimed_at)
+        self._lagging_ask(old)
+        self.assertEqual(self.job().status, store.QUEUED)
+        self.assertEqual(self.notify.gates, [])
+        self._lagging_ask(current)                         # the holder of the claim may
+        self.assertEqual(self.job().status, store.AWAITING_APPROVAL)
+        self.assertEqual(len(self.notify.gates), 1)
+
+    def test_a_finished_job_is_never_dragged_back_to_waiting(self):
+        self.run_through()
+        done = self.job()
+        self.assertEqual(done.status, store.DONE)
+        self._lagging_ask(done)
+        self.assertEqual(self.job().status, store.DONE)
+        self.assertEqual(len(self.notify.gates), 1)
+
     def test_a_click_without_the_nonce_never_approves(self):
         job = self.run_to_approval()
         for value in (f"{job.id}:{job.plan_hash[:16]}", f"{job.id}:{job.plan_hash[:16]}:",
