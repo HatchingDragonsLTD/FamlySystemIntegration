@@ -103,7 +103,6 @@ _PREFIX: tuple[tuple[str, str, str], ...] = (
     ("missing:", ADMIN, "A HubSpot deal property the job writes to does not exist."),
     ("skipped:", ADMIN, "A HubSpot update was skipped because its deal property does not exist."),
     ("value_not_offered:", ADMIN, "A HubSpot dropdown does not offer a value the job tried to write."),
-    ("gap_not_offered:", ADMIN, "A HubSpot checkbox property does not offer a value the job tried to write."),
     ("write_failed:", ADMIN, "A HubSpot update failed."),
 )
 

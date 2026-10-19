@@ -368,11 +368,14 @@ def _write_phase(job, deps, plan, context, digest) -> dict:
 
     bad_codes = sorted({o.split(":", 1)[1] for o in outcomes if o.split(":", 1)[1] not in OK_OUTCOMES})
     gaps = list(plan["warnings"]) + contact_warnings + flags
+    contact_codes = [o.split(":", 1)[1] for o in outcomes]
+    summary = _summary_line(child.created, contact_codes)
     if all_ok:
-        syncer.write_status(hubspot_sync.STATUS_CONTACTS_LINKED, "phase2_done", gaps)
+        syncer.write_status(hubspot_sync.STATUS_CONTACTS_LINKED,
+                            hubspot_sync.note_done(summary), gaps)
     else:
         syncer.write_status(hubspot_sync.STATUS_NEEDS_ATTENTION,
-                            "phase2_needs_review:" + ",".join(bad_codes), gaps)
+                            hubspot_sync.note_needs_attention(summary, bad_codes), gaps)
 
     # The job ends needs_review if any contact failed, or if the child id or a
     # defaulted end date could not be written to the deal. The Famly work is done
@@ -382,8 +385,6 @@ def _write_phase(job, deps, plan, context, digest) -> dict:
         failures.append("contact_outcomes")
     if syncer.critical_failed:
         failures.append("hubspot_writeback_failed")
-    contact_codes = [o.split(":", 1)[1] for o in outcomes]
-    summary = _summary_line(child.created, contact_codes)
     codes = (bad_codes + [f for f in failures if f != "contact_outcomes"] + flags
              + syncer.reports + list(plan["warnings"]) + contact_warnings
              + ["created" if child.created else "child_existed"])
@@ -644,7 +645,7 @@ def _held(job, deps, reasons: list[str], write_back: bool) -> None:
         # Best effort, one property per request: a held deal is visible in HubSpot too,
         # and a HubSpot problem is only ever reported, never an error here.
         hubspot_sync.Syncer(deps.hubspot, job.deal_id).write_status(
-            hubspot_sync.STATUS_NEEDS_ATTENTION, "held:" + ",".join(reasons), [])
+            hubspot_sync.STATUS_NEEDS_ATTENTION, hubspot_sync.note_not_started(reasons), [])
 
 
 def _end(job, deps, status: str, code: str, detail: list[str] | None = None) -> None:

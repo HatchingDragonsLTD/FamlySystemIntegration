@@ -104,7 +104,7 @@ def _emitted_codes() -> set[str]:
 DYNAMIC_EXAMPLES = [
     "child_http_400", "child_http_503", "contact_http_400", "child_graphql_error",
     "contact_graphql_error", "missing:famly_sync_status", "skipped:famly_childid",
-    "value_not_offered:famly_sync_status:contacts_linked", "gap_not_offered:no_quote",
+    "value_not_offered:famly_sync_status:contacts_linked",
     "write_failed:famly_sync_note",
 ]
 # Codes written to the jobs table or log from places the scan does not read.
@@ -151,15 +151,14 @@ class EveryCodeHasASentenceTests(unittest.TestCase):
 
     def test_configuration_codes_are_admin_not_staff(self):
         for code in ("value_not_offered:famly_sync_status:contacts_linked",
-                     "gap_not_offered:no_quote", "missing:famly_sync_gaps", "skipped:famly_sync_note",
+                     "missing:famly_sync_gaps", "skipped:famly_sync_note",
                      "write_failed:famly_sync_note", "preflight_failed"):
             self.assertEqual(messages.lookup(code)[0], messages.ADMIN, code)
 
 
 class StaffMessageTests(Phase2Case):
     EXAMPLE = ["created", "summary_start_mismatch", "value_not_offered:famly_sync_status:contacts_linked",
-               "gap_not_offered:deposit_amount_missing", "gap_not_offered:no_quote",
-               "gap_not_offered:phone_unnormalised", "deposit_amount_missing", "no_quote",
+               "deposit_amount_missing", "no_quote",
                "phone_unnormalised"]
 
     def test_the_staff_message_lists_sentences_and_keeps_admin_codes_out(self):
@@ -169,7 +168,6 @@ class StaffMessageTests(Phase2Case):
         self.assertIn("• No deposit amount is set on the deal.", text)
         self.assertIn("• No quote is attached to the deal.", text)
         self.assertNotIn("value_not_offered", text)
-        self.assertNotIn("gap_not_offered", text)
         body = text.split("_Codes:")[0]
         for code in ("summary_start_mismatch", "deposit_amount_missing", "phone_unnormalised"):
             self.assertNotIn(code, body)                           # sentences, not codes
