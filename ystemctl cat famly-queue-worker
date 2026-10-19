@@ -1,0 +1,397 @@
+[0;4mUNIT FILE                                   [0m[0;4m [0m[0;4mSTATE          [0m[0;4m [0m[0;4mPRESET  [0m
+[0;4mproc-sys-fs-binfmt_misc.automount           [0m[0;4m [0m[0;4mstatic         [0m[0;4m [0m[0;4;38;5;245m-       [0m
+-.mount                                      generated       [0;38;5;245m-       [0m
+boot-efi.mount                               generated       [0;38;5;245m-       [0m
+boot.mount                                   generated       [0;38;5;245m-       [0m
+dev-hugepages.mount                          static          [0;38;5;245m-       [0m
+dev-mqueue.mount                             static          [0;38;5;245m-       [0m
+proc-sys-fs-binfmt_misc.mount                [0;1;31mdisabled       [0m[0;1;31m [0m[0;1;31mdisabled[0m
+sys-fs-fuse-connections.mount                static          [0;38;5;245m-       [0m
+sys-kernel-config.mount                      static          [0;38;5;245m-       [0m
+sys-kernel-debug.mount                       static          [0;38;5;245m-       [0m
+[0;4msys-kernel-tracing.mount                    [0m[0;4m [0m[0;4mstatic         [0m[0;4m [0m[0;4;38;5;245m-       [0m
+apport-autoreport.path                       [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+systemd-ask-password-console.path            static          [0;38;5;245m-       [0m
+systemd-ask-password-plymouth.path           static          [0;38;5;245m-       [0m
+systemd-ask-password-wall.path               static          [0;38;5;245m-       [0m
+[0;4mtpm-udev.path                               [0m[0;4m [0m[0;1;4;32menabled        [0m[0;1;4;32m [0m[0;1;4;32menabled [0m
+[0;4msession-9909.scope                          [0m[0;4m [0m[0;4mtransient      [0m[0;4m [0m[0;4;38;5;245m-       [0m
+apparmor.service                             [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+apport-autoreport.service                    static          [0;38;5;245m-       [0m
+apport-coredump-hook@.service                static          [0;38;5;245m-       [0m
+apport-forward@.service                      static          [0;38;5;245m-       [0m
+apport.service                               [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+apt-daily-upgrade.service                    static          [0;38;5;245m-       [0m
+apt-daily.service                            static          [0;38;5;245m-       [0m
+apt-news.service                             static          [0;38;5;245m-       [0m
+autovt@.service                              [0;1;32malias          [0m[0;1;32m [0m[0;38;5;245m-       [0m
+blk-availability.service                     [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+bolt.service                                 static          [0;38;5;245m-       [0m
+caddy-api.service                            [0;1;31mdisabled       [0m[0;1;31m [0m[0;1;32menabled [0m
+caddy.service                                [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+cloud-config.service                         [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+cloud-final.service                          [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+cloud-init-hotplugd.service                  static          [0;38;5;245m-       [0m
+cloud-init-local.service                     [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+cloud-init.service                           [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+console-getty.service                        [0;1;31mdisabled       [0m[0;1;31m [0m[0;1;31mdisabled[0m
+console-setup.service                        [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+container-getty@.service                     static          [0;38;5;245m-       [0m
+cron.service                                 [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+cryptdisks-early.service                     [0;1;31mmasked         [0m[0;1;31m [0m[0;1;32menabled [0m
+cryptdisks.service                           [0;1;31mmasked         [0m[0;1;31m [0m[0;1;32menabled [0m
+dbus-org.freedesktop.hostname1.service       [0;1;32malias          [0m[0;1;32m [0m[0;38;5;245m-       [0m
+dbus-org.freedesktop.locale1.service         [0;1;32malias          [0m[0;1;32m [0m[0;38;5;245m-       [0m
+dbus-org.freedesktop.login1.service          [0;1;32malias          [0m[0;1;32m [0m[0;38;5;245m-       [0m
+dbus-org.freedesktop.ModemManager1.service   [0;1;32malias          [0m[0;1;32m [0m[0;38;5;245m-       [0m
+dbus-org.freedesktop.resolve1.service        [0;1;32malias          [0m[0;1;32m [0m[0;38;5;245m-       [0m
+dbus-org.freedesktop.timedate1.service       [0;1;32malias          [0m[0;1;32m [0m[0;38;5;245m-       [0m
+dbus-org.freedesktop.timesync1.service       [0;1;32malias          [0m[0;1;32m [0m[0;38;5;245m-       [0m
+dbus.service                                 static          [0;38;5;245m-       [0m
+debug-shell.service                          [0;1;31mdisabled       [0m[0;1;31m [0m[0;1;31mdisabled[0m
+dm-event.service                             static          [0;38;5;245m-       [0m
+dmesg.service                                [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+dpkg-db-backup.service                       static          [0;38;5;245m-       [0m
+droplet-agent-update.service                 static          [0;38;5;245m-       [0m
+droplet-agent.service                        [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+e2scrub@.service                             static          [0;38;5;245m-       [0m
+e2scrub_all.service                          static          [0;38;5;245m-       [0m
+e2scrub_fail@.service                        static          [0;38;5;245m-       [0m
+e2scrub_reap.service                         [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+emergency.service                            static          [0;38;5;245m-       [0m
+esm-cache.service                            static          [0;38;5;245m-       [0m
+fail2ban.service                             [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+famly-intake.service                         [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+famly-queue-worker.service                   [0;1;31mdisabled       [0m[0;1;31m [0m[0;1;32menabled [0m
+finalrd.service                              [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+friendly-recovery.service                    static          [0;38;5;245m-       [0m
+fstrim.service                               static          [0;38;5;245m-       [0m
+fwupd-refresh.service                        static          [0;38;5;245m-       [0m
+fwupd.service                                static          [0;38;5;245m-       [0m
+getty-static.service                         static          [0;38;5;245m-       [0m
+getty@.service                               [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+grub-common.service                          [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+grub-initrd-fallback.service                 [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+hwclock.service                              [0;1;31mmasked         [0m[0;1;31m [0m[0;1;32menabled [0m
+initrd-cleanup.service                       static          [0;38;5;245m-       [0m
+initrd-parse-etc.service                     static          [0;38;5;245m-       [0m
+initrd-switch-root.service                   static          [0;38;5;245m-       [0m
+initrd-udevadm-cleanup-db.service            static          [0;38;5;245m-       [0m
+iscsi.service                                [0;1;32malias          [0m[0;1;32m [0m[0;38;5;245m-       [0m
+iscsid.service                               [0;1;31mdisabled       [0m[0;1;31m [0m[0;1;32menabled [0m
+keyboard-setup.service                       [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+kmod-static-nodes.service                    static          [0;38;5;245m-       [0m
+kmod.service                                 [0;1;32malias          [0m[0;1;32m [0m[0;38;5;245m-       [0m
+ldconfig.service                             static          [0;38;5;245m-       [0m
+logrotate.service                            static          [0;38;5;245m-       [0m
+lvm2-lvmpolld.service                        static          [0;38;5;245m-       [0m
+lvm2-monitor.service                         [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+lxd-agent.service                            static          [0;38;5;245m-       [0m
+lxd-installer@.service                       static          [0;38;5;245m-       [0m
+man-db.service                               static          [0;38;5;245m-       [0m
+mdadm-grow-continue@.service                 static          [0;38;5;245m-       [0m
+mdadm-last-resort@.service                   static          [0;38;5;245m-       [0m
+mdcheck_continue.service                     static          [0;38;5;245m-       [0m
+mdcheck_start.service                        static          [0;38;5;245m-       [0m
+mdmon@.service                               static          [0;38;5;245m-       [0m
+mdmonitor-oneshot.service                    static          [0;38;5;245m-       [0m
+mdmonitor.service                            static          [0;38;5;245m-       [0m
+ModemManager.service                         [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+modprobe@.service                            static          [0;38;5;245m-       [0m
+motd-news.service                            static          [0;38;5;245m-       [0m
+multipath-tools-boot.service                 [0;1;31mmasked         [0m[0;1;31m [0m[0;1;32menabled [0m
+multipath-tools.service                      [0;1;32malias          [0m[0;1;32m [0m[0;38;5;245m-       [0m
+multipathd.service                           [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+netplan-ovs-cleanup.service                  enabled-runtime [0;1;32menabled [0m
+networkd-dispatcher.service                  [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+nftables.service                             [0;1;31mdisabled       [0m[0;1;31m [0m[0;1;32menabled [0m
+open-iscsi.service                           [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+open-vm-tools.service                        [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+packagekit-offline-update.service            static          [0;38;5;245m-       [0m
+packagekit.service                           static          [0;38;5;245m-       [0m
+pam_namespace.service                        static          [0;38;5;245m-       [0m
+plymouth-halt.service                        static          [0;38;5;245m-       [0m
+plymouth-kexec.service                       static          [0;38;5;245m-       [0m
+plymouth-log.service                         [0;1;32malias          [0m[0;1;32m [0m[0;38;5;245m-       [0m
+plymouth-poweroff.service                    static          [0;38;5;245m-       [0m
+plymouth-quit-wait.service                   static          [0;38;5;245m-       [0m
+plymouth-quit.service                        static          [0;38;5;245m-       [0m
+plymouth-read-write.service                  static          [0;38;5;245m-       [0m
+plymouth-reboot.service                      static          [0;38;5;245m-       [0m
+plymouth-start.service                       static          [0;38;5;245m-       [0m
+plymouth-switch-root-initramfs.service       static          [0;38;5;245m-       [0m
+plymouth-switch-root.service                 static          [0;38;5;245m-       [0m
+plymouth.service                             [0;1;32malias          [0m[0;1;32m [0m[0;38;5;245m-       [0m
+polkit.service                               static          [0;38;5;245m-       [0m
+pollinate.service                            [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+procps.service                               [0;1;32malias          [0m[0;1;32m [0m[0;38;5;245m-       [0m
+quotaon.service                              static          [0;38;5;245m-       [0m
+rc-local.service                             static          [0;38;5;245m-       [0m
+rescue.service                               static          [0;38;5;245m-       [0m
+rsync.service                                [0;1;31mdisabled       [0m[0;1;31m [0m[0;1;32menabled [0m
+rsyslog.service                              [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+screen-cleanup.service                       [0;1;31mmasked         [0m[0;1;31m [0m[0;1;32menabled [0m
+secureboot-db.service                        [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+serial-getty@.service                        indirect        [0;1;32menabled [0m
+setvtrgb.service                             [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+snapd.apparmor.service                       [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+snapd.autoimport.service                     [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+snapd.core-fixup.service                     [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+snapd.failure.service                        static          [0;38;5;245m-       [0m
+snapd.recovery-chooser-trigger.service       [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+snapd.seeded.service                         [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+snapd.service                                [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+snapd.snap-repair.service                    static          [0;38;5;245m-       [0m
+snapd.system-shutdown.service                [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+ssh.service                                  [0;1;31mdisabled       [0m[0;1;31m [0m[0;1;32menabled [0m
+sudo.service                                 [0;1;31mmasked         [0m[0;1;31m [0m[0;1;32menabled [0m
+syslog.service                               [0;1;32malias          [0m[0;1;32m [0m[0;38;5;245m-       [0m
+sysstat-collect.service                      static          [0;38;5;245m-       [0m
+sysstat-summary.service                      static          [0;38;5;245m-       [0m
+sysstat.service                              [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+system-update-cleanup.service                static          [0;38;5;245m-       [0m
+systemd-ask-password-console.service         static          [0;38;5;245m-       [0m
+systemd-ask-password-plymouth.service        static          [0;38;5;245m-       [0m
+systemd-ask-password-wall.service            static          [0;38;5;245m-       [0m
+systemd-backlight@.service                   static          [0;38;5;245m-       [0m
+systemd-battery-check.service                static          [0;38;5;245m-       [0m
+systemd-binfmt.service                       static          [0;38;5;245m-       [0m
+systemd-boot-check-no-failures.service       [0;1;31mdisabled       [0m[0;1;31m [0m[0;1;31mdisabled[0m
+systemd-bsod.service                         static          [0;38;5;245m-       [0m
+systemd-confext.service                      [0;1;31mdisabled       [0m[0;1;31m [0m[0;1;32menabled [0m
+systemd-exit.service                         static          [0;38;5;245m-       [0m
+systemd-firstboot.service                    static          [0;38;5;245m-       [0m
+systemd-fsck-root.service                    enabled-runtime [0;1;32menabled [0m
+systemd-fsck@.service                        static          [0;38;5;245m-       [0m
+systemd-fsckd.service                        static          [0;38;5;245m-       [0m
+systemd-growfs-root.service                  static          [0;38;5;245m-       [0m
+systemd-growfs@.service                      static          [0;38;5;245m-       [0m
+systemd-halt.service                         static          [0;38;5;245m-       [0m
+systemd-hibernate-resume.service             static          [0;38;5;245m-       [0m
+systemd-hibernate.service                    static          [0;38;5;245m-       [0m
+systemd-hostnamed.service                    static          [0;38;5;245m-       [0m
+systemd-hwdb-update.service                  static          [0;38;5;245m-       [0m
+systemd-hybrid-sleep.service                 static          [0;38;5;245m-       [0m
+systemd-initctl.service                      static          [0;38;5;245m-       [0m
+systemd-journal-catalog-update.service       static          [0;38;5;245m-       [0m
+systemd-journal-flush.service                static          [0;38;5;245m-       [0m
+systemd-journald.service                     static          [0;38;5;245m-       [0m
+systemd-journald@.service                    static          [0;38;5;245m-       [0m
+systemd-kexec.service                        static          [0;38;5;245m-       [0m
+systemd-localed.service                      static          [0;38;5;245m-       [0m
+systemd-logind.service                       static          [0;38;5;245m-       [0m
+systemd-machine-id-commit.service            static          [0;38;5;245m-       [0m
+systemd-modules-load.service                 static          [0;38;5;245m-       [0m
+systemd-network-generator.service            [0;1;31mdisabled       [0m[0;1;31m [0m[0;1;32menabled [0m
+systemd-networkd-wait-online.service         [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+systemd-networkd-wait-online@.service        [0;1;31mdisabled       [0m[0;1;31m [0m[0;1;32menabled [0m
+systemd-networkd.service                     [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+systemd-pcrextend@.service                   static          [0;38;5;245m-       [0m
+systemd-pcrfs-root.service                   static          [0;38;5;245m-       [0m
+systemd-pcrfs@.service                       static          [0;38;5;245m-       [0m
+systemd-pcrlock-file-system.service          [0;1;31mdisabled       [0m[0;1;31m [0m[0;1;32menabled [0m
+systemd-pcrlock-firmware-code.service        [0;1;31mdisabled       [0m[0;1;31m [0m[0;1;32menabled [0m
+systemd-pcrlock-firmware-config.service      [0;1;31mdisabled       [0m[0;1;31m [0m[0;1;32menabled [0m
+systemd-pcrlock-machine-id.service           [0;1;31mdisabled       [0m[0;1;31m [0m[0;1;32menabled [0m
+systemd-pcrlock-make-policy.service          [0;1;31mdisabled       [0m[0;1;31m [0m[0;1;32menabled [0m
+systemd-pcrlock-secureboot-authority.service [0;1;31mdisabled       [0m[0;1;31m [0m[0;1;32menabled [0m
+systemd-pcrlock-secureboot-policy.service    [0;1;31mdisabled       [0m[0;1;31m [0m[0;1;32menabled [0m
+systemd-pcrmachine.service                   static          [0;38;5;245m-       [0m
+systemd-pcrphase-initrd.service              static          [0;38;5;245m-       [0m
+systemd-pcrphase-sysinit.service             static          [0;38;5;245m-       [0m
+systemd-pcrphase.service                     static          [0;38;5;245m-       [0m
+systemd-poweroff.service                     static          [0;38;5;245m-       [0m
+systemd-pstore.service                       [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+systemd-quotacheck.service                   static          [0;38;5;245m-       [0m
+systemd-random-seed.service                  static          [0;38;5;245m-       [0m
+systemd-reboot.service                       static          [0;38;5;245m-       [0m
+systemd-remount-fs.service                   enabled-runtime [0;1;32menabled [0m
+systemd-repart.service                       static          [0;38;5;245m-       [0m
+systemd-resolved.service                     [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+systemd-rfkill.service                       static          [0;38;5;245m-       [0m
+systemd-soft-reboot.service                  static          [0;38;5;245m-       [0m
+systemd-storagetm.service                    static          [0;38;5;245m-       [0m
+systemd-suspend-then-hibernate.service       static          [0;38;5;245m-       [0m
+systemd-suspend.service                      static          [0;38;5;245m-       [0m
+systemd-sysctl.service                       static          [0;38;5;245m-       [0m
+systemd-sysext.service                       [0;1;31mdisabled       [0m[0;1;31m [0m[0;1;32menabled [0m
+systemd-sysext@.service                      static          [0;38;5;245m-       [0m
+systemd-sysupdate-reboot.service             indirect        [0;1;32menabled [0m
+systemd-sysupdate.service                    indirect        [0;1;32menabled [0m
+systemd-sysusers.service                     static          [0;38;5;245m-       [0m
+systemd-time-wait-sync.service               [0;1;31mdisabled       [0m[0;1;31m [0m[0;1;31mdisabled[0m
+systemd-timedated.service                    static          [0;38;5;245m-       [0m
+systemd-timesyncd.service                    [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+systemd-tmpfiles-clean.service               static          [0;38;5;245m-       [0m
+systemd-tmpfiles-setup-dev-early.service     static          [0;38;5;245m-       [0m
+systemd-tmpfiles-setup-dev.service           static          [0;38;5;245m-       [0m
+systemd-tmpfiles-setup.service               static          [0;38;5;245m-       [0m
+systemd-tpm2-setup-early.service             static          [0;38;5;245m-       [0m
+systemd-tpm2-setup.service                   static          [0;38;5;245m-       [0m
+systemd-udev-settle.service                  static          [0;38;5;245m-       [0m
+systemd-udev-trigger.service                 static          [0;38;5;245m-       [0m
+systemd-udevd.service                        static          [0;38;5;245m-       [0m
+systemd-update-done.service                  static          [0;38;5;245m-       [0m
+systemd-update-utmp-runlevel.service         static          [0;38;5;245m-       [0m
+systemd-update-utmp.service                  static          [0;38;5;245m-       [0m
+systemd-user-sessions.service                static          [0;38;5;245m-       [0m
+systemd-volatile-root.service                static          [0;38;5;245m-       [0m
+tpm-udev.service                             static          [0;38;5;245m-       [0m
+ua-reboot-cmds.service                       [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+ua-timer.service                             static          [0;38;5;245m-       [0m
+ubuntu-advantage.service                     [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+udev.service                                 [0;1;32malias          [0m[0;1;32m [0m[0;38;5;245m-       [0m
+udisks2.service                              [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+ufw.service                                  [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+unattended-upgrades.service                  [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+update-notifier-download.service             static          [0;38;5;245m-       [0m
+update-notifier-motd.service                 static          [0;38;5;245m-       [0m
+usb_modeswitch@.service                      static          [0;38;5;245m-       [0m
+user-runtime-dir@.service                    static          [0;38;5;245m-       [0m
+user@.service                                static          [0;38;5;245m-       [0m
+uuidd.service                                indirect        [0;1;32menabled [0m
+vgauth.service                               [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+vmtoolsd.service                             [0;1;32malias          [0m[0;1;32m [0m[0;38;5;245m-       [0m
+vpc-peering.service                          [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+x11-common.service                           [0;1;31mmasked         [0m[0;1;31m [0m[0;1;32menabled [0m
+xfs_scrub@.service                           static          [0;38;5;245m-       [0m
+xfs_scrub_all.service                        static          [0;38;5;245m-       [0m
+[0;4mxfs_scrub_fail@.service                     [0m[0;4m [0m[0;4mstatic         [0m[0;4m [0m[0;4;38;5;245m-       [0m
+machine.slice                                static          [0;38;5;245m-       [0m
+system-systemd\x2dcryptsetup.slice           static          [0;38;5;245m-       [0m
+system-systemd\x2dveritysetup.slice          static          [0;38;5;245m-       [0m
+[0;4muser.slice                                  [0m[0;4m [0m[0;4mstatic         [0m[0;4m [0m[0;4;38;5;245m-       [0m
+apport-forward.socket                        [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+cloud-init-hotplugd.socket                   [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+dbus.socket                                  static          [0;38;5;245m-       [0m
+dm-event.socket                              [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+iscsid.socket                                [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+lvm2-lvmpolld.socket                         [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+lxd-installer.socket                         [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+multipathd.socket                            [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+snapd.socket                                 [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+ssh.socket                                   [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+syslog.socket                                static          [0;38;5;245m-       [0m
+systemd-fsckd.socket                         static          [0;38;5;245m-       [0m
+systemd-initctl.socket                       static          [0;38;5;245m-       [0m
+systemd-journald-audit.socket                [0;1;31mdisabled       [0m[0;1;31m [0m[0;1;32menabled [0m
+systemd-journald-dev-log.socket              static          [0;38;5;245m-       [0m
+systemd-journald-varlink@.socket             static          [0;38;5;245m-       [0m
+systemd-journald.socket                      static          [0;38;5;245m-       [0m
+systemd-journald@.socket                     static          [0;38;5;245m-       [0m
+systemd-networkd.socket                      [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+systemd-pcrextend.socket                     [0;1;31mdisabled       [0m[0;1;31m [0m[0;1;32menabled [0m
+systemd-rfkill.socket                        static          [0;38;5;245m-       [0m
+systemd-sysext.socket                        [0;1;31mdisabled       [0m[0;1;31m [0m[0;1;32menabled [0m
+systemd-udevd-control.socket                 static          [0;38;5;245m-       [0m
+systemd-udevd-kernel.socket                  static          [0;38;5;245m-       [0m
+[0;4muuidd.socket                                [0m[0;4m [0m[0;1;4;32menabled        [0m[0;1;4;32m [0m[0;1;4;32menabled [0m
+basic.target                                 static          [0;38;5;245m-       [0m
+blockdev@.target                             static          [0;38;5;245m-       [0m
+bluetooth.target                             static          [0;38;5;245m-       [0m
+boot-complete.target                         static          [0;38;5;245m-       [0m
+cloud-config.target                          static          [0;38;5;245m-       [0m
+cloud-init.target                            enabled-runtime [0;1;32menabled [0m
+cryptsetup-pre.target                        static          [0;38;5;245m-       [0m
+cryptsetup.target                            static          [0;38;5;245m-       [0m
+ctrl-alt-del.target                          [0;1;32malias          [0m[0;1;32m [0m[0;38;5;245m-       [0m
+default.target                               [0;1;32malias          [0m[0;1;32m [0m[0;38;5;245m-       [0m
+emergency.target                             static          [0;38;5;245m-       [0m
+exit.target                                  [0;1;31mdisabled       [0m[0;1;31m [0m[0;1;31mdisabled[0m
+factory-reset.target                         static          [0;38;5;245m-       [0m
+final.target                                 static          [0;38;5;245m-       [0m
+first-boot-complete.target                   static          [0;38;5;245m-       [0m
+friendly-recovery.target                     static          [0;38;5;245m-       [0m
+getty-pre.target                             static          [0;38;5;245m-       [0m
+getty.target                                 static          [0;38;5;245m-       [0m
+graphical.target                             static          [0;38;5;245m-       [0m
+halt.target                                  [0;1;31mdisabled       [0m[0;1;31m [0m[0;1;31mdisabled[0m
+hibernate.target                             static          [0;38;5;245m-       [0m
+hybrid-sleep.target                          static          [0;38;5;245m-       [0m
+initrd-fs.target                             static          [0;38;5;245m-       [0m
+initrd-root-device.target                    static          [0;38;5;245m-       [0m
+initrd-root-fs.target                        static          [0;38;5;245m-       [0m
+initrd-switch-root.target                    static          [0;38;5;245m-       [0m
+initrd-usr-fs.target                         static          [0;38;5;245m-       [0m
+initrd.target                                static          [0;38;5;245m-       [0m
+integritysetup-pre.target                    static          [0;38;5;245m-       [0m
+integritysetup.target                        static          [0;38;5;245m-       [0m
+kexec.target                                 [0;1;31mdisabled       [0m[0;1;31m [0m[0;1;31mdisabled[0m
+local-fs-pre.target                          static          [0;38;5;245m-       [0m
+local-fs.target                              static          [0;38;5;245m-       [0m
+multi-user.target                            static          [0;38;5;245m-       [0m
+network-online.target                        static          [0;38;5;245m-       [0m
+network-pre.target                           static          [0;38;5;245m-       [0m
+network.target                               static          [0;38;5;245m-       [0m
+nss-lookup.target                            static          [0;38;5;245m-       [0m
+nss-user-lookup.target                       static          [0;38;5;245m-       [0m
+paths.target                                 static          [0;38;5;245m-       [0m
+poweroff.target                              [0;1;31mdisabled       [0m[0;1;31m [0m[0;1;31mdisabled[0m
+printer.target                               static          [0;38;5;245m-       [0m
+reboot.target                                [0;1;31mdisabled       [0m[0;1;31m [0m[0;1;32menabled [0m
+remote-cryptsetup.target                     [0;1;31mdisabled       [0m[0;1;31m [0m[0;1;32menabled [0m
+remote-fs-pre.target                         static          [0;38;5;245m-       [0m
+remote-fs.target                             [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+remote-veritysetup.target                    [0;1;31mdisabled       [0m[0;1;31m [0m[0;1;32menabled [0m
+rescue-ssh.target                            static          [0;38;5;245m-       [0m
+rescue.target                                static          [0;38;5;245m-       [0m
+rpcbind.target                               static          [0;38;5;245m-       [0m
+runlevel0.target                             [0;1;32malias          [0m[0;1;32m [0m[0;38;5;245m-       [0m
+runlevel1.target                             [0;1;32malias          [0m[0;1;32m [0m[0;38;5;245m-       [0m
+runlevel2.target                             [0;1;32malias          [0m[0;1;32m [0m[0;38;5;245m-       [0m
+runlevel3.target                             [0;1;32malias          [0m[0;1;32m [0m[0;38;5;245m-       [0m
+runlevel4.target                             [0;1;32malias          [0m[0;1;32m [0m[0;38;5;245m-       [0m
+runlevel5.target                             [0;1;32malias          [0m[0;1;32m [0m[0;38;5;245m-       [0m
+runlevel6.target                             [0;1;32malias          [0m[0;1;32m [0m[0;38;5;245m-       [0m
+shutdown.target                              static          [0;38;5;245m-       [0m
+sigpwr.target                                static          [0;38;5;245m-       [0m
+sleep.target                                 static          [0;38;5;245m-       [0m
+slices.target                                static          [0;38;5;245m-       [0m
+smartcard.target                             static          [0;38;5;245m-       [0m
+snapd.gpio-chardev-setup.target              static          [0;38;5;245m-       [0m
+snapd.mounts-pre.target                      static          [0;38;5;245m-       [0m
+snapd.mounts.target                          static          [0;38;5;245m-       [0m
+sockets.target                               static          [0;38;5;245m-       [0m
+soft-reboot.target                           static          [0;38;5;245m-       [0m
+sound.target                                 static          [0;38;5;245m-       [0m
+storage-target-mode.target                   static          [0;38;5;245m-       [0m
+suspend-then-hibernate.target                static          [0;38;5;245m-       [0m
+suspend.target                               static          [0;38;5;245m-       [0m
+swap.target                                  static          [0;38;5;245m-       [0m
+sysinit.target                               static          [0;38;5;245m-       [0m
+system-update-pre.target                     static          [0;38;5;245m-       [0m
+system-update.target                         static          [0;38;5;245m-       [0m
+time-set.target                              static          [0;38;5;245m-       [0m
+time-sync.target                             static          [0;38;5;245m-       [0m
+timers.target                                static          [0;38;5;245m-       [0m
+umount.target                                static          [0;38;5;245m-       [0m
+usb-gadget.target                            static          [0;38;5;245m-       [0m
+veritysetup-pre.target                       static          [0;38;5;245m-       [0m
+[0;4mveritysetup.target                          [0m[0;4m [0m[0;4mstatic         [0m[0;4m [0m[0;4;38;5;245m-       [0m
+apport-autoreport.timer                      [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+apt-daily-upgrade.timer                      [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+apt-daily.timer                              [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+dpkg-db-backup.timer                         [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+droplet-agent-update.timer                   [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+e2scrub_all.timer                            [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+fstrim.timer                                 [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+fwupd-refresh.timer                          [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+logrotate.timer                              [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+man-db.timer                                 [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+mdadm-last-resort@.timer                     static          [0;38;5;245m-       [0m
+mdcheck_continue.timer                       [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+mdcheck_start.timer                          [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+mdmonitor-oneshot.timer                      [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+motd-news.timer                              [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+snapd.snap-repair.timer                      [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+sysstat-collect.timer                        [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+sysstat-summary.timer                        [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+systemd-sysupdate-reboot.timer               [0;1;31mdisabled       [0m[0;1;31m [0m[0;1;32menabled [0m
+systemd-sysupdate.timer                      [0;1;31mdisabled       [0m[0;1;31m [0m[0;1;32menabled [0m
+systemd-tmpfiles-clean.timer                 static          [0;38;5;245m-       [0m
+ua-timer.timer                               [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+update-notifier-download.timer               [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+update-notifier-motd.timer                   [0;1;32menabled        [0m[0;1;32m [0m[0;1;32menabled [0m
+xfs_scrub_all.timer                          [0;1;31mdisabled       [0m[0;1;31m [0m[0;1;32menabled [0m
+
+394 unit files listed.
