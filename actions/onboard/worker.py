@@ -73,7 +73,7 @@ from actions.onboard import (
 )
 from actions.onboard_dry_run import derive
 from actions.onboard_dry_run.famly_reads import FamlyReads, normalise_email
-from actions.onboard_dry_run.runner import DryRun, plan_hash
+from actions.onboard_dry_run.runner import DryRun, hashed_plan, plan_hash
 from core import hubspot
 from core.hubspot import HubSpotError
 
@@ -282,7 +282,9 @@ def _webhook_hold_reason(deps, deal_id: str) -> str | None:
 
 def plan_section_hashes(plan: dict) -> dict:
     """A short hash per top-level plan section (hashes only, no personal data), logged
-    on every ask so a plan that changes between runs names the section that did."""
+    on every ask so a plan that changes between runs names the section that did.
+    Over the HASHED part of the plan, so it agrees with the digest."""
+    plan = hashed_plan(plan)
     return {
         key: hashlib.sha256(json.dumps(value, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:8]
         for key, value in sorted(plan.items())
