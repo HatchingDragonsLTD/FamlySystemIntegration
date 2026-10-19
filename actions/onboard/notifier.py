@@ -84,9 +84,9 @@ def notice_text(deal_id: str, headline: str, codes) -> str:
 class SlackNotifier:
     """Posts through integrations.slack. Never raises."""
 
-    def gate(self, text: str, job_id: str, plan_hash: str) -> str | None:
+    def gate(self, text: str, job_id: str, plan_hash: str, nonce: str) -> str | None:
         """Post the Approve / Reject request; returns the message ref or None."""
-        return slack.post_onboard_gate(text, approval.button_value(job_id, plan_hash))
+        return slack.post_onboard_gate(text, approval.button_value(job_id, plan_hash, nonce))
 
     def notice(self, text: str) -> bool:
         return slack.post_notice(text)

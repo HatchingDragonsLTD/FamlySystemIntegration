@@ -5,9 +5,11 @@ upstream in server.py) arrives with the button's value, and the decision is made
 HERE with an ATOMIC state change, so a double click, or a click on a message that
 has been superseded, does nothing the second time.
 
-The button value is `<job_id>:<plan hash prefix>`. Approve only counts if that
-prefix is still the hash of the plan the job is waiting on: the message the
-approver clicked is the plan they saw. It does not commit anything itself; it
+The button value is `<job_id>:<plan hash prefix>:<nonce>`. Approve only counts if
+that prefix is still the hash of the plan the job is waiting on AND the nonce is
+the one of the CURRENT approval request: the message the approver clicked is the
+plan they saw, and an older message for the same plan (or a Slack redelivery of an
+earlier click) is stale once the job has asked again. It does not commit anything itself; it
 returns the job to `queued` with `approved_hash` set, and the WORKER re-runs the
 plan and writes only if the hash is unchanged.
 
@@ -31,27 +33,31 @@ MSG_STALE = "⚠️ This approval request is out of date (the plan changed). Use
 MSG_UNKNOWN = "⚠️ Unknown onboarding job."
 
 
-def button_value(job_id: str, plan_hash: str) -> str:
-    return f"{job_id}:{plan_hash[:HASH_PREFIX]}"
+def button_value(job_id: str, plan_hash: str, nonce: str | None) -> str:
+    return f"{job_id}:{plan_hash[:HASH_PREFIX]}:{nonce or ''}"
 
 
-def _parse(value: str | None) -> tuple[str | None, str | None]:
+def _parse(value: str | None) -> tuple[str | None, str | None, str | None]:
     if not value or ":" not in value:
-        return None, None
-    job_id, _, prefix = value.partition(":")
-    return job_id or None, prefix or None
+        return None, None, None
+    job_id, _, rest = value.partition(":")
+    prefix, _, nonce = rest.partition(":")
+    return job_id or None, prefix or None, nonce or None
 
 
 def handle_click(action_id: str, value: str | None, user: str | None) -> str:
     """Act on a verified Gate A click. Never raises; returns the text to show."""
-    job_id, prefix = _parse(value)
+    job_id, prefix, nonce = _parse(value)
     job = store.get(job_id) if job_id else None
     if job is None:
         return MSG_UNKNOWN
 
     if action_id == slack.ACTION_ONBOARD_REJECT:
+        if (job.status == store.AWAITING_APPROVAL
+                and (not job.approval_nonce or nonce != job.approval_nonce)):
+            return MSG_STALE
         if store.transition(job.id, store.AWAITING_APPROVAL, store.HELD,
-                            last_error_code="approval_rejected"):
+                            last_error_code="approval_rejected", approval_nonce=None):
             logger.info("ONBOARD REJECTED job=%s deal=%s user=%s -- nothing written",
                         job.id, job.deal_id, user)
             return MSG_REJECTED
@@ -62,8 +68,10 @@ def handle_click(action_id: str, value: str | None, user: str | None) -> str:
             return MSG_HANDLED
         if not job.plan_hash or not prefix or not job.plan_hash.startswith(prefix):
             return MSG_STALE
+        if not job.approval_nonce or nonce != job.approval_nonce:
+            return MSG_STALE
         if store.transition(job.id, store.AWAITING_APPROVAL, store.QUEUED,
-                            approved_hash=job.plan_hash):
+                            approved_hash=job.plan_hash, approval_nonce=None):
             logger.info("ONBOARD APPROVED job=%s deal=%s user=%s", job.id, job.deal_id, user)
             return MSG_APPROVED
         return MSG_HANDLED
