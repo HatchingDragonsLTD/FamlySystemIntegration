@@ -189,7 +189,7 @@ def discover_shape(body: dict) -> dict:
     """How to ask for a bill payer's children, share, deletedAt, externalId and
     `includeDeleted`.
 
-    Returns {"children_field", "child_path", "multiplier_field", "external_id",
+    Returns {"children_field", "child_path", "multiplier_path", "multiplier_chain", "external_id",
     "deleted_at", "include_deleted_type", "include_deleted_default", "notes"}.
     `child_path` is the selection for one child id inside the children field ("" when
     the field is a plain list of ids, "childId" or "child { id }" otherwise).
@@ -199,7 +199,8 @@ def discover_shape(body: dict) -> dict:
     schema = ((body or {}).get("data") or {}).get("__schema") or {}
     by_name = {t.get("name"): t for t in types}
     notes: list[str] = []
-    shape = {"children_field": None, "child_path": None, "multiplier_field": None,
+    shape = {"children_field": None, "child_path": None, "multiplier_path": None,
+             "multiplier_chain": None,
              "external_id": False, "deleted_at": False, "include_deleted_type": None,
              "include_deleted_default": None, "notes": notes}
 
@@ -259,11 +260,37 @@ def discover_shape(body: dict) -> dict:
         shape["child_path"] = "id"
     if shape["child_path"] is None:
         notes.append(f"cannot find a child id inside {target}")
-    if "multiplier" in sub and shape["child_path"]:
-        shape["multiplier_field"] = "multiplier"
-    elif shape["child_path"]:
-        notes.append(f"no multiplier field inside {target}")
+    if shape["child_path"]:
+        found = _find_multiplier(by_name, target, sub)
+        if found is None:
+            notes.append(f"no multiplier found inside {target} (directly or one level down)")
+        else:
+            shape["multiplier_path"], shape["multiplier_chain"] = found
     return shape
+
+
+def _find_multiplier(by_name: dict, target: str, sub: dict) -> tuple[list[str], str] | None:
+    """The path to `multiplier` from a child entry: directly, or ONE level down through
+    the `share` field (the live schema: BillPayerChild.share -> ChildShare.multiplier),
+    or failing that through any other object field. Returns (path, readable chain)."""
+    if "multiplier" in sub:
+        return ["multiplier"], f"{target}.multiplier"
+    ordered = sorted(sub, key=lambda name: (name != "share", name))
+    for name in ordered:
+        inner_name = named_type(sub[name]["type"]) or ""
+        inner = by_name.get(inner_name) or {}
+        if inner.get("kind") == "OBJECT" and any(
+                f["name"] == "multiplier" for f in inner.get("fields") or []):
+            return [name, "multiplier"], f"{target}.{name} -> {inner_name}.multiplier"
+    return None
+
+
+def _selection(path: list[str]) -> str:
+    """["share", "multiplier"] -> `share { multiplier }`."""
+    text = path[-1]
+    for name in reversed(path[:-1]):
+        text = f"{name} {{ {text} }}"
+    return text
 
 
 def build_query(shape: dict, with_include_deleted: bool) -> str:
@@ -274,8 +301,8 @@ def build_query(shape: dict, with_include_deleted: bool) -> str:
         selection.append("deletedAt")
     if shape["children_field"] and shape["child_path"] is not None:
         parts = [shape["child_path"]] if shape["child_path"] else []
-        if shape.get("multiplier_field"):
-            parts.append(shape["multiplier_field"])
+        if shape.get("multiplier_path"):
+            parts.append(_selection(shape["multiplier_path"]))
         inner = f" {{ {' '.join(parts)} }}" if parts else ""
         selection.append(shape["children_field"] + inner)
     declared = "$siteIds: [SiteId!]!, $next: BillPayerCursor"
@@ -301,9 +328,12 @@ def _child_entries(node: dict, shape: dict) -> list[tuple[str, float | None]]:
         if not value:
             continue
         multiplier = None
-        if isinstance(item, dict) and shape.get("multiplier_field"):
+        if isinstance(item, dict) and shape.get("multiplier_path"):
+            leaf = item
+            for part in shape["multiplier_path"]:
+                leaf = leaf.get(part) if isinstance(leaf, dict) else None
             try:
-                multiplier = float(item.get(shape["multiplier_field"]))
+                multiplier = float(leaf)
             except (TypeError, ValueError):
                 multiplier = None
         out.append((str(value), multiplier))
@@ -379,6 +409,10 @@ DEFINITIONS = {
                    "and others differ (for example two identical sets and a third that differs)",
     "multiplierEntries": "count of child entries by multiplier value, rounded to 3 decimal places",
     "liveWith2PlusChildren": "bill payers not deleted that have two or more child entries",
+    "liveWith2PlusAllEqualMultipliers": "of those, every child entry has the same multiplier "
+                                        "(rounded to 3 decimal places)",
+    "liveWith2PlusUnequalMultipliers": "of those, the multipliers are not all the same",
+    "liveWith2PlusMultiplierUnavailable": "of those, at least one child entry has no readable multiplier",
 }
 
 
@@ -424,9 +458,18 @@ def _duplicate_stats(rows) -> dict:
     return out
 
 
+def _equal(row) -> bool | None:
+    """Whether every child entry of a bill payer has the same multiplier (3 dp);
+    None when some entry has no readable multiplier."""
+    if len(row["multipliers"]) < row["entries"]:
+        return None
+    return len({round(m, 3) for m in row["multipliers"]}) == 1
+
+
 def _site_counts(scan: dict) -> dict:
     rows = scan["rows"]
     multipliers = Counter(f"{m:.3f}" for r in rows for m in r["multipliers"])
+    many = [r for r in rows if not r["deleted"] and r["entries"] >= 2]
     counts = {
         "billPayers": len({r["id"] for r in rows}),
         "pages": scan["pages"],
@@ -437,6 +480,9 @@ def _site_counts(scan: dict) -> dict:
         "withNoChildren": sum(1 for r in rows if not r["children"]),
         "withDeletedAtSet": sum(1 for r in rows if r["deleted"]),
         "liveWith2PlusChildren": sum(1 for r in rows if not r["deleted"] and r["entries"] >= 2),
+        "liveWith2PlusAllEqualMultipliers": sum(1 for r in many if _equal(r) is True),
+        "liveWith2PlusUnequalMultipliers": sum(1 for r in many if _equal(r) is False),
+        "liveWith2PlusMultiplierUnavailable": sum(1 for r in many if _equal(r) is None),
         "multiplierEntries": dict(sorted(multipliers.items())),
     }
     counts.update(_duplicate_stats(rows))
