@@ -19,9 +19,9 @@ CHILD = "child-test-1"
 
 
 def schema(delete_with_site=False, with_delete=True, share_required=True, extra_required=False,
-           include_deleted=True):
+           include_deleted=True, delete_children=True, delete_children_list=True):
     """The read schema (listBySiteIds with `includeDeleted: Boolean! = true`) plus the
-    bill payer mutations."""
+    bill payer mutations, including addChildren and deleteChildren."""
     delete_args = [{"name": "billPayerIds", "type": _nn(_list(_nn(_t("SCALAR", "UniqueId"))))}]
     if delete_with_site:
         delete_args.append({"name": "siteIds", "type": _nn(_list(_nn(_t("SCALAR", "SiteId"))))})
@@ -31,6 +31,14 @@ def schema(delete_with_site=False, with_delete=True, share_required=True, extra_
     if with_delete:
         mut_fields.append({"name": "delete", "args": delete_args,
                            "type": _nn(_list(_nn(_t("SCALAR", "UniqueId"))))})
+    mut_fields.append({"name": "addChildren", "args": [
+        {"name": "shares", "type": _nn(_list(_nn(_t("INPUT_OBJECT", "BillPayerChildAddInput"))))}],
+        "type": _nn(_t("OBJECT", "BillPayer"))})
+    if delete_children:
+        delete_type = _nn(_t("INPUT_OBJECT", "ChildSharesDeleteInput"))
+        mut_fields.append({"name": "deleteChildren", "args": [
+            {"name": "shares", "type": _nn(_list(delete_type)) if delete_children_list else delete_type}],
+            "type": _nn(_t("OBJECT", "BillPayer"))})
     input_fields = [
         {"name": "siteId", "type": _nn(_t("SCALAR", "SiteId"))},
         {"name": "name", "type": _nn(_t("SCALAR", "NameInput"))},
@@ -49,26 +57,45 @@ def schema(delete_with_site=False, with_delete=True, share_required=True, extra_
         {"kind": "INPUT_OBJECT", "name": "BillPayerChildInput", "inputFields": [
             {"name": "childId", "type": _nn(_t("SCALAR", "ChildId"))},
             {"name": "share", "type": share_type}]},
+        {"kind": "INPUT_OBJECT", "name": "BillPayerChildAddInput", "inputFields": [
+            {"name": "childId", "type": _nn(_t("SCALAR", "ChildId"))},
+            {"name": "billPayerId", "type": _nn(_t("SCALAR", "UniqueId"))},
+            {"name": "share", "type": share_type}]},
+        {"kind": "INPUT_OBJECT", "name": "ChildSharesDeleteInput", "inputFields": [
+            {"name": "childId", "type": _nn(_t("SCALAR", "ChildId"))},
+            {"name": "billPayerId", "type": _nn(_t("SCALAR", "UniqueId"))}]},
     ]
     return {**base, "types": types}
 
 
-class FakeFamly:
-    """A tiny stateful Famly: bill payers with read-after-write lag, delete that hides
-    from includeDeleted=false, a test child create/delete. Records every write and the
-    includeDeleted value of every scan."""
+TRANSIENT_400 = json.dumps({"errors": [{"message": "can not archive a bill payer with shares",
+                                        "extensions": {"display": "Transient"}}]})
 
-    def __init__(self, schema_=None, lag_scans=0):
+
+class FakeFamly:
+    """A tiny stateful Famly: bill payers with shares and read-after-write lag, a delete
+    that is REFUSED while a share exists (as the live API does) and hides from
+    includeDeleted=false once it works, test children with ids child-test-1, -2.
+    Records every write and the includeDeleted value of every scan."""
+
+    def __init__(self, schema_=None, lag_scans=0, child_delete_releases_share=False):
         self.schema = schema_ or schema()
-        self.payers = []                 # {"id", "email", "ext", "children", "deleted", "visible_at"}
+        self.payers = []     # {"id","email","ext","shares": {child: multiplier},"deleted","visible_at"}
         self.lag_scans = lag_scans
+        self.child_delete_releases_share = child_delete_releases_share
         self.scans = 0
         self.scan_flags = []
         self.writes = []                 # (operation, variables, document text)
         self.create_error = None
         self.delete_error = None
+        self.add_error = None
+        self.delete_children_error = None
         self.child_deleted = []
         self.next_id = 1
+        self.next_child = 1
+
+    def _payer(self, bill_payer_id):
+        return next(p for p in self.payers if p["id"] == bill_payer_id)
 
     def execute(self, query_path, variables, operation_name):
         text = Path(query_path).read_text(encoding="utf-8")
@@ -77,10 +104,16 @@ class FakeFamly:
             return {"data": {"__schema": self.schema}}
         if op == "ProbeChildCreate":
             self.writes.append((op, variables, text))
-            return {"data": {"children": {"create": [{"id": CHILD, "externalId": "x"}]}}}
+            child = f"child-test-{self.next_child}"
+            self.next_child += 1
+            return {"data": {"children": {"create": [{"id": child, "externalId": "x"}]}}}
         if op == "ProbeChildDelete":
             self.writes.append((op, variables, text))
             self.child_deleted += variables["childIds"]
+            if self.child_delete_releases_share:
+                for payer in self.payers:
+                    for child in variables["childIds"]:
+                        payer["shares"].pop(child, None)
             return {"data": {"children": {"delete": variables["childIds"]}}}
         if op == write_probe.CREATE_OP:
             self.writes.append((op, variables, text))
@@ -88,19 +121,44 @@ class FakeFamly:
                 raise self.create_error
             item = variables["input"][0]
             payer = {"id": f"bp-{self.next_id}", "email": item["email"], "ext": item["externalId"],
-                     "children": [c["childId"] for c in item["children"]], "deleted": False,
-                     "visible_at": self.scans + self.lag_scans}
+                     "shares": {c["childId"]: (c.get("share") or {}).get("multiplier", 1.0)
+                                for c in item["children"]},
+                     "deleted": False, "visible_at": self.scans + self.lag_scans}
             self.next_id += 1
             self.payers.append(payer)
             return {"data": {"billPayers": {"create": [{"billPayerId": payer["id"]}]}}}
+        if op == write_probe.ADD_CHILDREN_OP:
+            self.writes.append((op, variables, text))
+            if self.add_error:
+                raise self.add_error
+            payer = None
+            for entry in variables["input"]:
+                payer = self._payer(entry["billPayerId"])
+                payer["shares"][entry["childId"]] = (entry.get("share") or {}).get("multiplier", 1.0)
+            return {"data": {"billPayers": {"addChildren": {
+                "billPayerId": payer["id"],
+                "childShares": [{"childId": c, "multiplier": m} for c, m in payer["shares"].items()]}}}}
+        if op == write_probe.DELETE_CHILDREN_OP:
+            self.writes.append((op, variables, text))
+            if self.delete_children_error:
+                raise self.delete_children_error
+            entries = variables["input"] if isinstance(variables["input"], list) else [variables["input"]]
+            payer = None
+            for entry in entries:
+                payer = self._payer(entry["billPayerId"])
+                payer["shares"].pop(entry["childId"], None)
+            return {"data": {"billPayers": {"deleteChildren": {"billPayerId": payer["id"]}}}}
         if op == write_probe.DELETE_OP:
             self.writes.append((op, variables, text))
             if self.delete_error:
                 raise self.delete_error
-            for payer in self.payers:
-                if payer["id"] in variables["id"]:
-                    payer["deleted"] = True
-            return {"data": {"billPayers": {"delete": variables["id"]}}}
+            ids = variables["id"] if isinstance(variables["id"], list) else [variables["id"]]
+            for bill_payer_id in ids:
+                payer = self._payer(bill_payer_id)
+                if payer["shares"]:                           # the live behaviour
+                    raise GraphQLHTTPError("bad", 400, TRANSIENT_400)
+                payer["deleted"] = True
+            return {"data": {"billPayers": {"delete": ids}}}
         # the list scan: includeDeleted must be passed, explicitly
         self.scans += 1
         flag = variables.get("includeDeleted", "OMITTED")
@@ -109,15 +167,18 @@ class FakeFamly:
         return {"data": {"billPayers": {"listBySiteIds": {"result": [
             {"billPayerId": p["id"], "email": p["email"], "externalId": p["ext"],
              "deletedAt": "2026-01-01T00:00:00Z" if p["deleted"] else None,
-             "childShares": [{"childId": c, "multiplier": 1.0} for c in p["children"]]} for p in rows],
-            "next": None}}}}
+             "childShares": [{"childId": c, "multiplier": m} for c, m in p["shares"].items()]}
+            for p in rows], "next": None}}}}
 
     def mutations(self, operation):
         return [w for w in self.writes if w[0] == operation]
 
+    def order(self):
+        return [w[0] for w in self.writes]
+
 
 class FakeRest:
-    def __init__(self, test_children=(CHILD,)):
+    def __init__(self, test_children=(CHILD, "child-test-2")):
         self.test_children = set(test_children)
 
     def get(self, path):
@@ -314,12 +375,25 @@ class CapTests(unittest.TestCase):
 
     def test_a_second_delete_is_refused_before_a_request(self):
         famly = FakeFamly()
+        famly.payers.append({"id": "bp-9", "email": "e", "ext": "x", "shares": {}, "deleted": False,
+                             "visible_at": 0})
         probe = write_probe.Probe(famly, FakeRest(), out=lambda _t: None)
         plan = write_probe.plan_from_schema({"data": {"__schema": famly.schema}})
         shape = runner.discover_shape({"data": {"__schema": famly.schema}})
+        run_ = write_probe._Run(plan=plan, shape=shape, site_id="S", email_key="e", external_id="x",
+                                bill_payer_id="bp-9")
         for _ in range(2):
-            probe._delete_bill_payer(plan, shape, "S", "e", "x", CHILD, "bp-9")
+            probe._delete_bill_payer(run_)
         self.assertEqual(len(famly.mutations(write_probe.DELETE_OP)), 1)
+
+    def test_the_budget_refuses_a_second_delete_children_and_add_children(self):
+        budget = write_probe.Budget()
+        for what in ("billpayer_deletechildren", "billpayer_addchildren"):
+            budget.spend(what)
+            with self.assertRaises(write_probe.ProbeRefused):
+                budget.spend(what)
+        self.assertIn("deleteChildren", write_probe.Budget().text())
+        self.assertEqual(write_probe.Budget(delete_cap=2).caps["billpayer_delete"], 2)
 
 
 class DocumentTests(unittest.TestCase):
@@ -370,7 +444,7 @@ class AbortIfItExistsTests(unittest.TestCase):
     def test_an_existing_test_email_aborts_with_no_writes(self):
         famly = FakeFamly()
         famly.payers.append({"id": "old", "email": TEST_EMAIL.upper(), "ext": "other",
-                             "children": [], "deleted": False, "visible_at": 0})
+                             "shares": {}, "deleted": False, "visible_at": 0})
         famly, _probe, result, lines, _clock = run(famly=famly)
         self.assertEqual(famly.writes, [])
         self.assertEqual(result.stopped, "exists")
@@ -378,7 +452,7 @@ class AbortIfItExistsTests(unittest.TestCase):
     def test_an_existing_deleted_twin_also_aborts(self):
         famly = FakeFamly()
         famly.payers.append({"id": "old", "email": TEST_EMAIL, "ext": "other",
-                             "children": [], "deleted": True, "visible_at": 0})
+                             "shares": {}, "deleted": True, "visible_at": 0})
         famly, _probe, result, *_ = run(famly=famly)
         self.assertEqual(famly.writes, [])
 
@@ -513,6 +587,312 @@ class ShareAndFlagTests(unittest.TestCase):
             cli.handle(argparse.Namespace(share="1.0", **base))
         self.assertEqual(ctx.exception.code, 3)
         self.assertEqual(famly.writes, [])
+
+
+def kinds_in(famly):
+    return famly.order()
+
+
+class CleanupOrderTests(unittest.TestCase):
+    """Famly refuses billPayers.delete while a share exists, so: shares, then the bill
+    payer, then the test children."""
+
+    def test_write_mode_removes_the_share_before_the_delete_before_the_child(self):
+        famly, _probe, result, lines, _clock = run(child_id=None, create_test_child=True)
+        order = famly.order()
+        self.assertEqual(order, ["ProbeChildCreate", write_probe.CREATE_OP,
+                                 write_probe.DELETE_CHILDREN_OP, write_probe.DELETE_OP, "ProbeChildDelete"])
+        self.assertTrue(result.shares_deleted and result.bill_payer_deleted and result.test_child_deleted)
+        self.assertEqual(famly.payers[0]["shares"], {})
+        self.assertTrue(famly.payers[0]["deleted"])
+
+    def test_the_delete_children_variable_names_the_probes_own_share_only(self):
+        famly, *_ = run()
+        variables = famly.mutations(write_probe.DELETE_CHILDREN_OP)[0][1]
+        self.assertEqual(variables, {"input": [{"childId": CHILD, "billPayerId": "bp-1"}]})
+        code = "".join(l for l in famly.mutations(write_probe.DELETE_CHILDREN_OP)[0][2].splitlines()
+                       if not l.lstrip().startswith("#"))
+        self.assertNotIn("siteIds", code)
+
+    def test_delete_children_is_sent_once_for_every_failure_type(self):
+        errors = [requests.Timeout(), requests.ConnectionError(), GraphQLHTTPError("x", 500, ""),
+                  GraphQLHTTPError("x", 429, ""), GraphQLHTTPError("x", 400, TRANSIENT_400),
+                  GraphQLError("x", [{"extensions": {"display": "Transient"}}])]
+        for error in errors:
+            with self.subTest(error=type(error).__name__):
+                famly = FakeFamly()
+                famly.delete_children_error = error
+                famly, _probe, result, lines, _clock = run(famly=famly, child_id=None, create_test_child=True)
+                self.assertEqual(len(famly.mutations(write_probe.DELETE_CHILDREN_OP)), 1)   # never retried
+                # The doomed delete is not spent; the bill payer is left for a person.
+                self.assertEqual(famly.mutations(write_probe.DELETE_OP), [])
+                text = "\n".join(lines)
+                self.assertIn("DELETE THIS BILL PAYER BY HAND (remove its shares first): bp-1", text)
+                self.assertEqual(len(famly.mutations("ProbeChildDelete")), 1)         # the child still goes
+
+    def test_a_refused_delete_prints_the_hand_clean_up_and_does_not_retry(self):
+        famly = FakeFamly()
+        famly.delete_error = GraphQLHTTPError("bad", 400, TRANSIENT_400)
+        famly, _probe, result, lines, _clock = run(famly=famly)
+        self.assertEqual(len(famly.mutations(write_probe.DELETE_OP)), 1)
+        self.assertIn("DELETE THIS BILL PAYER BY HAND: bp-1", "\n".join(lines))
+
+    def test_the_caps_text_names_delete_children_and_add_children(self):
+        _famly, _probe, _result, lines, _clock = run()
+        self.assertTrue(any("deleteChildren" in l and "addChildren" in l for l in lines))
+
+    def test_clean_up_is_impossible_without_delete_children_so_it_stops_before_any_write(self):
+        famly = FakeFamly(schema(delete_children=False))
+        famly, _probe, result, lines, _clock = run(famly=famly)
+        self.assertEqual(famly.writes, [])
+        self.assertIn("clean-up is impossible", "\n".join(lines))
+        self.assertEqual(result.stopped, "schema")
+
+    def test_a_single_entry_delete_children_argument_is_sent_per_share(self):
+        famly = FakeFamly(schema(delete_children_list=False))
+        famly, *_ = run(famly=famly)
+        sent = famly.mutations(write_probe.DELETE_CHILDREN_OP)
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0][1], {"input": {"childId": CHILD, "billPayerId": "bp-1"}})
+
+
+class MutationGuardTests(unittest.TestCase):
+    def docs(self):
+        plan = write_probe.plan_from_schema({"data": {"__schema": schema()}})
+        return plan, {
+            "create": write_probe.create_document(plan),
+            "delete": write_probe.delete_document(plan),
+            "addChildren": write_probe.add_children_document(plan.add_children),
+            "deleteChildren": write_probe.delete_children_document(plan.delete_children),
+        }
+
+    def test_each_built_document_passes_its_own_guard_and_no_other(self):
+        _plan, docs = self.docs()
+        for kind, text in docs.items():
+            write_probe.assert_probe_mutation(text, kind)
+            for other in docs:
+                if other != kind:
+                    with self.assertRaises(write_probe.ProbeRefused):
+                        write_probe.assert_probe_mutation(text, other)
+
+    def test_no_document_can_carry_a_site_wide_argument_or_an_update(self):
+        _plan, docs = self.docs()
+        for kind, text in docs.items():
+            code = "".join(l for l in text.splitlines() if not l.lstrip().startswith("#")).lower()
+            self.assertNotIn("siteids", code)
+            self.assertNotIn("update(", code)
+        for bad in ("mutation ProbeBillPayerAddChildren($i: X) { billPayers { addChildren(a: $i) deleteChildren(b: $i) } }",
+                    "mutation ProbeBillPayerDeleteChildren($i: X, $s: Y) { billPayers { deleteChildren(a: $i, siteIds: $s) } }"):
+            kind = "addChildren" if "AddChildren" in bad else "deleteChildren"
+            with self.assertRaises(write_probe.ProbeRefused):
+                write_probe.assert_probe_mutation(bad, kind)
+
+    def test_the_add_children_select_reads_back_the_nested_share(self):
+        plan, docs = self.docs()
+        self.assertIn("childShares { childId multiplier }", docs["addChildren"])
+
+
+class AttachTests(unittest.TestCase):
+    def attach(self, famly=None, **kw):
+        famly = famly or FakeFamly()
+        clock = Clock()
+        lines = []
+        probe = write_probe.Probe(famly, FakeRest(), out=lines.append, clock=clock, sleep=clock.sleep)
+        args = dict(site_code=SITE, test_email=TEST_EMAIL, create_test_child=True,
+                    existing_bill_payer_id=None, share=1.0, second_share=None, confirm=True)
+        args.update(kw)
+        result = probe.run_attach(**args)
+        return famly, probe, result, lines, clock
+
+    def test_it_refuses_without_confirm_or_test_children_and_sends_nothing(self):
+        for kw in (dict(confirm=False), dict(create_test_child=False), dict(site_code=""),
+                   dict(test_email="nope")):
+            with self.subTest(kw=kw):
+                famly = FakeFamly()
+                with self.assertRaises(write_probe.ProbeRefused):
+                    self.attach(famly=famly, **kw)
+                self.assertEqual(famly.writes, [])
+                self.assertEqual(famly.scans, 0)
+
+    def test_the_whole_sibling_path_in_the_right_order(self):
+        famly, _probe, result, lines, clock = self.attach()
+        self.assertEqual(famly.order(), [
+            "ProbeChildCreate", write_probe.CREATE_OP, "ProbeChildCreate", write_probe.ADD_CHILDREN_OP,
+            write_probe.DELETE_CHILDREN_OP, write_probe.DELETE_OP, "ProbeChildDelete", "ProbeChildDelete"])
+        self.assertTrue(result.children_added and result.shares_deleted and result.bill_payer_deleted)
+        self.assertTrue(result.test_child_created and result.test_child_deleted)
+
+    def test_add_children_sends_the_second_child_with_a_wrapped_share_once(self):
+        famly, *_ = self.attach()
+        sent = famly.mutations(write_probe.ADD_CHILDREN_OP)
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0][1], {"input": [
+            {"childId": "child-test-2", "billPayerId": "bp-1", "share": {"multiplier": 1.0}}]})
+
+    def test_a_second_share_can_differ(self):
+        famly, *_ = self.attach(second_share=0.5)
+        sent = famly.mutations(write_probe.ADD_CHILDREN_OP)[0][1]["input"][0]
+        self.assertEqual(sent["share"], {"multiplier": 0.5})
+        create = famly.mutations(write_probe.CREATE_OP)[0][1]["input"][0]
+        self.assertEqual(create["children"][0]["share"], {"multiplier": 1.0})
+
+    def test_the_read_back_lists_both_children_with_their_multipliers(self):
+        _famly, _probe, _result, lines, _clock = self.attach(second_share=0.5)
+        text = "\n".join(lines)
+        self.assertRegex(text, r"T\+ 0s after addChildren: the payer lists 2 child entries; "
+                               r"both test children listed=yes; child 1 listed=yes multiplier=1.000; "
+                               r"child 2 listed=yes multiplier=0.500")
+        self.assertIn("T+10s after addChildren", text)
+        self.assertIn("addChildren RETURNED the second child: yes; entries returned: 2", text)
+
+    def test_the_clean_up_removes_both_shares_in_one_request_then_the_payer_then_both_children(self):
+        famly, *_ = self.attach()
+        delete = famly.mutations(write_probe.DELETE_CHILDREN_OP)
+        self.assertEqual(len(delete), 1)
+        self.assertEqual(delete[0][1]["input"], [
+            {"childId": "child-test-1", "billPayerId": "bp-1"},
+            {"childId": "child-test-2", "billPayerId": "bp-1"}])
+        for write in famly.mutations("ProbeChildDelete"):
+            self.assertEqual(set(write[1]), {"childIds"})              # never siteIds
+        self.assertEqual(famly.child_deleted, ["child-test-1", "child-test-2"])
+        self.assertEqual(famly.payers[0]["shares"], {})
+
+    def test_add_children_is_sent_once_for_every_failure_type(self):
+        errors = [requests.Timeout(), requests.ConnectionError(), GraphQLHTTPError("x", 500, ""),
+                  GraphQLHTTPError("x", 429, ""), GraphQLHTTPError("x", 400, "{}"),
+                  GraphQLError("x", [{"extensions": {"display": "Transient"}}])]
+        for error in errors:
+            with self.subTest(error=type(error).__name__):
+                famly = FakeFamly()
+                famly.add_error = error
+                famly, _probe, result, lines, _clock = self.attach(famly=famly)
+                self.assertEqual(len(famly.mutations(write_probe.ADD_CHILDREN_OP)), 1)   # no retry
+                # The clean-up still ran, in order.
+                self.assertEqual(len(famly.mutations(write_probe.DELETE_CHILDREN_OP)), 1)
+                self.assertEqual(len(famly.mutations("ProbeChildDelete")), 2)
+
+    def test_a_rejected_create_stops_but_still_cleans_up_the_first_child(self):
+        famly = FakeFamly()
+        famly.create_error = GraphQLHTTPError("bad", 400, TRANSIENT_400)
+        famly, _probe, result, lines, _clock = self.attach(famly=famly)
+        self.assertEqual(len(famly.mutations(write_probe.CREATE_OP)), 1)
+        self.assertEqual(famly.mutations(write_probe.ADD_CHILDREN_OP), [])
+        self.assertEqual(famly.mutations(write_probe.DELETE_CHILDREN_OP), [])
+        self.assertEqual(famly.child_deleted, ["child-test-1"])
+
+    def test_an_existing_probe_bill_payer_is_reused_and_left_in_place(self):
+        famly = FakeFamly()
+        famly.payers.append({"id": "bp-old", "email": TEST_EMAIL, "ext": "probe-20260101T000000Z",
+                             "shares": {"old-child": 1.0}, "deleted": False, "visible_at": 0})
+        famly, _probe, result, lines, _clock = self.attach(famly=famly, existing_bill_payer_id="bp-old")
+        self.assertEqual(famly.mutations(write_probe.CREATE_OP), [])          # no second payer
+        self.assertEqual(famly.mutations(write_probe.DELETE_OP), [])          # it is not ours to delete
+        self.assertEqual(len(famly.mutations("ProbeChildCreate")), 1)
+        add = famly.mutations(write_probe.ADD_CHILDREN_OP)[0][1]["input"][0]
+        self.assertEqual((add["billPayerId"], add["childId"]), ("bp-old", "child-test-1"))
+        # Only the share this run added is removed; the old one stays.
+        self.assertEqual(famly.mutations(write_probe.DELETE_CHILDREN_OP)[0][1]["input"],
+                         [{"childId": "child-test-1", "billPayerId": "bp-old"}])
+        self.assertEqual(famly.payers[0]["shares"], {"old-child": 1.0})
+        self.assertIn("left in place: bp-old", "\n".join(lines))
+
+    def test_an_existing_bill_payer_that_is_not_a_probe_is_refused_without_a_write(self):
+        famly = FakeFamly()
+        famly.payers.append({"id": "bp-real", "email": "someone.real@example.org", "ext": "crm-1",
+                             "shares": {"k": 1.0}, "deleted": False, "visible_at": 0})
+        famly, _probe, result, lines, _clock = self.attach(famly=famly, existing_bill_payer_id="bp-real")
+        self.assertEqual(famly.writes, [])
+        self.assertEqual(result.stopped, "not_probe")
+        famly2 = FakeFamly()
+        famly2.payers.append({"id": "bp-x", "email": "other@example.org", "ext": "probe-1",
+                              "shares": {}, "deleted": False, "visible_at": 0})
+        famly2, _probe, result2, *_ = self.attach(famly=famly2, existing_bill_payer_id="bp-x")
+        self.assertEqual(famly2.writes, [])                  # probe externalId but not the test email
+
+    def test_an_existing_test_email_aborts_a_new_bill_payer_with_no_writes(self):
+        famly = FakeFamly()
+        famly.payers.append({"id": "old", "email": TEST_EMAIL, "ext": "other", "shares": {},
+                             "deleted": False, "visible_at": 0})
+        famly, _probe, result, *_ = self.attach(famly=famly)
+        self.assertEqual(famly.writes, [])
+        self.assertEqual(result.stopped, "exists")
+
+    def test_the_pre_scan_and_every_scan_pass_include_deleted_false_explicitly(self):
+        famly, *_ = self.attach()
+        self.assertNotIn("OMITTED", famly.scan_flags)
+        self.assertTrue(all(isinstance(f, bool) for f in famly.scan_flags))
+        self.assertEqual(famly.scan_flags[0], False)                 # the attach pre-scan
+
+    def test_attach_refuses_before_a_write_without_add_children_or_include_deleted(self):
+        for kw in (dict(schema_=schema(delete_children=False)), dict(schema_=schema(include_deleted=False))):
+            famly = FakeFamly(**kw)
+            with self.subTest(kw=list(kw)):
+                try:
+                    famly, _probe, result, lines, _clock = self.attach(famly=famly)
+                except write_probe.ProbeRefused:
+                    pass
+                self.assertEqual(famly.writes, [])
+
+    def test_the_variables_are_printed_without_the_email_and_no_output_has_it(self):
+        _famly, _probe, _result, lines, _clock = self.attach()
+        text = "\n".join(lines)
+        self.assertIn("VARIABLES TO SEND (addChildren)", text)
+        self.assertIn("<test-email>", text)
+        for form in (TEST_EMAIL, TEST_EMAIL.lower(), "probe.owner", "example.org"):
+            self.assertNotIn(form.lower(), text.lower())
+
+    def test_the_cli_returns_booleans_only_and_the_attach_options_exist(self):
+        import argparse
+        parser = argparse.ArgumentParser()
+        cli.add_args(parser)
+        parsed = parser.parse_args(["attach", "--site", "HDCW", "--test-email", "x@y.z",
+                                    "--create-test-child", "--existing-bill-payer-id", "bp-1",
+                                    "--second-share", "0.5", "--share", "1.0", "--confirm"])
+        self.assertEqual((parsed.report, parsed.existing_bill_payer_id, parsed.second_share),
+                         ("attach", "bp-1", "0.5"))
+        flag = parser.parse_args(["write", "--probe-delete-after-child-delete"])
+        self.assertTrue(flag.probe_delete_after_child_delete)
+
+
+class DeleteAfterChildDeleteTests(unittest.TestCase):
+    def go(self, releases):
+        famly = FakeFamly(child_delete_releases_share=releases)
+        return run(famly=famly, child_id=None, create_test_child=True,
+                   probe_delete_after_child_delete=True)
+
+    def test_it_needs_a_test_child_the_run_created(self):
+        famly = FakeFamly()
+        with self.assertRaises(write_probe.ProbeRefused):
+            run(famly=famly, probe_delete_after_child_delete=True)         # --child-id given
+        self.assertEqual(famly.writes, [])
+
+    def test_when_deleting_the_child_does_not_release_the_share(self):
+        famly, _probe, result, lines, _clock = self.go(releases=False)
+        order = famly.order()
+        # The child goes FIRST, the delete is tried (and refused), then the fallback.
+        self.assertEqual(order, ["ProbeChildCreate", write_probe.CREATE_OP, "ProbeChildDelete",
+                                 write_probe.DELETE_OP, write_probe.DELETE_CHILDREN_OP, write_probe.DELETE_OP])
+        text = "\n".join(lines)
+        self.assertIn("deleting a child does NOT release its share", text)
+        self.assertIn("at most 1 billPayers.create, 2 billPayers.delete", text)
+        self.assertTrue(result.bill_payer_deleted)                          # the fallback worked
+
+    def test_when_deleting_the_child_releases_the_share(self):
+        famly, _probe, result, lines, _clock = self.go(releases=True)
+        self.assertEqual(famly.order(), ["ProbeChildCreate", write_probe.CREATE_OP, "ProbeChildDelete",
+                                         write_probe.DELETE_OP])
+        self.assertEqual(famly.mutations(write_probe.DELETE_CHILDREN_OP), [])
+        self.assertIn("deleting a child RELEASES its share", "\n".join(lines))
+
+    def test_each_mutation_is_still_sent_at_most_once_per_step(self):
+        famly, *_ = self.go(releases=False)
+        self.assertEqual(len(famly.mutations(write_probe.CREATE_OP)), 1)
+        self.assertEqual(len(famly.mutations(write_probe.DELETE_CHILDREN_OP)), 1)
+        self.assertLessEqual(len(famly.mutations(write_probe.DELETE_OP)), 2)
+
+    def test_the_default_path_does_not_run_the_experiment(self):
+        famly, *_ = run(child_id=None, create_test_child=True)
+        self.assertEqual(famly.order()[2], write_probe.DELETE_CHILDREN_OP)   # shares first, not the child
 
 
 if __name__ == "__main__":

@@ -1,30 +1,41 @@
-"""ONE-OFF WRITE PROBE: create ONE test bill payer in Famly, measure how fast it can
-be read back, then delete it. Like probe-child-create and probe-contact-create it is
-an explicit, narrow exception to "never call a write against Famly outside tests".
+"""ONE-OFF WRITE PROBES: create ONE test bill payer in Famly (`write`), or attach a
+second test child to one (`attach`), measure how fast it can be read back, then clean
+up. Like probe-child-create and probe-contact-create these are explicit, narrow
+exceptions to "never call a write against Famly outside tests".
 
-What it may send, and nothing else:
+What they may send, and nothing else:
   * ONE `billPayers.create` and ONE `billPayers.delete` (the delete names the bill
     payer id only; an argument that would act on a whole site is never declared);
-  * with --create-test-child: ONE test child create (`isTestChild` true) and ONE
-    delete of that child by `childIds` only, through the existing, guarded
-    `ProbeSession` in actions/probe_child_create (never `siteIds`).
-Every mutation is sent ONCE and NEVER retried, including on HTTP 400 "Transient".
-A rejected request is printed and the probe stops; no variants are tried.
+  * `billPayers.addChildren` ONCE (attach mode only) and `billPayers.deleteChildren`
+    ONCE (a list argument carries every share in one request) to remove the probe's
+    shares, because Famly refuses to archive a bill payer that still has shares;
+  * with --create-test-child: test children (`isTestChild` true), each deleted at the
+    end by `childIds` only, through the existing, guarded `ProbeSession` in
+    actions/probe_child_create (never `siteIds`).
+CLEAN-UP ORDER (Famly refuses `billPayers.delete` while a share exists): remove the
+shares with deleteChildren, THEN delete the bill payer, THEN delete the test children.
+Every mutation is sent ONCE and NEVER retried, including on HTTP 400 "Transient". A
+rejected request is printed and the probe stops going forward; the clean-up path
+still runs, and no variants are tried.
 
-Guards, all before the first request: --confirm, --site, --test-email, and exactly
-one of --child-id (which must be a verified test child) or --create-test-child.
-The probe scans the site first and aborts if the test email or the probe externalId
-already exists.
+`--probe-delete-after-child-delete` (write mode, with --create-test-child only) swaps
+the clean-up to answer one question: does deleting a child release its share? It
+deletes the test child FIRST, then tries billPayers.delete once and reports the
+outcome. If that is refused it falls back to deleteChildren and a second delete (the
+delete cap is 2 in that mode, printed up front).
 
-The create and delete documents are BUILT FROM THE LIVE SCHEMA (argument names and
-types are not recorded in the repo), checked by `assert_probe_mutation`, and
-anything that cannot be filled in (an unknown required input field) stops the probe
-before any write and is printed.
+Guards, all before the first request: --confirm, --site, --test-email, and the child
+options. The probe scans the site first and aborts if the test email or the probe
+externalId already exists.
 
-PRIVACY: the test email is held in memory only. It is redacted from every printed
-line (an error body may echo it), never logged, never written to a file or the jobs
-DB. The bill payer id and the child id are printed to the TERMINAL ONLY, so a failed
-step can be cleaned up by hand; they are never written anywhere.
+The documents are BUILT FROM THE LIVE SCHEMA (argument names and types are not
+recorded in the repo), checked by `assert_probe_mutation`, and anything that cannot be
+filled in (an unknown required input field) stops the probe before any write.
+
+PRIVACY: the test email is held in memory only. It is redacted from every printed line
+(an error body may echo it), never logged, never written to a file or the jobs DB. The
+bill payer id and the child ids are printed to the TERMINAL ONLY, so a failed step can
+be cleaned up by hand; they are never written anywhere.
 """
 
 import json
@@ -50,11 +61,19 @@ from . import runner
 PROBE_NAME = "ZZ Probe Test"
 CREATE_OP = "ProbeBillPayerCreate"
 DELETE_OP = "ProbeBillPayerDelete"
+ADD_CHILDREN_OP = "ProbeBillPayerAddChildren"
+DELETE_CHILDREN_OP = "ProbeBillPayerDeleteChildren"
 MAX_BILL_PAYER_CREATES = 1
 MAX_BILL_PAYER_DELETES = 1
-SCAN_OFFSETS = (0, 10, 60)          # seconds after the create
+SCAN_OFFSETS = (0, 10, 60)          # seconds after the create (write mode)
+ATTACH_OFFSETS = (0, 10)            # seconds after addChildren (attach mode)
 TEST_CHILD_NAME = "AAProbe BillPayerChild"
 TEST_CHILD_BIRTHDAY = date(2025, 6, 1)
+
+OPS = {"create": CREATE_OP, "delete": DELETE_OP, "addChildren": ADD_CHILDREN_OP,
+       "deleteChildren": DELETE_CHILDREN_OP}
+TOKENS = {"create": "create(", "delete": "delete(", "addChildren": "addchildren(",
+          "deleteChildren": "deletechildren("}
 
 
 class ProbeRefused(Exception):
@@ -65,36 +84,62 @@ class ProbeRefused(Exception):
 # Guards on what may be sent
 # --------------------------------------------------------------------------- #
 def assert_probe_mutation(text: str, kind: str) -> None:
-    """`kind` is "create" or "delete". The document must be exactly one probe
-    mutation on `billPayers`, with no site-wide argument and nothing else."""
+    """`kind` is create, delete, addChildren or deleteChildren. The document must be
+    exactly one probe mutation on `billPayers`, with no site-wide argument, nothing
+    but its own field, and no update."""
     code = "\n".join(l for l in text.splitlines() if not l.lstrip().startswith("#")).lower()
-    expected = CREATE_OP if kind == "create" else DELETE_OP
+    expected = OPS[kind]
     if code.count("mutation") != 1 or f"mutation {expected.lower()}(" not in code:
         raise ProbeRefused(f"refusing: not a single {expected} mutation")
-    if "billpayers {" not in code or f"{kind}(" not in code:
+    if "billpayers {" not in code or TOKENS[kind] not in code:
         raise ProbeRefused(f"refusing: the document is not billPayers.{kind}")
-    for forbidden in ("siteids", "update(", "addchildren(") + (("create(",) if kind == "delete" else ("delete(",)):
-        if forbidden in code:
-            raise ProbeRefused(f"refusing: the document contains {forbidden!r}")
+    forbidden = ["siteids", "update("] + [t for k, t in TOKENS.items() if k != kind]
+    for token in forbidden:
+        if token in code:
+            raise ProbeRefused(f"refusing: the document contains {token!r}")
 
 
 class Budget:
     """The write caps. `spend` raises before a request that would exceed one."""
 
-    CAPS = {"billpayer_create": MAX_BILL_PAYER_CREATES, "billpayer_delete": MAX_BILL_PAYER_DELETES}
-
-    def __init__(self):
+    def __init__(self, delete_cap: int = MAX_BILL_PAYER_DELETES, delete_children_cap: int = 1):
+        self.caps = {"billpayer_create": MAX_BILL_PAYER_CREATES,
+                     "billpayer_delete": delete_cap,
+                     "billpayer_addchildren": 1,
+                     "billpayer_deletechildren": delete_children_cap}
         self.used: dict[str, int] = {}
 
     def spend(self, what: str) -> None:
-        if self.used.get(what, 0) >= self.CAPS[what]:
-            raise ProbeRefused(f"cap reached: at most {self.CAPS[what]} {what.replace('_', ' ')}")
+        if self.used.get(what, 0) >= self.caps[what]:
+            raise ProbeRefused(f"cap reached: at most {self.caps[what]} {what.replace('_', ' ')}")
         self.used[what] = self.used.get(what, 0) + 1
+
+    def text(self) -> str:
+        return (f"CAPS: at most {self.caps['billpayer_create']} billPayers.create, "
+                f"{self.caps['billpayer_delete']} billPayers.delete, "
+                f"{self.caps['billpayer_addchildren']} addChildren (attach only) and "
+                f"{self.caps['billpayer_deletechildren']} deleteChildren request(s)")
 
 
 # --------------------------------------------------------------------------- #
 # Working out the mutations from the live schema
 # --------------------------------------------------------------------------- #
+@dataclass
+class ListOp:
+    """A billPayers mutation taking a list of {childId, billPayerId, ...} entries."""
+    arg: str = ""
+    arg_type: str = ""
+    is_list: bool = False
+    select: str = ""
+    child_id_field: str = "childId"
+    bill_payer_field: str | None = None
+    share_field: str | None = None
+    share_required: bool = False
+    share_is_object: bool = False
+    share_wrap_key: str | None = None
+    share_hint: str = ""
+
+
 @dataclass
 class WritePlan:
     create_arg: str = ""
@@ -105,6 +150,10 @@ class WritePlan:
     delete_is_list: bool = False
     delete_select: str = ""
     delete_unusable: str | None = None
+    add_children: ListOp | None = None
+    add_children_unusable: str | None = None
+    delete_children: ListOp | None = None
+    delete_children_unusable: str | None = None
     site_field: str = "siteId"
     name_field: str = "name"
     email_field: str | None = "email"
@@ -123,10 +172,68 @@ def _required(arg) -> bool:
     return (arg.get("type") or {}).get("kind") == "NON_NULL" and arg.get("defaultValue") is None
 
 
-def plan_from_schema(body: dict) -> WritePlan:
+def _share_info(by_name: dict, f: dict) -> dict:
+    share_type = by_name.get(runner.named_type(f["type"]) or "") or {}
+    is_object = share_type.get("kind") == "INPUT_OBJECT"
+    inner = share_type.get("inputFields") or []
+    return {
+        "hint": (f"{f['name']}: {runner.type_str(f['type'])}"
+                 + (f" = {f['defaultValue']}" if f.get("defaultValue") is not None else "")),
+        "is_object": is_object,
+        "wrap_key": inner[0]["name"] if is_object and len(inner) == 1 else None,
+    }
+
+
+def _list_op(by_name: dict, mut_fields: dict, name: str, shape_select: str,
+             want_share: bool) -> tuple[ListOp | None, str | None]:
+    """The plan for billPayers.<name>(<list of {childId, billPayerId[, share]}>)."""
+    mutation = mut_fields.get(name)
+    if mutation is None:
+        return None, f"the schema has no billPayers.{name}"
+    main = []
+    for arg in mutation.get("args") or []:
+        input_type = by_name.get(runner.named_type(arg["type"]) or "") or {}
+        if input_type.get("kind") == "INPUT_OBJECT" and any(
+                f["name"] == "childId" for f in input_type.get("inputFields") or []):
+            main.append((arg, input_type))
+    if len(main) != 1:
+        return None, f"billPayers.{name} has no single input argument with a childId"
+    arg, input_type = main[0]
+    others = [a["name"] for a in mutation.get("args") or [] if a is not arg and _required(a)]
+    if others:
+        return None, f"billPayers.{name} has other required arguments: {', '.join(others)}"
+    fields = {f["name"]: f for f in input_type.get("inputFields") or []}
+    op = ListOp(arg=arg["name"], arg_type=runner.type_str(arg["type"]),
+                is_list="[" in runner.type_str(arg["type"]))
+    op.bill_payer_field = next((n for n in fields if re.search(r"bill\s*payer", n, re.IGNORECASE)
+                                and "id" in n.lower()), None)
+    if op.bill_payer_field is None:
+        return None, f"{input_type.get('name')} has no bill payer id field"
+    handled = {"childId", op.bill_payer_field}
+    if want_share:
+        share_name = "share" if "share" in fields else next(
+            (n for n in fields if n not in handled), None)
+        if share_name is None:
+            return None, f"{input_type.get('name')} has no share field"
+        op.share_field, op.share_required = share_name, _required(fields[share_name])
+        info = _share_info(by_name, fields[share_name])
+        op.share_hint, op.share_is_object, op.share_wrap_key = info["hint"], info["is_object"], info["wrap_key"]
+        handled.add(share_name)
+    unfillable = [n for n, f in fields.items() if n not in handled and _required(f)]
+    if unfillable:
+        return None, f"{input_type.get('name')} has other required fields: {', '.join(unfillable)}"
+    ret = by_name.get(runner.named_type(mutation["type"]) or "") or {}
+    if ret.get("kind") == "OBJECT" and any(f["name"] == "billPayerId" for f in ret.get("fields") or []):
+        op.select = " { billPayerId" + shape_select + " }"
+    return op, None
+
+
+def plan_from_schema(body: dict, shape: dict | None = None) -> WritePlan:
     types, roots = runner._types(body)
     by_name = {t.get("name"): t for t in types}
     schema = ((body or {}).get("data") or {}).get("__schema") or {}
+    shape = shape if shape is not None else runner.discover_shape(body)
+    children_text = runner.children_selection(shape)
     plan = WritePlan()
 
     mutation_root = by_name.get((schema.get("mutationType") or {}).get("name") or "") or {}
@@ -177,6 +284,12 @@ def plan_from_schema(body: dict) -> WritePlan:
         if ret.get("kind") == "OBJECT":
             plan.delete_select = " { billPayerId }"
 
+    # ---- the share operations (removing shares must work before a delete can) ---
+    plan.add_children, plan.add_children_unusable = _list_op(
+        by_name, mut_fields, "addChildren", (" " + children_text) if children_text else "", True)
+    plan.delete_children, plan.delete_children_unusable = _list_op(
+        by_name, mut_fields, "deleteChildren", "", False)
+
     # ---- the input ------------------------------------------------------------
     bp_input = by_name.get("BillPayerInput") or {}
     fields = {f["name"]: f for f in bp_input.get("inputFields") or []}
@@ -205,13 +318,9 @@ def plan_from_schema(body: dict) -> WritePlan:
         for name, f in child_fields.items():
             if name != plan.child_id_field:
                 plan.share_field, plan.share_required = name, _required(f)
-                plan.share_hint = (f"{name}: {runner.type_str(f['type'])}"
-                                   + (f" = {f['defaultValue']}" if f.get("defaultValue") is not None else ""))
-                share_type = by_name.get(runner.named_type(f["type"]) or "") or {}
-                if share_type.get("kind") == "INPUT_OBJECT":
-                    plan.share_is_object = True
-                    inner = share_type.get("inputFields") or []
-                    plan.share_wrap_key = inner[0]["name"] if len(inner) == 1 else None
+                info = _share_info(by_name, f)
+                plan.share_hint, plan.share_is_object, plan.share_wrap_key = (
+                    info["hint"], info["is_object"], info["wrap_key"])
 
     handled = {"siteId", "name", "email", "externalId", plan.children_field}
     unfillable = [n for n, f in fields.items() if n not in handled and _required(f)]
@@ -230,21 +339,43 @@ def delete_document(plan: WritePlan) -> str:
             f"{{ delete({plan.delete_arg}: $id){plan.delete_select} }} }}\n")
 
 
+def add_children_document(op: ListOp) -> str:
+    return (f"mutation {ADD_CHILDREN_OP}($input: {op.arg_type}) {{ billPayers "
+            f"{{ addChildren({op.arg}: $input){op.select} }} }}\n")
+
+
+def delete_children_document(op: ListOp) -> str:
+    return (f"mutation {DELETE_CHILDREN_OP}($input: {op.arg_type}) {{ billPayers "
+            f"{{ deleteChildren({op.arg}: $input){op.select} }} }}\n")
+
+
+def _wrap(raw, is_object: bool, wrap_key, hint: str):
+    if raw is None:
+        return None
+    if is_object:
+        if isinstance(raw, dict):
+            return raw
+        if isinstance(raw, (int, float)) and not isinstance(raw, bool) and wrap_key:
+            return {wrap_key: float(raw)}
+        raise ProbeRefused("refusing: --share must be a number, or a full JSON object for "
+                           f"the share input ({hint})")
+    if isinstance(raw, dict):
+        raise ProbeRefused(f"refusing: the share field is not an object ({hint})")
+    return raw
+
+
 def build_share(plan: WritePlan, raw):
     """The share value to send. `--share 1.0` is wrapped into the share input's own
     single field (`{"multiplier": 1.0}`); a full JSON object is sent as given."""
     if raw is None or not plan.share_field:
         return None
-    if plan.share_is_object:
-        if isinstance(raw, dict):
-            return raw
-        if isinstance(raw, (int, float)) and not isinstance(raw, bool) and plan.share_wrap_key:
-            return {plan.share_wrap_key: float(raw)}
-        raise ProbeRefused("refusing: --share must be a number, or a full JSON object for "
-                           f"the share input ({plan.share_hint})")
-    if isinstance(raw, dict):
-        raise ProbeRefused(f"refusing: the share field is not an object ({plan.share_hint})")
-    return raw
+    return _wrap(raw, plan.share_is_object, plan.share_wrap_key, plan.share_hint)
+
+
+def build_add_share(op: ListOp, raw):
+    if raw is None or not op.share_field:
+        return None
+    return _wrap(raw, op.share_is_object, op.share_wrap_key, op.share_hint)
 
 
 def make_input(plan: WritePlan, site_id: str, email: str, external_id: str, child_id: str, share) -> dict:
@@ -259,11 +390,26 @@ def make_input(plan: WritePlan, site_id: str, email: str, external_id: str, chil
     return payload
 
 
+def make_add_entry(op: ListOp, child_id: str, bill_payer_id: str, share) -> dict:
+    entry = {op.child_id_field: child_id, op.bill_payer_field: bill_payer_id}
+    if op.share_field and share is not None:
+        entry[op.share_field] = share
+    return entry
+
+
+def make_delete_entry(op: ListOp, child_id: str, bill_payer_id: str) -> dict:
+    return {op.child_id_field: child_id, op.bill_payer_field: bill_payer_id}
+
+
 # --------------------------------------------------------------------------- #
 # Scanning for the probe bill payer (in memory; nothing is printed but booleans)
 # --------------------------------------------------------------------------- #
-def probe_scan(client, site_id, shape, include_deleted, email_key, external_id, child_id) -> dict:
-    """One full scan with `includeDeleted` passed EXPLICITLY (a bool, never omitted)."""
+def probe_scan(client, site_id, shape, include_deleted, email_key, external_id, child_id,
+               bill_payer_id=None) -> dict:
+    """One full scan with `includeDeleted` passed EXPLICITLY (a bool, never omitted).
+
+    Returns counts and, for the probe's own bill payer (matched by externalId, or by id
+    when `bill_payer_id` is given), its child entries as (child id, multiplier)."""
     if not isinstance(include_deleted, bool):
         raise ProbeRefused("refusing: a scan must pass includeDeleted explicitly")
     text = runner.build_query(shape, True)
@@ -276,6 +422,9 @@ def probe_scan(client, site_id, shape, include_deleted, email_key, external_id, 
         by_email = by_ext = 0
         attached = None
         found_id = None
+        entries: list = []
+        id_seen = False
+        id_probe_ok = False
         cursor, pages = None, 0
         while pages < runner.MAX_PAGES:
             variables = {"siteIds": [site_id], "next": cursor, "includeDeleted": include_deleted}
@@ -287,18 +436,24 @@ def probe_scan(client, site_id, shape, include_deleted, email_key, external_id, 
                 if not isinstance(node, dict):
                     continue
                 is_email = bool(email_key) and normalise_email(node.get("email")) == email_key
-                is_ext = str(node.get("externalId") or "").strip() == external_id
+                ext_text = str(node.get("externalId") or "").strip()
+                is_ext = ext_text == external_id
+                is_id = bool(bill_payer_id) and str(node.get("billPayerId")) == bill_payer_id
                 by_email += is_email
                 by_ext += is_ext
+                if is_id:
+                    id_seen = True
+                    id_probe_ok = ext_text.startswith("probe-") and is_email
                 if is_email or is_ext:
                     found_id = found_id or str(node.get("billPayerId"))
-                if is_ext and shape["children_field"]:
-                    attached = child_id in runner._child_ids(node, shape)
+                if (is_ext or is_id) and shape["children_field"]:
+                    entries = runner._child_entries(node, shape)
+                    attached = child_id in {c for c, _m in entries}
             cursor = listing.get("next") or None
             if not cursor:
                 break
         return {"byEmail": by_email, "byExternalId": by_ext, "attached": attached,
-                "id": found_id}
+                "id": found_id, "entries": entries, "idSeen": id_seen, "idProbeOk": id_probe_ok}
     finally:
         os.unlink(handle.name)
 
@@ -308,15 +463,33 @@ def _yes(value) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# The probe
+# The probes
 # --------------------------------------------------------------------------- #
 @dataclass
 class WriteResult:
     bill_payer_created: bool = False
     bill_payer_deleted: bool = False
+    shares_deleted: bool = False
+    children_added: bool = False
     test_child_created: bool = False
     test_child_deleted: bool = False
     stopped: str | None = None
+
+
+@dataclass
+class _Run:
+    """What one run has created, so the clean-up knows what to remove."""
+    plan: WritePlan
+    shape: dict
+    site_id: str
+    email_key: str
+    external_id: str
+    session: object = None
+    bill_payer_id: str | None = None
+    owns_bill_payer: bool = True
+    share_children: list = field(default_factory=list)      # child ids with a share to remove
+    test_children: list = field(default_factory=list)       # child ids created by this run
+    deleted_children: set = field(default_factory=set)
 
 
 class Probe:
@@ -352,46 +525,81 @@ class Probe:
         finally:
             os.unlink(handle.name)
 
-    def run(self, site_code: str, test_email: str, child_id: str | None, create_test_child: bool,
-            share, confirm: bool) -> WriteResult:
+    # -- the guards and the schema, shared by both modes ------------------------- #
+    def _prepare(self, site_code, test_email, confirm):
         self._email = (test_email or "").strip()
-        # ---- guards: all before the first request -------------------------------
         if not confirm:
             raise ProbeRefused("refusing without --confirm; nothing was written")
         if not site_code or not self._email or "@" not in self._email:
             raise ProbeRefused("refusing: --site and a --test-email are required")
-        if bool(child_id) == bool(create_test_child):
-            raise ProbeRefused("refusing: give exactly one of --child-id or --create-test-child")
         site_code = site_code.strip().upper()
         entry = catalogue.load_sites().get(site_code)
         site_id = entry.get("institutionId") if isinstance(entry, dict) else None
         if not site_id:
             raise ProbeRefused(f"refusing: no institutionId for site {site_code}")
+        return site_code, site_id
 
-        if child_id:
-            # Verified BEFORE anything is scanned or written: only a test child is used.
-            try:
-                summary = self.rest.get(f"/v2/children/{child_id}/summary")
-            except RestHTTPError as exc:
-                raise ProbeRefused(f"could not verify the child (HTTP {exc.status_code})") from None
-            if not child_probe.is_test_child(summary):
-                raise ProbeRefused("refusing: that child is not a test child (isTestChild is not true)")
+    def _verify_test_child(self, child_id: str) -> None:
+        try:
+            summary = self.rest.get(f"/v2/children/{child_id}/summary")
+        except RestHTTPError as exc:
+            raise ProbeRefused(f"could not verify the child (HTTP {exc.status_code})") from None
+        if not child_probe.is_test_child(summary):
+            raise ProbeRefused("refusing: that child is not a test child (isTestChild is not true)")
 
-        self.say(f"CAPS: at most {MAX_BILL_PAYER_CREATES} billPayers.create and "
-                 f"{MAX_BILL_PAYER_DELETES} billPayers.delete"
-                 + ("; one test child created and deleted" if create_test_child else ""))
-        self.say("Mutations are sent once and never retried, including on a 400 Transient.")
-
-        # ---- read: the schema, then the site ------------------------------------
+    def _read_schema(self, need_add_children: bool):
         schema_body = runner.fetch_schema(self.public)
-        plan = plan_from_schema(schema_body)
         shape = runner.discover_shape(schema_body)
+        plan = plan_from_schema(schema_body, shape)
         try:
             runner.require_include_deleted(shape)
         except runner.AuditRefused as exc:
             raise ProbeRefused(str(exc)) from None
-        if plan.blockers:
-            for blocker in plan.blockers:
+        blockers = list(plan.blockers)
+        if plan.delete_children is None:
+            blockers.append(f"clean-up is impossible: {plan.delete_children_unusable}")
+        if need_add_children and plan.add_children is None:
+            blockers.append(plan.add_children_unusable or "billPayers.addChildren is unusable")
+        return plan, shape, blockers
+
+    def _new_test_child(self, run: _Run, site_code: str, label: str, stamp: str):
+        group_id = derive.group_id_for(site_code, "Hatchlings")
+        spec = child_probe.ChildSpec(
+            label, TEST_CHILD_NAME, TEST_CHILD_BIRTHDAY, f"AAPROBE-BP-{stamp}-{label}",
+            f"AAPROBE-BP-DEAL-{stamp}-{label}", "2027-01-04", "2027-12-31")
+        payload = child_probe.make_child_input(spec, run.site_id, group_id, "%Y-%m-%d")
+        child_id = run.session.create_child(payload, f"test child {label}")
+        if not child_id:
+            return None
+        run.test_children.append(child_id)
+        self.result.test_child_created = True
+        self.say(f"TEST CHILD {label} id (terminal only): {child_id}")
+        return child_id
+
+    # ======================================================================== #
+    # write: create one bill payer, measure the lag, clean up
+    # ======================================================================== #
+    def run(self, site_code: str, test_email: str, child_id: str | None, create_test_child: bool,
+            share, confirm: bool, probe_delete_after_child_delete: bool = False) -> WriteResult:
+        site_code, site_id = self._prepare(site_code, test_email, confirm)
+        if bool(child_id) == bool(create_test_child):
+            raise ProbeRefused("refusing: give exactly one of --child-id or --create-test-child")
+        if probe_delete_after_child_delete and not create_test_child:
+            raise ProbeRefused("refusing: --probe-delete-after-child-delete needs --create-test-child "
+                               "(only a child this run created may be deleted)")
+        if child_id:
+            self._verify_test_child(child_id)        # BEFORE anything is scanned or written
+        if probe_delete_after_child_delete:
+            self.budget = Budget(delete_cap=2)
+
+        plan, shape, blockers = self._read_schema(need_add_children=False)
+        self.say(self.budget.text() + ("; test child created and deleted" if create_test_child else ""))
+        self.say("Mutations are sent once and never retried, including on a 400 Transient.")
+        if probe_delete_after_child_delete:
+            self.say("EXPERIMENT: the test child is deleted FIRST, then billPayers.delete is tried once "
+                     "(a second delete is allowed only as the fallback clean-up).")
+        if blockers:
+            for blocker in blockers:
                 self.say(f"STOPPED before any write: {blocker}")
             self.result.stopped = "schema"
             return self.result
@@ -406,13 +614,11 @@ class Probe:
         self.say("delete: " + (f"{plan.delete_arg}: {plan.delete_arg_type}" if plan.delete_arg
                                else f"UNAVAILABLE ({plan.delete_unusable})"))
 
-        include_deleted = False        # the live view, as the pipeline will scan
-        scan_flag = True               # the pre-scan also sees deleted twins
         stamp = self.utcnow().strftime("%Y%m%dT%H%M%SZ")
-        external_id = f"probe-{stamp}"
-        email_key = normalise_email(self._email)
+        run = _Run(plan=plan, shape=shape, site_id=site_id,
+                   email_key=normalise_email(self._email), external_id=f"probe-{stamp}")
 
-        before = probe_scan(self.public, site_id, shape, scan_flag, email_key, external_id, "")
+        before = probe_scan(self.public, site_id, shape, True, run.email_key, run.external_id, "")
         if before["byEmail"] or before["byExternalId"]:
             self.say("STOPPED: the test email or the probe externalId already exists at this site; "
                      "nothing was written")
@@ -420,80 +626,220 @@ class Probe:
             return self.result
         self.say("PRE-SCAN: test email and probe externalId are absent")
 
-        # ---- the test child ------------------------------------------------------
-        session = None
-        bill_payer_id = None
         try:
             if create_test_child:
-                session = child_probe.ProbeSession(self.rest, self.public, None, self.say)
-                group_id = derive.group_id_for(site_code, "Hatchlings")
-                spec = child_probe.ChildSpec(
-                    "BP", TEST_CHILD_NAME, TEST_CHILD_BIRTHDAY, f"AAPROBE-BP-{stamp}",
-                    f"AAPROBE-BP-DEAL-{stamp}", "2027-01-04", "2027-12-31")
-                payload = child_probe.make_child_input(spec, site_id, group_id, "%Y-%m-%d")
-                child_id = session.create_child(payload, "test child")
+                run.session = child_probe.ProbeSession(self.rest, self.public, None, self.say)
+                child_id = self._new_test_child(run, site_code, "1", stamp)
                 if not child_id:
                     self.say("STOPPED: the test child was rejected; nothing else was written")
                     self.result.stopped = "child"
                     return self.result
-                self.result.test_child_created = True
-                self.say(f"TEST CHILD id (terminal only): {child_id}")
-
-            bill_payer_id = self._create_and_measure(plan, shape, site_id, email_key, external_id,
-                                                     child_id, share, include_deleted)
+            started = self._create_bill_payer(run, child_id, share)
+            if started is not None:
+                self._measure(run, child_id, started, SCAN_OFFSETS, "T+{:>2}s")
         except ProbeRefused as exc:
             self.say(f"STOPPED: {exc}")
             self.result.stopped = self.result.stopped or "refused"
         except Exception as exc:  # noqa: BLE001 - the clean-up below must still run
             self.say(f"ERROR ({type(exc).__name__}); going on to the clean-up")
         finally:
-            self._cleanup(plan, shape, site_id, email_key, external_id, child_id, bill_payer_id,
-                          include_deleted, session)
+            if probe_delete_after_child_delete:
+                self._cleanup_delete_after_child_delete(run)
+            else:
+                self._cleanup(run)
         self.say("=== DONE. Ids for a manual clean-up are above (terminal only; nothing was stored) ===")
         return self.result
 
-    # -- create the bill payer, then measure read-after-write lag ----------------- #
-    def _create_and_measure(self, plan, shape, site_id, email_key, external_id, child_id, share,
-                            include_deleted):
-        payload = make_input(plan, site_id, self._email, external_id, child_id, share)
-        variables = {"input": [payload] if "[" in plan.create_arg_type else payload}
-        # The exact variable about to be sent (the test email is redacted by `say`).
-        self.say("VARIABLES TO SEND: " + json.dumps(variables))
-        self.budget.spend("billpayer_create")
-        self.say(f"SENDING billPayers.create (externalId {external_id}) ...")
-        started = self.clock()
-        bill_payer_id = None
+    # ======================================================================== #
+    # attach: a second test child onto the probe bill payer (the sibling path)
+    # ======================================================================== #
+    def run_attach(self, site_code: str, test_email: str, create_test_child: bool,
+                   existing_bill_payer_id: str | None, share, second_share, confirm: bool) -> WriteResult:
+        site_code, site_id = self._prepare(site_code, test_email, confirm)
+        if not create_test_child:
+            raise ProbeRefused("refusing: attach needs --create-test-child (it creates the test "
+                               "children it uses, and deletes only those)")
+        plan, shape, blockers = self._read_schema(need_add_children=True)
+        if plan.delete_children is not None:
+            # One request carries every share when the argument is a list.
+            self.budget = Budget(delete_children_cap=1 if plan.delete_children.is_list else 2)
+        self.say(self.budget.text() + ("; one test child created and deleted" if existing_bill_payer_id
+                                       else "; two test children created and deleted"))
+        self.say("Mutations are sent once and never retried, including on a 400 Transient.")
+        if blockers:
+            for blocker in blockers:
+                self.say(f"STOPPED before any write: {blocker}")
+            self.result.stopped = "schema"
+            return self.result
+        add = plan.add_children
+        if (plan.share_required or add.share_required) and share is None:
+            self.say("STOPPED before any write: a share is required; give --share")
+            self.result.stopped = "share"
+            return self.result
+        raw_second = second_share if second_share is not None else share   # same unless --second-share
+        share = build_share(plan, share)
+        second = build_add_share(add, raw_second)
+        self.say(f"addChildren input: {add.arg}: {add.arg_type} "
+                 f"[{add.child_id_field}, {add.bill_payer_field}"
+                 + (f", {add.share_hint}" if add.share_field else "") + "]")
+
+        stamp = self.utcnow().strftime("%Y%m%dT%H%M%SZ")
+        run = _Run(plan=plan, shape=shape, site_id=site_id, email_key=normalise_email(self._email),
+                   external_id=f"probe-{stamp}", owns_bill_payer=not existing_bill_payer_id)
+
+        # a) the pre-scan, includeDeleted false.
+        before = probe_scan(self.public, site_id, shape, False, run.email_key, run.external_id, "",
+                            bill_payer_id=existing_bill_payer_id)
+        if existing_bill_payer_id:
+            if not before["idSeen"] or not before["idProbeOk"]:
+                self.say("STOPPED: that bill payer is not a probe bill payer with the test email "
+                         "(externalId must start with probe- and the email must match); "
+                         "nothing was written")
+                self.result.stopped = "not_probe"
+                return self.result
+            run.bill_payer_id = existing_bill_payer_id
+            self.say("PRE-SCAN: the existing bill payer is a probe bill payer with the test email")
+        elif before["byEmail"] or before["byExternalId"]:
+            self.say("STOPPED: the test email or the probe externalId already exists at this site; "
+                     "nothing was written")
+            self.result.stopped = "exists"
+            return self.result
+        else:
+            self.say("PRE-SCAN: test email and probe externalId are absent")
+
+        first_child = second_child = None
         try:
-            body = self._send(create_document(plan), variables, CREATE_OP, "create")
+            run.session = child_probe.ProbeSession(self.rest, self.public, None, self.say)
+            if run.owns_bill_payer:
+                first_child = self._new_test_child(run, site_code, "1", stamp)
+                if not first_child:
+                    self.say("STOPPED: the first test child was rejected; nothing else was written")
+                    self.result.stopped = "child"
+                    return self.result
+                started = self._create_bill_payer(run, first_child, share)
+                if started is None:
+                    return self.result            # rejected: the clean-up below still runs
+                if not run.bill_payer_id:         # an unknown outcome: settle it by scanning
+                    self._measure(run, first_child, started, ATTACH_OFFSETS, "T+{:>2}s")
+            # b) the second test child
+            second_child = self._new_test_child(run, site_code, "2", stamp)
+            if not second_child:
+                self.say("STOPPED: the second test child was rejected")
+                self.result.stopped = "child"
+                return self.result
+            if not run.bill_payer_id:
+                self.say("STOPPED: no bill payer id to attach to (the create was not confirmed)")
+                self.result.stopped = "no_bill_payer"
+                return self.result
+            # c) addChildren, once
+            self._add_children(run, second_child, second)
+            # d) read it back
+            self._measure_attach(run, first_child, second_child)
+        except ProbeRefused as exc:
+            self.say(f"STOPPED: {exc}")
+            self.result.stopped = self.result.stopped or "refused"
+        except Exception as exc:  # noqa: BLE001
+            self.say(f"ERROR ({type(exc).__name__}); going on to the clean-up")
+        finally:
+            self._cleanup(run)
+        self.say("=== DONE. Ids for a manual clean-up are above (terminal only; nothing was stored) ===")
+        return self.result
+
+    # -- create the bill payer ------------------------------------------------------ #
+    def _create_bill_payer(self, run: _Run, child_id, share):
+        """ONE billPayers.create. Returns the clock value it started at, or None if it
+        was rejected. An unknown outcome is settled by the scans that follow."""
+        payload = make_input(run.plan, run.site_id, self._email, run.external_id, child_id, share)
+        variables = {"input": [payload] if "[" in run.plan.create_arg_type else payload}
+        self.say("VARIABLES TO SEND: " + json.dumps(variables))      # the email is redacted by `say`
+        self.budget.spend("billpayer_create")
+        self.say(f"SENDING billPayers.create (externalId {run.external_id}) ...")
+        started = self.clock()
+        run.share_children.append(child_id)          # it has a share if the create landed
+        try:
+            body = self._send(create_document(run.plan), variables, CREATE_OP, "create")
         except (GraphQLError, GraphQLHTTPError) as exc:
             self.say(f"REJECTED (sent once, not retried, no variants tried): {self._error(exc)}")
             self.result.stopped = "rejected"
+            run.share_children.remove(child_id)
             return None
         except (requests.RequestException, TimeoutError, ConnectionError) as exc:
             self.say(f"UNKNOWN OUTCOME ({type(exc).__name__}); not resent; settling with a scan")
-            body = None
         else:
             self.say(f"RAW RESPONSE: {json.dumps(body)}")
-            bill_payer_id = self._created_id(body)
-            if bill_payer_id:
-                self.say(f"BILL PAYER id (terminal only): {bill_payer_id}")
+            run.bill_payer_id = self._created_id(body)
+            if run.bill_payer_id:
+                self.say(f"BILL PAYER id (terminal only): {run.bill_payer_id}")
             self.result.bill_payer_created = True
+        return started
 
-        # Read-after-write lag: immediately, after 10 s and after 60 s.
-        for offset in SCAN_OFFSETS:
+    def _measure(self, run: _Run, child_id, started, offsets, label_format) -> None:
+        """Read-after-write lag: scan at each offset after `started`."""
+        for offset in offsets:
             wait = offset - (self.clock() - started)
             if wait > 0:
                 self.sleep(wait)
-            found = probe_scan(self.public, site_id, shape, include_deleted, email_key,
-                               external_id, child_id)
-            self.say(f"T+{offset:>2}s scan: found by email={_yes(found['byEmail'] > 0)} "
+            found = probe_scan(self.public, run.site_id, run.shape, False, run.email_key,
+                               run.external_id, child_id)
+            self.say(f"{label_format.format(offset)} scan: found by email={_yes(found['byEmail'] > 0)} "
                      f"(count {found['byEmail']}), found by externalId={_yes(found['byExternalId'] > 0)} "
                      f"(count {found['byExternalId']}), child attached={_yes(found['attached'])}")
-            if found["id"] and not bill_payer_id:
-                bill_payer_id = found["id"]
+            if found["id"] and not run.bill_payer_id:
+                run.bill_payer_id = found["id"]
                 self.result.bill_payer_created = True
-                self.say(f"BILL PAYER id (terminal only, found by scan): {bill_payer_id}")
-        return bill_payer_id
+                self.say(f"BILL PAYER id (terminal only, found by scan): {run.bill_payer_id}")
+
+    # -- addChildren, once ----------------------------------------------------------- #
+    def _add_children(self, run: _Run, second_child, share) -> None:
+        op = run.plan.add_children
+        variables = {"input": [make_add_entry(op, second_child, run.bill_payer_id, share)]
+                     if op.is_list else make_add_entry(op, second_child, run.bill_payer_id, share)}
+        self.say("VARIABLES TO SEND (addChildren): " + json.dumps(variables))
+        self.budget.spend("billpayer_addchildren")
+        self.say("SENDING billPayers.addChildren ...")
+        run.share_children.append(second_child)       # remove it in the clean-up either way
+        try:
+            body = self._send(add_children_document(op), variables, ADD_CHILDREN_OP, "addChildren")
+        except (GraphQLError, GraphQLHTTPError) as exc:
+            self.say(f"addChildren REJECTED (sent once, not retried): {self._error(exc)}")
+            self.result.stopped = "add_rejected"
+            return
+        except (requests.RequestException, TimeoutError, ConnectionError) as exc:
+            self.say(f"addChildren OUTCOME UNKNOWN ({type(exc).__name__}); not resent")
+            return
+        self.result.children_added = True
+        self.say(f"addChildren RAW RESPONSE: {json.dumps(body)}")
+        returned = ((body or {}).get("data") or {}).get("billPayers", {}).get("addChildren")
+        if isinstance(returned, list):
+            returned = returned[0] if returned else None
+        if isinstance(returned, dict) and run.shape["children_field"]:
+            entries = runner._child_entries(returned, run.shape)
+            ids = {c for c, _m in entries}
+            self.say(f"addChildren RETURNED the second child: {_yes(second_child in ids)}; "
+                     f"entries returned: {len(entries)}")
+        else:
+            self.say("addChildren returned no children to inspect")
+
+    def _measure_attach(self, run: _Run, first_child, second_child) -> None:
+        started = self.clock()
+        for offset in ATTACH_OFFSETS:
+            wait = offset - (self.clock() - started)
+            if wait > 0:
+                self.sleep(wait)
+            found = probe_scan(self.public, run.site_id, run.shape, False, run.email_key,
+                               run.external_id, second_child, bill_payer_id=run.bill_payer_id)
+            by_child = {c: m for c, m in found["entries"]}
+            parts = []
+            for label, child in (("child 1", first_child), ("child 2", second_child)):
+                if child is None:
+                    continue
+                m = by_child.get(child)
+                parts.append(f"{label} listed={_yes(child in by_child)}"
+                             + (f" multiplier={m:.3f}" if m is not None else ""))
+            both = all(c in by_child for c in (first_child, second_child) if c)
+            self.say(f"T+{offset:>2}s after addChildren: the payer lists {len(found['entries'])} "
+                     f"child entr{'y' if len(found['entries']) == 1 else 'ies'}; "
+                     f"both test children listed={_yes(both)}; " + "; ".join(parts))
 
     @staticmethod
     def _created_id(body) -> str | None:
@@ -505,51 +851,128 @@ class Probe:
             return str(created.get("billPayerId") or "") or None
         return str(created) if created else None
 
-    # -- the clean-up: bill payer first, then the child ----------------------------- #
-    def _cleanup(self, plan, shape, site_id, email_key, external_id, child_id, bill_payer_id,
-                 include_deleted, session) -> None:
-        if bill_payer_id:
-            self._delete_bill_payer(plan, shape, site_id, email_key, external_id, child_id,
-                                    bill_payer_id)
-        if session is not None and child_id and self.result.test_child_created:
+    # -- the clean-up: shares, then the bill payer, then the children --------------- #
+    def _cleanup(self, run: _Run) -> None:
+        shares_gone = self._delete_shares(run)
+        if run.bill_payer_id and run.owns_bill_payer:
+            if shares_gone:
+                self._delete_bill_payer(run)
+            else:
+                self.say("NOT DELETING the bill payer: its shares could not be removed and Famly "
+                         "refuses to archive a bill payer with shares")
+                self.say(f"DELETE THIS BILL PAYER BY HAND (remove its shares first): {run.bill_payer_id}")
+        elif run.bill_payer_id:
+            self.say(f"The existing bill payer was left in place: {run.bill_payer_id}")
+        self._delete_test_children(run)
+
+    def _delete_shares(self, run: _Run) -> bool:
+        """billPayers.deleteChildren for every share this run made. One request when the
+        argument is a list. True if there is nothing left to remove."""
+        if not run.bill_payer_id or not run.share_children:
+            return True
+        op = run.plan.delete_children
+        if op is None:
+            self.say(f"NO DELETECHILDREN ({run.plan.delete_children_unusable}); remove the shares by hand")
+            return False
+        entries = [make_delete_entry(op, c, run.bill_payer_id) for c in run.share_children]
+        batches = [entries] if op.is_list else [[e] for e in entries]
+        for batch in batches:
+            variables = {"input": batch if op.is_list else batch[0]}
             try:
-                self.result.test_child_deleted = session.delete_child(child_id)
+                self.budget.spend("billpayer_deletechildren")
+            except ProbeRefused as exc:
+                self.say(f"STOPPED: {exc}")
+                return False
+            self.say("SENDING billPayers.deleteChildren (the probe's shares only) ...")
+            try:
+                body = self._send(delete_children_document(op), variables, DELETE_CHILDREN_OP,
+                                  "deleteChildren")
+            except (GraphQLError, GraphQLHTTPError) as exc:
+                self.say(f"deleteChildren REJECTED (sent once, not retried): {self._error(exc)}")
+                return False
+            except (requests.RequestException, TimeoutError, ConnectionError) as exc:
+                self.say(f"deleteChildren OUTCOME UNKNOWN ({type(exc).__name__}); not resent")
+                return False
+            self.say(f"deleteChildren RAW RESPONSE: {json.dumps(body)}")
+        self.result.shares_deleted = True
+        return True
+
+    def _delete_test_children(self, run: _Run) -> None:
+        deleted_all = True
+        for child in run.test_children:
+            if child in run.deleted_children:
+                continue
+            try:
+                ok = run.session.delete_child(child)
             except ProbeRefused as exc:
                 self.say(f"TEST CHILD NOT DELETED: {exc}")
+                ok = False
             except Exception as exc:  # noqa: BLE001
                 self.say(f"TEST CHILD NOT DELETED ({type(exc).__name__})")
-            if not self.result.test_child_deleted:
-                self.say(f"DELETE THIS TEST CHILD BY HAND: {child_id}")
+                ok = False
+            if ok:
+                run.deleted_children.add(child)
+            else:
+                deleted_all = False
+                self.say(f"DELETE THIS TEST CHILD BY HAND: {child}")
+        self.result.test_child_deleted = bool(run.test_children) and deleted_all
 
-    def _delete_bill_payer(self, plan, shape, site_id, email_key, external_id, child_id,
-                           bill_payer_id) -> None:
+    def _delete_bill_payer(self, run: _Run) -> bool:
+        plan = run.plan
         if plan.delete_arg is None:
             self.say(f"NO SAFE DELETE ({plan.delete_unusable}). DELETE THIS BILL PAYER IN THE "
-                     f"FAMLY UI: {bill_payer_id}")
-            return
-        variables = {"id": [bill_payer_id] if plan.delete_is_list else bill_payer_id}
+                     f"FAMLY UI: {run.bill_payer_id}")
+            return False
+        variables = {"id": [run.bill_payer_id] if plan.delete_is_list else run.bill_payer_id}
         assert set(variables) == {"id"}
         try:
             self.budget.spend("billpayer_delete")
         except ProbeRefused as exc:
             self.say(f"STOPPED: {exc}")
-            return
+            return False
         self.say("SENDING billPayers.delete (the bill payer id only) ...")
         try:
             body = self._send(delete_document(plan), variables, DELETE_OP, "delete")
         except (GraphQLError, GraphQLHTTPError) as exc:
             self.say(f"DELETE REJECTED (sent once, not retried): {self._error(exc)}")
-            self.say(f"DELETE THIS BILL PAYER BY HAND: {bill_payer_id}")
-            return
+            self.say(f"DELETE THIS BILL PAYER BY HAND: {run.bill_payer_id}")
+            return False
         except (requests.RequestException, TimeoutError, ConnectionError) as exc:
             self.say(f"DELETE OUTCOME UNKNOWN ({type(exc).__name__}); not resent")
-            self.say(f"CHECK / DELETE THIS BILL PAYER BY HAND: {bill_payer_id}")
-            return
+            self.say(f"CHECK / DELETE THIS BILL PAYER BY HAND: {run.bill_payer_id}")
+            return False
         self.say(f"DELETE RAW RESPONSE: {json.dumps(body)}")
         self.result.bill_payer_deleted = True
         for flag in (False, True):
-            found = probe_scan(self.public, site_id, shape, flag, email_key, external_id, child_id)
+            found = probe_scan(self.public, run.site_id, run.shape, flag, run.email_key,
+                               run.external_id, "")
             label = "includeDeleted=" + str(flag).lower()
             hidden = found["byExternalId"] == 0 and found["byEmail"] == 0
             self.say(f"AFTER DELETE ({label}): still returned = {_yes(not hidden)}"
                      f" (by email {found['byEmail']}, by externalId {found['byExternalId']})")
+        return True
+
+    # -- the experiment: does deleting a child release its share? ---------------------- #
+    def _cleanup_delete_after_child_delete(self, run: _Run) -> None:
+        if not run.bill_payer_id:
+            self._delete_test_children(run)
+            return
+        self.say("=== EXPERIMENT: delete the test child first, then try billPayers.delete once ===")
+        self._delete_test_children(run)
+        child_deleted = self.result.test_child_deleted
+        if not child_deleted:
+            self.say("The test child was not deleted, so the experiment cannot be read; "
+                     "falling back to the normal clean-up")
+        deleted = self._delete_bill_payer(run) if run.owns_bill_payer else False
+        if child_deleted:
+            self.say("EXPERIMENT RESULT: after the test child was deleted, billPayers.delete was "
+                     + ("ACCEPTED, so deleting a child RELEASES its share" if deleted else
+                        "REFUSED or not completed, so deleting a child does NOT release its share "
+                        "(see the line above)"))
+        if deleted:
+            return
+        # The fallback: remove the share, then the second (and last) delete.
+        if self._delete_shares(run):
+            self._delete_bill_payer(run)
+        else:
+            self.say(f"DELETE THIS BILL PAYER BY HAND (remove its shares first): {run.bill_payer_id}")
