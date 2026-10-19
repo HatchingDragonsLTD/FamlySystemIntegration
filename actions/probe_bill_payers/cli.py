@@ -27,6 +27,11 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--sites", default=DEFAULT_SITES,
                         help=f"Site codes (default {DEFAULT_SITES})")
     parser.add_argument(
+        "--types", default="", metavar="A,B",
+        help="Schema report only: also print these types in full "
+             f"(use `default` for {','.join(runner.DEFAULT_TYPES)})",
+    )
+    parser.add_argument(
         "--api", choices=("public", "internal"), default="public",
         help="Which Famly GraphQL API the schema report reads (the audit is public-only)",
     )
@@ -43,7 +48,9 @@ def handle(args: argparse.Namespace):
     if args.env:
         load_dotenv(args.env, override=False)
     if args.report == "schema":
-        for line in runner.run_schema(_client(args.api)):
+        names = runner.DEFAULT_TYPES if args.types == "default" else tuple(
+            n.strip() for n in args.types.split(",") if n.strip())
+        for line in runner.run_schema(_client(args.api), names):
             print(line)
         return {"api": args.api, "report": "schema"}
 
