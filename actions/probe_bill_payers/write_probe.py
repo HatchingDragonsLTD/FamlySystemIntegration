@@ -168,6 +168,11 @@ class WritePlan:
     blockers: list[str] = field(default_factory=list)
 
 
+# Fields that need an extra permission to READ. Selecting one can turn a successful
+# mutation into an HTTP 403 whose `data` still holds the created record.
+SENSITIVE_FIELDS = frozenset({"socialSecurityNumber", "accountNumber", "sortCode"})
+
+
 def selection_for(by_name: dict, type_ref) -> str:
     """The selection set for a mutation's RETURN TYPE, read from the live schema (never
     hand-assumed): every scalar/enum field that needs no arguments, plus `share { ... }`
@@ -182,7 +187,7 @@ def selection_for(by_name: dict, type_ref) -> str:
 
     def scalar_names(obj) -> list[str]:
         return [f["name"] for f in obj.get("fields") or []
-                if no_required_args(f)
+                if f["name"] not in SENSITIVE_FIELDS and no_required_args(f)
                 and (by_name.get(runner.named_type(f["type"]) or "") or {}).get("kind", "SCALAR")
                 in ("SCALAR", "ENUM")]
 
@@ -279,9 +284,11 @@ def plan_from_schema(body: dict, shape: dict | None = None) -> WritePlan:
         if others:
             plan.blockers.append(f"billPayers.create has other required arguments: {', '.join(others)}")
         ret = by_name.get(runner.named_type(create["type"]) or "") or {}
-        plan.create_select = selection_for(by_name, create["type"])
-        if ret.get("kind") == "OBJECT" and not any(
-                f["name"] == "billPayerId" for f in ret.get("fields") or []):
+        # MINIMAL: only the id. Reading anything else back is a way to turn a mutation that
+        # ran into an error response (e.g. a field the token may not read).
+        if ret.get("kind") == "OBJECT" and any(f["name"] == "billPayerId" for f in ret.get("fields") or []):
+            plan.create_select = " { billPayerId }"
+        elif ret.get("kind") == "OBJECT":
             plan.blockers.append("billPayers.create returns an object with no billPayerId")
 
     # ---- delete ---------------------------------------------------------------
@@ -446,6 +453,7 @@ def probe_scan(client, site_id, shape, include_deleted, email_key, external_id, 
         entries: list = []
         id_seen = False
         id_probe_ok = False
+        found_deleted = None
         cursor, pages = None, 0
         while pages < runner.MAX_PAGES:
             variables = {"siteIds": [site_id], "next": cursor, "includeDeleted": include_deleted}
@@ -466,7 +474,9 @@ def probe_scan(client, site_id, shape, include_deleted, email_key, external_id, 
                     id_seen = True
                     id_probe_ok = ext_text.startswith("probe-") and is_email
                 if is_email or is_ext:
-                    found_id = found_id or str(node.get("billPayerId"))
+                    if found_id is None:
+                        found_id = str(node.get("billPayerId"))
+                        found_deleted = bool(node.get("deletedAt"))
                 if (is_ext or is_id) and shape["children_field"]:
                     entries = runner._child_entries(node, shape)
                     attached = child_id in {c for c, _m in entries}
@@ -474,7 +484,8 @@ def probe_scan(client, site_id, shape, include_deleted, email_key, external_id, 
             if not cursor:
                 break
         return {"byEmail": by_email, "byExternalId": by_ext, "attached": attached,
-                "id": found_id, "entries": entries, "idSeen": id_seen, "idProbeOk": id_probe_ok}
+                "id": found_id, "deleted": found_deleted, "entries": entries, "idSeen": id_seen,
+                "idProbeOk": id_probe_ok}
     finally:
         os.unlink(handle.name)
 
@@ -791,19 +802,69 @@ class Probe:
         try:
             body = self._send(create_document(run.plan), variables, CREATE_OP, "create")
         except (GraphQLError, GraphQLHTTPError) as exc:
+            # An error status or an `errors` array does NOT mean the mutation did not run.
             self._rejection("create", exc)
+            salvaged = self._data_id(exc)
+            if salvaged:
+                self.say("create: the response carried errors AND data with a billPayerId, so the "
+                         "mutation RAN; treating it as created (never resent)")
+                run.bill_payer_id = salvaged
+                self.result.bill_payer_created = True
+                self.say(f"BILL PAYER id (terminal only): {run.bill_payer_id}")
+                return started
+            self._settle(run, child_id)
             self.result.stopped = "rejected"
-            run.share_children.remove(child_id)
             return None
         except (requests.RequestException, TimeoutError, ConnectionError) as exc:
             self.say(f"UNKNOWN OUTCOME ({type(exc).__name__}); not resent; settling with a scan")
+            self._settle(run, child_id)
         else:
             self.say(f"RAW RESPONSE: {json.dumps(body)}")
             run.bill_payer_id = self._created_id(body)
             if run.bill_payer_id:
                 self.say(f"BILL PAYER id (terminal only): {run.bill_payer_id}")
-            self.result.bill_payer_created = True
+                self.result.bill_payer_created = True
+            else:
+                self.say("create returned no billPayerId; settling with a scan")
+                self._settle(run, child_id)
         return started
+
+    def _settle(self, run: _Run, child_id) -> None:
+        """The create was not a clean success, so look. Scan with includeDeleted TRUE by the
+        probe externalId and the test email: if a record exists the create ran, and the
+        clean-up must run on it. The create is never sent again."""
+        found = probe_scan(self.public, run.site_id, run.shape, True, run.email_key,
+                           run.external_id, child_id)
+        self.say(f"SETTLE scan (includeDeleted=true): found by email={_yes(found['byEmail'] > 0)} "
+                 f"(count {found['byEmail']}), found by externalId={_yes(found['byExternalId'] > 0)} "
+                 f"(count {found['byExternalId']})")
+        if not found["id"]:
+            if child_id in run.share_children:
+                run.share_children.remove(child_id)         # nothing was created: no share to remove
+            self.say("SETTLED: no record exists; the create did not run")
+            return
+        if found["deleted"]:
+            self.say("SETTLED: a record exists but is already archived; nothing to clean up")
+            run.share_children.clear()
+            return
+        run.bill_payer_id = found["id"]
+        self.result.bill_payer_created = True
+        self.say(f"SETTLED: the create DID run. BILL PAYER id (terminal only, found by scan): "
+                 f"{run.bill_payer_id}; the clean-up will remove it")
+
+    @staticmethod
+    def _data_id(exc) -> str | None:
+        """The billPayerId in `data` of an error response, if there is one. A GraphQLError
+        carries the parsed body; an HTTP error carries it as text."""
+        body = getattr(exc, "body", None)
+        if isinstance(body, str):
+            try:
+                body = json.loads(body)
+            except ValueError:
+                return None
+        if not isinstance(body, dict):
+            return None
+        return Probe._created_id({"data": body.get("data")}) if body.get("data") else None
 
     def _measure(self, run: _Run, child_id, started, offsets, label_format) -> None:
         """Read-after-write lag: scan at each offset after `started`."""

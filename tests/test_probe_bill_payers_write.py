@@ -142,6 +142,7 @@ class FakeFamly:
         self.scan_flags = []
         self.writes = []                 # (operation, variables, document text)
         self.create_error = None
+        self.create_after_error = None   # the create RUNS (the record exists), THEN this is raised
         self.delete_error = None
         self.add_error = None
         self.delete_children_error = None
@@ -190,6 +191,8 @@ class FakeFamly:
                      "deleted": False, "visible_at": self.scans + self.lag_scans}
             self.next_id += 1
             self.payers.append(payer)
+            if self.create_after_error:
+                raise self.create_after_error
             return {"data": {"billPayers": {"create": [{"billPayerId": payer["id"]}]}}}
         if op == write_probe.ADD_CHILDREN_OP:
             self.writes.append((op, variables, text))
@@ -1005,9 +1008,22 @@ class SelectionTests(unittest.TestCase):
         plan = write_probe.plan_from_schema({"data": {"__schema": s_}})
         self.assertEqual(plan.add_children.select, " { billPayerId childId addedAt }")   # no share, no objects
 
-    def test_create_selects_scalars_only_from_the_bill_payer_type(self):
+    def test_create_selects_only_the_id(self):
         plan = self.plan()
-        self.assertEqual(plan.create_select, " { billPayerId email externalId deletedAt }")
+        self.assertEqual(plan.create_select, " { billPayerId }")
+        self.assertIn("create(billPayers: $input) { billPayerId }", write_probe.create_document(plan))
+
+    def test_fields_that_need_extra_permission_are_never_selected(self):
+        s_ = schema()
+        for t in s_["types"]:
+            if t["name"] == "BillPayerChildShareType":
+                t["fields"] += [{"name": name, "args": [], "type": _t("SCALAR", "String")}
+                                for name in ("socialSecurityNumber", "accountNumber", "sortCode")]
+        plan = write_probe.plan_from_schema({"data": {"__schema": s_}})
+        for select in (plan.add_children.select, plan.delete_children.select, plan.create_select):
+            for name in ("socialSecurityNumber", "accountNumber", "sortCode"):
+                self.assertNotIn(name, select)
+        self.assertEqual(plan.add_children.select, " { billPayerId childId share { multiplier } }")
 
     def test_a_scalar_return_gets_no_selection(self):
         plan = self.plan()
@@ -1066,6 +1082,112 @@ class AfterDeleteChildrenTests(unittest.TestCase):
         _famly, _probe, _result, lines, _clock = AttachTests().attach()
         self.assertTrue(any(l.startswith("AFTER deleteChildren: the payer lists 0 child entries")
                             for l in lines))
+
+
+def error_body_with_data(bill_payer_id="bp-1"):
+    return json.dumps({
+        "errors": [{"message": "not authorised to read socialSecurityNumber"}],
+        "data": {"billPayers": {"create": [{"billPayerId": bill_payer_id}]}}})
+
+
+class CreateRanDespiteErrorsTests(unittest.TestCase):
+    """An HTTP error or an `errors` array does NOT mean the mutation did not run. The live
+    create answered 403 because a selected field was not readable, but `data` held the
+    created record: the probe called it a failure and left a live orphan."""
+
+    def assert_cleaned_up(self, famly, result, lines):
+        self.assertEqual(len(famly.mutations(write_probe.CREATE_OP)), 1)            # never resent
+        self.assertTrue(result.bill_payer_created)
+        self.assertEqual(len(famly.mutations(write_probe.DELETE_CHILDREN_OP)), 1)   # the share is removed
+        self.assertEqual(len(famly.mutations(write_probe.DELETE_OP)), 1)            # and the payer archived
+        self.assertTrue(famly.payers[0]["deleted"])
+        self.assertEqual(famly.payers[0]["shares"], {})
+
+    def test_http_403_with_errors_and_data_is_treated_as_created_and_cleaned_up(self):
+        famly = FakeFamly()
+        famly.create_after_error = GraphQLHTTPError("forbidden", 403, error_body_with_data())
+        famly, _probe, result, lines, _clock = run(famly=famly, child_id=None, create_test_child=True)
+        self.assert_cleaned_up(famly, result, lines)
+        text = "\n".join(lines)
+        self.assertIn("the response carried errors AND data with a billPayerId, so the mutation RAN", text)
+        self.assertIn("BILL PAYER id (terminal only): bp-1", text)
+        self.assertNotEqual(result.stopped, "rejected")
+
+    def test_a_200_with_errors_and_data_is_treated_the_same_way(self):
+        famly = FakeFamly()
+        body = json.loads(error_body_with_data())
+        famly.create_after_error = GraphQLError("errors", body["errors"], body=body)
+        famly, _probe, result, lines, _clock = run(famly=famly, child_id=None, create_test_child=True)
+        self.assert_cleaned_up(famly, result, lines)
+
+    def test_a_server_error_after_the_record_was_created_is_settled_by_a_scan(self):
+        famly = FakeFamly()
+        famly.create_after_error = GraphQLHTTPError("boom", 500, "")          # no data at all
+        famly, _probe, result, lines, _clock = run(famly=famly, child_id=None, create_test_child=True)
+        self.assert_cleaned_up(famly, result, lines)
+        text = "\n".join(lines)
+        self.assertIn("SETTLED: the create DID run", text)
+        self.assertIn(True, famly.scan_flags[1:])               # the settle scan used includeDeleted=true
+
+    def test_a_timeout_after_the_record_was_created_is_settled_and_cleaned_up(self):
+        famly = FakeFamly()
+        famly.create_after_error = requests.Timeout()
+        famly, _probe, result, lines, _clock = run(famly=famly, child_id=None, create_test_child=True)
+        self.assert_cleaned_up(famly, result, lines)
+
+    def test_every_non_clean_response_settles_by_scan_and_never_resends(self):
+        errors = [requests.Timeout(), requests.ConnectionError(), GraphQLHTTPError("x", 500, ""),
+                  GraphQLHTTPError("x", 429, ""), GraphQLHTTPError("x", 403, "{}"),
+                  GraphQLHTTPError("x", 400, TRANSIENT_400), GraphQLError("x", [{"message": "m"}])]
+        for error in errors:
+            with self.subTest(error=type(error).__name__):
+                famly = FakeFamly()
+                famly.create_after_error = error                      # it ran, whatever came back
+                famly, _probe, result, lines, _clock = run(famly=famly, child_id=None, create_test_child=True)
+                self.assertEqual(len(famly.mutations(write_probe.CREATE_OP)), 1)
+                self.assertTrue(famly.payers[0]["deleted"])           # no orphan left behind
+                self.assertEqual(famly.payers[0]["shares"], {})
+
+    def test_when_the_create_really_did_not_run_nothing_is_cleaned_up(self):
+        for error in (GraphQLHTTPError("x", 400, TRANSIENT_400), requests.Timeout()):
+            with self.subTest(error=type(error).__name__):
+                famly = FakeFamly()
+                famly.create_error = error                            # raised BEFORE anything is created
+                famly, _probe, result, lines, _clock = run(famly=famly, child_id=None, create_test_child=True)
+                self.assertEqual(len(famly.mutations(write_probe.CREATE_OP)), 1)
+                self.assertEqual(famly.mutations(write_probe.DELETE_CHILDREN_OP), [])
+                self.assertEqual(famly.mutations(write_probe.DELETE_OP), [])
+                self.assertIn("SETTLED: no record exists; the create did not run", "\n".join(lines))
+                self.assertFalse(result.bill_payer_created)
+
+    def test_a_validation_failure_is_settled_too_and_finds_nothing(self):
+        famly = FakeFamly()
+        famly.validation_errors[write_probe.CREATE_OP] = True
+        famly, _probe, result, lines, _clock = run(famly=famly, child_id=None, create_test_child=True)
+        self.assertIn("rejected at validation, nothing was executed", "\n".join(lines))
+        self.assertIn("SETTLED: no record exists", "\n".join(lines))
+        self.assertEqual(famly.mutations(write_probe.DELETE_OP), [])
+
+    def test_attach_carries_on_after_a_403_with_data_and_cleans_both_shares(self):
+        famly = FakeFamly()
+        famly.create_after_error = GraphQLHTTPError("forbidden", 403, error_body_with_data())
+        famly, _probe, result, lines, _clock = AttachTests().attach(famly=famly)
+        self.assertEqual(len(famly.mutations(write_probe.CREATE_OP)), 1)
+        self.assertEqual(len(famly.mutations(write_probe.ADD_CHILDREN_OP)), 1)       # it went on
+        self.assertEqual(len(famly.mutations(write_probe.DELETE_CHILDREN_OP)), 1)
+        self.assertTrue(famly.payers[0]["deleted"])
+
+    def test_the_create_is_never_sent_twice_in_attach_either(self):
+        famly = FakeFamly()
+        famly.create_after_error = GraphQLHTTPError("x", 500, "")
+        famly, *_ = AttachTests().attach(famly=famly)
+        self.assertEqual(len(famly.mutations(write_probe.CREATE_OP)), 1)
+        self.assertTrue(famly.payers[0]["deleted"])
+
+    def test_graphql_error_carries_the_whole_body(self):
+        err = GraphQLError("m", [{"message": "x"}], body={"data": {"a": 1}, "errors": [{"message": "x"}]})
+        self.assertEqual(err.body["data"], {"a": 1})
+        self.assertIsNone(GraphQLError("m", []).body)           # the old two-argument form still works
 
 
 if __name__ == "__main__":
