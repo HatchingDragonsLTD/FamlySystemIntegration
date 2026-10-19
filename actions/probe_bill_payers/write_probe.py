@@ -114,6 +114,8 @@ class WritePlan:
     share_field: str | None = None
     share_required: bool = False
     share_hint: str = ""
+    share_is_object: bool = False
+    share_wrap_key: str | None = None
     blockers: list[str] = field(default_factory=list)
 
 
@@ -205,6 +207,11 @@ def plan_from_schema(body: dict) -> WritePlan:
                 plan.share_field, plan.share_required = name, _required(f)
                 plan.share_hint = (f"{name}: {runner.type_str(f['type'])}"
                                    + (f" = {f['defaultValue']}" if f.get("defaultValue") is not None else ""))
+                share_type = by_name.get(runner.named_type(f["type"]) or "") or {}
+                if share_type.get("kind") == "INPUT_OBJECT":
+                    plan.share_is_object = True
+                    inner = share_type.get("inputFields") or []
+                    plan.share_wrap_key = inner[0]["name"] if len(inner) == 1 else None
 
     handled = {"siteId", "name", "email", "externalId", plan.children_field}
     unfillable = [n for n, f in fields.items() if n not in handled and _required(f)]
@@ -223,6 +230,23 @@ def delete_document(plan: WritePlan) -> str:
             f"{{ delete({plan.delete_arg}: $id){plan.delete_select} }} }}\n")
 
 
+def build_share(plan: WritePlan, raw):
+    """The share value to send. `--share 1.0` is wrapped into the share input's own
+    single field (`{"multiplier": 1.0}`); a full JSON object is sent as given."""
+    if raw is None or not plan.share_field:
+        return None
+    if plan.share_is_object:
+        if isinstance(raw, dict):
+            return raw
+        if isinstance(raw, (int, float)) and not isinstance(raw, bool) and plan.share_wrap_key:
+            return {plan.share_wrap_key: float(raw)}
+        raise ProbeRefused("refusing: --share must be a number, or a full JSON object for "
+                           f"the share input ({plan.share_hint})")
+    if isinstance(raw, dict):
+        raise ProbeRefused(f"refusing: the share field is not an object ({plan.share_hint})")
+    return raw
+
+
 def make_input(plan: WritePlan, site_id: str, email: str, external_id: str, child_id: str, share) -> dict:
     payload = {plan.site_field: site_id, plan.name_field: PROBE_NAME,
                plan.external_field: external_id}
@@ -239,7 +263,10 @@ def make_input(plan: WritePlan, site_id: str, email: str, external_id: str, chil
 # Scanning for the probe bill payer (in memory; nothing is printed but booleans)
 # --------------------------------------------------------------------------- #
 def probe_scan(client, site_id, shape, include_deleted, email_key, external_id, child_id) -> dict:
-    text = runner.build_query(shape, include_deleted is not None)
+    """One full scan with `includeDeleted` passed EXPLICITLY (a bool, never omitted)."""
+    if not isinstance(include_deleted, bool):
+        raise ProbeRefused("refusing: a scan must pass includeDeleted explicitly")
+    text = runner.build_query(shape, True)
     handle = tempfile.NamedTemporaryFile("w", suffix=".graphql", delete=False, encoding="utf-8")
     try:
         handle.write(text)
@@ -251,9 +278,7 @@ def probe_scan(client, site_id, shape, include_deleted, email_key, external_id, 
         found_id = None
         cursor, pages = None, 0
         while pages < runner.MAX_PAGES:
-            variables = {"siteIds": [site_id], "next": cursor}
-            if include_deleted is not None:
-                variables["includeDeleted"] = bool(include_deleted)
+            variables = {"siteIds": [site_id], "next": cursor, "includeDeleted": include_deleted}
             body = client.execute(query_path=path, variables=variables,
                                   operation_name=runner.BILL_PAYERS_OP)
             pages += 1
@@ -361,6 +386,10 @@ class Probe:
         schema_body = runner.fetch_schema(self.public)
         plan = plan_from_schema(schema_body)
         shape = runner.discover_shape(schema_body)
+        try:
+            runner.require_include_deleted(shape)
+        except runner.AuditRefused as exc:
+            raise ProbeRefused(str(exc)) from None
         if plan.blockers:
             for blocker in plan.blockers:
                 self.say(f"STOPPED before any write: {blocker}")
@@ -371,13 +400,14 @@ class Probe:
                      "give --share with the format found in the schema report")
             self.result.stopped = "share"
             return self.result
+        share = build_share(plan, share)        # a bad --share refuses before any write
         self.say(f"children input: {plan.children_field}[{plan.child_id_field}"
                  + (f", {plan.share_hint}" if plan.share_field else "") + "]")
         self.say("delete: " + (f"{plan.delete_arg}: {plan.delete_arg_type}" if plan.delete_arg
                                else f"UNAVAILABLE ({plan.delete_unusable})"))
 
-        include_deleted = False if shape["include_deleted_type"] else None
-        scan_flag = True if shape["include_deleted_type"] else None   # also sees deleted twins
+        include_deleted = False        # the live view, as the pipeline will scan
+        scan_flag = True               # the pre-scan also sees deleted twins
         stamp = self.utcnow().strftime("%Y%m%dT%H%M%SZ")
         external_id = f"probe-{stamp}"
         email_key = normalise_email(self._email)
@@ -427,6 +457,8 @@ class Probe:
                             include_deleted):
         payload = make_input(plan, site_id, self._email, external_id, child_id, share)
         variables = {"input": [payload] if "[" in plan.create_arg_type else payload}
+        # The exact variable about to be sent (the test email is redacted by `say`).
+        self.say("VARIABLES TO SEND: " + json.dumps(variables))
         self.budget.spend("billpayer_create")
         self.say(f"SENDING billPayers.create (externalId {external_id}) ...")
         started = self.clock()
@@ -516,12 +548,8 @@ class Probe:
         self.say(f"DELETE RAW RESPONSE: {json.dumps(body)}")
         self.result.bill_payer_deleted = True
         for flag in (False, True):
-            if flag and not shape["include_deleted_type"]:
-                self.say("includeDeleted is not an argument of the list query; not testable")
-                continue
-            found = probe_scan(self.public, site_id, shape, flag if shape["include_deleted_type"] else None,
-                               email_key, external_id, child_id)
-            label = "includeDeleted=" + str(flag).lower() if shape["include_deleted_type"] else "server default"
+            found = probe_scan(self.public, site_id, shape, flag, email_key, external_id, child_id)
+            label = "includeDeleted=" + str(flag).lower()
             hidden = found["byExternalId"] == 0 and found["byEmail"] == 0
             self.say(f"AFTER DELETE ({label}): still returned = {_yes(not hidden)}"
                      f" (by email {found['byEmail']}, by externalId {found['byExternalId']})")

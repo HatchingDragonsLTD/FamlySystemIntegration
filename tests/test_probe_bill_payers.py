@@ -1,4 +1,4 @@
-"""probe-bill-payers: read-only, counts only. Fakes only; nothing is sent anywhere."""
+"""probe-bill-payers (read-only parts): counts only. Fakes only; nothing is sent anywhere."""
 
 import json
 import re
@@ -21,13 +21,19 @@ def _list(inner):
     return _t("LIST", None, inner)
 
 
-def schema(include_deleted=True, children="childShares", external_id=True):
+def schema(include_deleted=True, children="childShares", external_id=True, deleted_at=True,
+           query_type="BillPayerQueries", root_link=True):
+    """The public schema's shape: `listBySiteIds(siteIds, nextToken,
+    includeDeleted: Boolean! = true)`, on an object whose name does NOT begin with
+    "BillPayers" (the old detector looked for that and so found nothing)."""
     bill_payer_fields = [
         {"name": "billPayerId", "args": [], "type": _nn(_t("SCALAR", "UniqueId"))},
         {"name": "email", "args": [], "type": _t("SCALAR", "String")},
     ]
     if external_id:
         bill_payer_fields.append({"name": "externalId", "args": [], "type": _t("SCALAR", "String")})
+    if deleted_at:
+        bill_payer_fields.append({"name": "deletedAt", "args": [], "type": _t("SCALAR", "DateTime")})
     if children:
         bill_payer_fields.append({"name": children, "args": [],
                                   "type": _nn(_list(_nn(_t("OBJECT", "ChildShare"))))})
@@ -36,16 +42,17 @@ def schema(include_deleted=True, children="childShares", external_id=True):
         {"name": "nextToken", "type": _t("SCALAR", "BillPayerCursor")},
     ]
     if include_deleted:
-        list_args.append({"name": "includeDeleted", "type": _t("SCALAR", "Boolean"),
-                          "defaultValue": "false"})
+        list_args.append({"name": "includeDeleted", "type": _nn(_t("SCALAR", "Boolean")),
+                          "defaultValue": "true"})
     return {
         "queryType": {"name": "Query"}, "mutationType": {"name": "Mutation"},
         "types": [
-            {"kind": "OBJECT", "name": "Query", "fields": [
-                {"name": "billPayers", "args": [], "type": _nn(_t("OBJECT", "BillPayersQuery"))}]},
+            {"kind": "OBJECT", "name": "Query", "fields": (
+                [{"name": "billPayers", "args": [], "type": _nn(_t("OBJECT", query_type))}]
+                if root_link else [])},
             {"kind": "OBJECT", "name": "Mutation", "fields": [
                 {"name": "billPayers", "args": [], "type": _t("OBJECT", "BillPayersMutation")}]},
-            {"kind": "OBJECT", "name": "BillPayersQuery", "fields": [
+            {"kind": "OBJECT", "name": query_type, "fields": [
                 {"name": "listBySiteIds", "args": list_args, "type": _nn(_t("OBJECT", "BillPayerPage"))}]},
             {"kind": "OBJECT", "name": "BillPayersMutation", "fields": [
                 {"name": "addChildren", "args": [
@@ -55,12 +62,12 @@ def schema(include_deleted=True, children="childShares", external_id=True):
             {"kind": "OBJECT", "name": "BillPayer", "fields": bill_payer_fields},
             {"kind": "OBJECT", "name": "ChildShare", "fields": [
                 {"name": "childId", "args": [], "type": _nn(_t("SCALAR", "ChildId"))},
-                {"name": "percentage", "args": [], "type": _t("SCALAR", "Float")}]},
+                {"name": "multiplier", "args": [], "type": _nn(_t("SCALAR", "Float"))}]},
             {"kind": "INPUT_OBJECT", "name": "BillPayerChildInput", "inputFields": [
                 {"name": "childId", "type": _nn(_t("SCALAR", "ChildId"))},
-                {"name": "percentage", "type": _t("SCALAR", "Float"), "defaultValue": "100"}]},
+                {"name": "share", "type": _nn(_t("INPUT_OBJECT", "ChildShareInput"))}]},
             {"kind": "INPUT_OBJECT", "name": "ChildShareInput", "inputFields": [
-                {"name": "childId", "type": _nn(_t("SCALAR", "ChildId"))}]},
+                {"name": "multiplier", "type": _nn(_t("SCALAR", "Float"))}]},
             {"kind": "ENUM", "name": "Unrelated", "enumValues": [{"name": "A"}]},
         ],
     }
@@ -68,13 +75,14 @@ def schema(include_deleted=True, children="childShares", external_id=True):
 
 class FakeClient:
     """Serves the schema and pages of bill payers (2 a page). Raises on a mutation.
-    `data[site][deleted_flag]` is a list of nodes."""
+    `data[site][flag]` is the list of nodes the server returns for includeDeleted=flag."""
 
     def __init__(self, data, schema_=None):
         self.data = data
         self.schema = schema_ or schema()
         self.calls = 0
         self.documents = []
+        self.flags = []
 
     def execute(self, query_path, variables, operation_name):
         text = Path(query_path).read_text(encoding="utf-8")
@@ -84,118 +92,191 @@ class FakeClient:
         if operation_name == runner.SCHEMA_OP:
             return {"data": {"__schema": self.schema}}
         self.calls += 1
-        flag = variables.get("includeDeleted", False)
-        rows = self.data[variables["siteIds"][0]][bool(flag)]
+        self.flags.append(variables.get("includeDeleted", "OMITTED"))
+        rows = self.data[variables["siteIds"][0]][bool(variables.get("includeDeleted", True))]
         start = int(variables["next"] or 0)
         nxt = str(start + 2) if start + 2 < len(rows) else None
         return {"data": {"billPayers": {"listBySiteIds": {"result": rows[start:start + 2], "next": nxt}}}}
 
 
-def node(bill_payer_id, email, children=(), external=None):
+def node(bill_payer_id, email, children=(), external=None, deleted=False, multipliers=None):
+    multipliers = multipliers or [1.0] * len(children)
     return {"billPayerId": bill_payer_id, "email": email, "externalId": external,
-            "childShares": [{"childId": c} for c in children]}
+            "deletedAt": "2026-01-01T00:00:00Z" if deleted else None,
+            "childShares": [{"childId": c, "multiplier": m} for c, m in zip(children, multipliers)]}
 
 
 class ShapeTests(unittest.TestCase):
     def shape(self, **kw):
         return runner.discover_shape({"data": {"__schema": schema(**kw)}})
 
-    def test_the_children_field_and_include_deleted_are_discovered(self):
+    def test_include_deleted_is_detected_in_the_exact_public_shape(self):
+        # listBySiteIds(siteIds, nextToken, includeDeleted: Boolean! = true) on an
+        # object called BillPayerQueries (not "BillPayers...").
         shape = self.shape()
-        self.assertEqual((shape["children_field"], shape["child_path"]), ("childShares", "childId"))
-        self.assertTrue(shape["external_id"])
-        self.assertEqual((shape["include_deleted_type"], shape["include_deleted_default"]),
-                         ("Boolean", "false"))
+        self.assertEqual(shape["include_deleted_type"], "Boolean!")
+        self.assertEqual(shape["include_deleted_default"], "true")
+        self.assertFalse([n for n in shape["notes"] if "includeDeleted" in n])
+        text = runner.build_query(shape, True)
+        self.assertIn("$includeDeleted: Boolean!", text)
+        self.assertIn("includeDeleted: $includeDeleted", text)
 
-    def test_a_missing_piece_is_reported_not_guessed(self):
-        shape = self.shape(include_deleted=False, children=None, external_id=False)
-        self.assertIsNone(shape["children_field"])
+    def test_detection_does_not_depend_on_the_object_type_name(self):
+        for name in ("BillPayersQuery", "BillPayerQueries", "BillPayersQueries", "Whatever"):
+            with self.subTest(name=name):
+                self.assertEqual(self.shape(query_type=name)["include_deleted_type"], "Boolean!")
+
+    def test_detection_falls_back_to_a_listBySiteIds_that_returns_a_bill_payer_page(self):
+        shape = self.shape(query_type="BillPayerQueries", root_link=False)
+        self.assertEqual(shape["include_deleted_type"], "Boolean!")
+
+    def test_a_missing_argument_is_reported_not_guessed(self):
+        shape = self.shape(include_deleted=False, children=None, external_id=False, deleted_at=False)
         self.assertIsNone(shape["include_deleted_type"])
-        self.assertFalse(shape["external_id"])
         self.assertTrue(any("includeDeleted" in n for n in shape["notes"]))
         self.assertTrue(any("children" in n for n in shape["notes"]))
+        self.assertFalse(shape["deleted_at"])
 
-    def test_the_query_built_is_a_read_only_document_with_the_flag(self):
-        text = runner.build_query(self.shape(), True)
-        self.assertIn("includeDeleted: $includeDeleted", text)
-        self.assertIn("childShares { childId }", text)
+    def test_the_children_deleted_at_and_multiplier_are_discovered(self):
+        shape = self.shape()
+        self.assertEqual((shape["children_field"], shape["child_path"], shape["multiplier_field"]),
+                         ("childShares", "childId", "multiplier"))
+        self.assertTrue(shape["deleted_at"] and shape["external_id"])
+        text = runner.build_query(shape, True)
+        self.assertIn("childShares { childId multiplier }", text)
+        self.assertIn("deletedAt", text)
         self.assertNotIn("mutation", text.lower())
-        self.assertNotIn("includeDeleted", runner.build_query(self.shape(), False))
+        self.assertNotIn("includeDeleted", runner.build_query(shape, False))
 
 
 class AuditTests(unittest.TestCase):
-    EMAILS = ["a.one@example.org", "B.Two@Example.org ", "c.three@gmail.com", "c.three@googlemail.com",
-              "d.four@example.org", "d.four@example.org", "d.four@example.org", "e.five@example.org",
-              "e.five@example.org"]
+    EMAILS = {"a": "a.one@example.org", "b": "B.Two@Example.org ", "c3": "c.three@gmail.com",
+              "c4": "c.three@googlemail.com", "d": "d.four@example.org", "e": "e.five@example.org",
+              "f": "f.six@example.org", "g": "g.seven@example.org", "h": "h.eight@example.org"}
 
-    def data(self):
-        live = [
-            node("bp1", self.EMAILS[0], ["k1"], external="x"),
-            node("bp2", self.EMAILS[1], []),
-            node("bp3", self.EMAILS[2], ["k2", "k3"]),          # c.three: same set as bp4
-            node("bp4", self.EMAILS[3], ["k3", "k2"], external="y"),
-            node("bp5", self.EMAILS[4], ["k4"]),                # d.four: bp5 and bp6 differ,
-            node("bp6", self.EMAILS[5], ["k5"]),                # bp7 has none
-            node("bp7", self.EMAILS[6], []),
-            node("bp8", self.EMAILS[7], ["k6"]),                # e.five: identical sets
-            node("bp9", self.EMAILS[8], ["k6"]),
+    def live(self):
+        E = self.EMAILS
+        return [
+            node("bp1", E["a"], ["k1"], external="x"),
+            node("bp2", E["b"], []),
+            node("bp3", E["c3"], ["k2", "k3"], multipliers=[0.5, 0.5]),     # c.three: identical sets
+            node("bp4", E["c4"], ["k3", "k2"], external="y", multipliers=[0.5, 0.5]),
+            node("bp5", E["d"], ["k4"]),                                    # d.four: two differ, one empty
+            node("bp6", E["d"], ["k5"]),
+            node("bp7", E["d"], []),
+            node("bp8", E["e"], ["k6"]),                                    # e.five: identical
+            node("bp9", E["e"], ["k6"]),
+            node("bp12", E["f"], ["k8"]),                                   # f.six: only one has children
+            node("bp13", E["f"], []),
+            node("bp14", E["g"], []),                                       # g.seven: none have children
+            node("bp15", E["g"], []),
+            node("bp16", E["h"], ["k9"], multipliers=[0.3333]),             # h.eight: mixed
+            node("bp17", E["h"], ["k9"], multipliers=[0.3333]),
+            node("bp18", E["h"], ["k10"], multipliers=[0.3333]),
             node("bp10", None, []),
         ]
-        deleted = live + [node("bp11", self.EMAILS[0], ["k7"])]  # a deleted twin of a.one
-        return {"S1": {False: live, True: deleted}, "S2": {False: [node("bp20", "b.two@example.org", [])],
-                                                             True: [node("bp20", "b.two@example.org", [])]}}
 
-    def run_audit(self):
+    def data(self):
+        live = self.live()
+        deleted = live + [node("bp11", self.EMAILS["a"], ["k7"], deleted=True)]   # a deleted twin of a.one
+        return {"S1": {False: live, True: deleted},
+                "S2": {False: [node("bp20", "b.two@example.org", [])],
+                       True: [node("bp20", "b.two@example.org", [])]}}
+
+    def run_audit(self, data=None, schema_=None):
         ticks = iter(range(0, 10000, 2))
-        client = FakeClient(self.data())
+        client = FakeClient(data or self.data(), schema_)
         return client, runner.audit(client, {"AAA": "S1", "BBB": "S2"}, clock=lambda: next(ticks))
 
-    def test_counts_with_include_deleted_false_and_true(self):
-        _client, result = self.run_audit()
+    def test_the_false_and_true_comparison_runs_and_both_flags_are_passed(self):
+        client, result = self.run_audit()
         false_, true_ = (result["sites"]["AAA"]["includeDeletedFalse"],
                          result["sites"]["AAA"]["includeDeletedTrue"])
-        self.assertEqual((false_["billPayers"], true_["billPayers"]), (10, 11))
-        self.assertEqual((false_["withEmail"], false_["withoutEmail"]), (9, 1))
-        # Under false: c.three, d.four, e.five have 2+ ids. Under true: a.one does too.
-        self.assertEqual(false_["emailsWith2PlusBillPayerIds"], 3)
-        self.assertEqual(true_["emailsWith2PlusBillPayerIds"], 4)
-        self.assertGreater(false_["pages"], 1)
-        self.assertGreater(false_["seconds"], 0)
+        self.assertEqual((false_["billPayers"], true_["billPayers"]), (17, 18))
+        self.assertEqual((false_["withDeletedAtSet"], true_["withDeletedAtSet"]), (0, 1))
+        self.assertEqual(false_["emailsWith2PlusBillPayerIds"], 6)
+        self.assertEqual(true_["emailsWith2PlusBillPayerIds"], 7)          # a.one gains a deleted twin
+        self.assertNotIn("OMITTED", client.flags)                          # includeDeleted always explicit
+        self.assertEqual({True, False}, set(client.flags))
 
-    def test_the_children_audit_for_duplicated_emails(self):
-        false_ = self.run_audit()[1]["sites"]["AAA"]["includeDeletedFalse"]
-        self.assertEqual(false_["billPayerIdsInThoseEmails"], 7)          # 2 + 3 + 2
-        self.assertEqual(false_["idsWithZeroChildren"], 1)                 # bp7
-        self.assertEqual(false_["idsSharingAnIdenticalChildSet"], 4)       # bp3+bp4, bp8+bp9
-        self.assertEqual(false_["idsWithADifferentChildSet"], 2)           # bp5, bp6
-        self.assertEqual(false_["emailsWhereEveryNonEmptySetIsIdentical"], 2)
-        self.assertEqual(false_["emailsWhereEveryNonEmptySetDiffers"], 1)
-        self.assertEqual(false_["emailsMixed"], 0)
+    def test_a_server_that_returns_deleted_rows_under_false_is_counted(self):
+        data = self.data()
+        data["S1"][False] = data["S1"][True]                                # the filter is ignored
+        false_ = self.run_audit(data)[1]["sites"]["AAA"]["includeDeletedFalse"]
+        self.assertEqual(false_["withDeletedAtSet"], 1)
+        self.assertEqual(false_["idsDeleted"], 1)                           # bp11, in a.one's group
+        self.assertEqual(false_["emailsWith2PlusBillPayerIds"], 7)
 
-    def test_external_id_and_no_children_counts(self):
+    def test_duplicate_groups_split_into_deleted_live_with_children_and_live_without(self):
         false_ = self.run_audit()[1]["sites"]["AAA"]["includeDeletedFalse"]
+        self.assertEqual(false_["idsInGroups"], 14)                         # c(2) d(3) e(2) f(2) g(2) h(3)
+        self.assertEqual(false_["idsDeleted"], 0)
+        self.assertEqual(false_["idsLiveWithChildren"] + false_["idsLiveWithNoChildren"], false_["idsInGroups"])
+        self.assertEqual(false_["idsLiveWithNoChildren"], 4)                # bp7, bp13, bp14, bp15
+        true_ = self.run_audit()[1]["sites"]["AAA"]["includeDeletedTrue"]
+        self.assertEqual(true_["idsDeleted"], 1)
+
+    def test_every_email_group_falls_into_exactly_one_documented_category(self):
+        false_ = self.run_audit()[1]["sites"]["AAA"]["includeDeletedFalse"]
+        self.assertEqual(false_["emailsNoneHaveChildren"], 1)               # g.seven
+        self.assertEqual(false_["emailsOneHasChildren"], 1)                 # f.six
+        self.assertEqual(false_["emailsAllIdentical"], 2)                   # c.three, e.five
+        self.assertEqual(false_["emailsAllDifferent"], 1)                   # d.four
+        self.assertEqual(false_["emailsMixed"], 1)                          # h.eight
+        total = sum(false_[k] for k in ("emailsNoneHaveChildren", "emailsOneHasChildren",
+                    "emailsAllIdentical", "emailsAllDifferent", "emailsMixed"))
+        self.assertEqual(total, false_["emailsWith2PlusBillPayerIds"])
+
+    def test_emails_mixed_is_defined_in_the_output(self):
+        result = self.run_audit()[1]
+        self.assertIn("emailsMixed", result["definitions"])
+        self.assertIn("some share a child set and others differ", result["definitions"]["emailsMixed"])
+        for key in ("emailsAllIdentical", "emailsAllDifferent", "emailsOneHasChildren",
+                    "emailsNoneHaveChildren", "multiplierEntries", "liveWith2PlusChildren"):
+            self.assertIn(key, result["definitions"])
+
+    def test_the_multiplier_distribution_and_live_with_two_or_more_children(self):
+        false_ = self.run_audit()[1]["sites"]["AAA"]["includeDeletedFalse"]
+        self.assertEqual(false_["multiplierEntries"], {"0.333": 3, "0.500": 4, "1.000": 6})
+        self.assertEqual(false_["liveWith2PlusChildren"], 2)                # bp3, bp4
+        true_ = self.run_audit()[1]["sites"]["AAA"]["includeDeletedTrue"]
+        self.assertEqual(true_["multiplierEntries"]["1.000"], 7)            # + the deleted twin's entry
+        self.assertEqual(true_["liveWith2PlusChildren"], 2)                 # deleted ones do not count
+
+    def test_the_old_counts_still_work(self):
+        false_ = self.run_audit()[1]["sites"]["AAA"]["includeDeletedFalse"]
+        self.assertEqual((false_["withEmail"], false_["withoutEmail"]), (16, 1))
         self.assertEqual(false_["withExternalId"], 2)
-        self.assertEqual(false_["withNoChildren"], 3)                       # bp2, bp7, bp10
+        self.assertGreater(false_["pages"], 1)
+        self.assertEqual(self.run_audit()[1]["emailsAtMoreThanOneSite"], 1)   # b.two@ at both sites
 
-    def test_cross_site_emails_and_the_existing_scan_flag(self):
-        _client, result = self.run_audit()
-        self.assertEqual(result["emailsAtMoreThanOneSite"], 1)             # b.two@ at both sites
-        self.assertFalse(result["existingScanPassesIncludeDeleted"])       # pull_roster's query
-        self.assertEqual(result["shape"]["include_deleted_default"], "false")
+    def test_the_audit_refuses_when_include_deleted_is_not_detected(self):
+        client = FakeClient(self.data(), schema(include_deleted=False))
+        with self.assertRaises(runner.AuditRefused) as ctx:
+            runner.audit(client, {"AAA": "S1"})
+        self.assertIn("server default", str(ctx.exception))
+        self.assertEqual(client.calls, 0)                                   # nothing was scanned
+
+    def test_the_cli_exits_3_when_it_refuses(self):
+        import argparse
+        import contextlib
+        import io
+        from unittest import mock
+        client = FakeClient(self.data(), schema(include_deleted=False))
+        args = argparse.Namespace(report="audit", env=None, sites="HDCW", types="", api="public")
+        err = io.StringIO()
+        with mock.patch.object(cli, "_client", return_value=client), \
+                contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as ctx:
+            cli.handle(args)
+        self.assertEqual(ctx.exception.code, 3)
+        self.assertIn("includeDeleted", err.getvalue())
 
     def test_the_output_has_no_email_name_or_id(self):
         _client, result = self.run_audit()
         blob = json.dumps(result).casefold()
         self.assertNotIn("@", blob)
-        for fragment in ("example.org", "gmail", "bp1", "bp20", "k1", "k6", "s1\"", "b.two"):
+        for fragment in ("example.org", "c.three", "d.four", "bp1", "bp20", "k1", "k6", "s1\"", "b.two"):
             self.assertNotIn(fragment, blob)
-
-    def test_without_include_deleted_the_server_default_is_scanned_once(self):
-        client = FakeClient(self.data(), schema(include_deleted=False))
-        result = runner.audit(client, {"AAA": "S1"})
-        self.assertEqual(list(result["sites"]["AAA"]), ["serverDefault"])
-        self.assertTrue(all("includeDeleted" not in d for d in client.documents
-                            if "ProbeBillPayerAudit" in d))
 
     def test_a_runaway_cursor_ends(self):
         class Forever(FakeClient):
@@ -233,13 +314,17 @@ class ReadOnlyTests(unittest.TestCase):
         for attr in ("NAME", "HELP", "add_args", "handle"):
             self.assertTrue(hasattr(cli, attr))
 
+    def test_pull_roster_still_omits_include_deleted(self):
+        # It is NOT changed: its scan omits the argument and so gets the server default
+        # (true), which returns deleted bill payers. Noted in docs/status.md.
+        self.assertFalse("includedeleted" in runner.BILL_PAYERS_QUERY.read_text(encoding="utf-8").lower())
+
 
 class SchemaReportTests(unittest.TestCase):
     def test_the_report_shows_required_fields_defaults_and_links(self):
         text = "\n".join(runner.run_schema(FakeClient({}, schema())))
-        self.assertIn("includeDeleted: Boolean = false", text)          # the declared default
-        self.assertIn("childId: ChildId!", text)                         # required
-        self.assertIn("percentage: Float = 100", text)                   # optional with a default
+        self.assertIn("includeDeleted: Boolean! = true", text)             # the declared default
+        self.assertIn("childId: ChildId!", text)                            # required
         self.assertIn("Mutation.billPayers", text)
 
     def test_the_requested_types_are_printed_in_full(self):
@@ -247,7 +332,8 @@ class SchemaReportTests(unittest.TestCase):
         text = "\n".join(lines[lines.index("REQUESTED types:"):])
         for name in ("OBJECT ChildShare", "INPUT_OBJECT ChildShareInput", "INPUT_OBJECT BillPayerChildInput"):
             self.assertIn(name, text)
-        self.assertIn("ChildSharesUpdateInput: NOT IN THE SCHEMA", text)  # said, not skipped
+        self.assertIn("multiplier: Float!", text)
+        self.assertIn("ChildSharesUpdateInput: NOT IN THE SCHEMA", text)    # said, not skipped
         self.assertNotIn("Unrelated", text)
 
 
