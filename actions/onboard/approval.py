@@ -33,6 +33,9 @@ MSG_STALE = "⚠️ This approval request is out of date (the plan changed). Use
 MSG_UNKNOWN = "⚠️ Unknown onboarding job."
 
 
+_RESULT_CODES = {}
+
+
 def button_value(job_id: str, plan_hash: str, nonce: str | None) -> str:
     return f"{job_id}:{plan_hash[:HASH_PREFIX]}:{nonce or ''}"
 
@@ -46,7 +49,15 @@ def _parse(value: str | None) -> tuple[str | None, str | None, str | None]:
 
 
 def handle_click(action_id: str, value: str | None, user: str | None) -> str:
-    """Act on a verified Gate A click. Never raises; returns the text to show."""
+    """Act on a verified Gate A click. Never raises; returns the text to show.
+    One INFO line per click, whatever the outcome (ids and codes only)."""
+    text = _decide(action_id, value, user)
+    logger.info("ONBOARD CLICK action=%s job=%s result=%s", action_id,
+                _parse(value)[0], _RESULT_CODES.get(text, "unknown"))
+    return text
+
+
+def _decide(action_id: str, value: str | None, user: str | None) -> str:
     job_id, prefix, nonce = _parse(value)
     job = store.get(job_id) if job_id else None
     if job is None:
@@ -77,3 +88,9 @@ def handle_click(action_id: str, value: str | None, user: str | None) -> str:
         return MSG_HANDLED
 
     return MSG_UNKNOWN
+
+
+_RESULT_CODES.update({
+    MSG_APPROVED: "approved", MSG_REJECTED: "rejected", MSG_HANDLED: "already_handled",
+    MSG_STALE: "stale", MSG_UNKNOWN: "unknown",
+})

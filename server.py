@@ -55,9 +55,17 @@ from dotenv import load_dotenv
 
 import web_registry
 from core.rest_client import RestHTTPError
+from core.logging_setup import configure_logging
 from integrations import slack
 
 load_dotenv()
+
+# gunicorn configures only ITS loggers; without this the application's own INFO
+# lines (e.g. "ONBOARD APPROVED") are dropped at the root logger's WARNING default.
+# gunicorn's loggers already have handlers by the time the app is imported, which
+# is how this tells gunicorn from a test or a plain import.
+if logging.getLogger("gunicorn.error").handlers:
+    configure_logging(force=True)
 
 app = Flask(__name__)
 
@@ -302,4 +310,5 @@ def slack_interactivity():
 
 if __name__ == "__main__":
     # Local testing only. In production gunicorn serves `app` (see systemd unit).
+    configure_logging()
     app.run(host="127.0.0.1", port=8000, debug=False)
