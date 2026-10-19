@@ -473,17 +473,21 @@ def _ensure_child(job, deps, plan, deal) -> ChildResult:
         raise StopJob(store.NEEDS_REVIEW, "duplicate_create_blocked")
 
     clean = True
+    rejected_code = None
     try:
         child_id = famly_writes.create_child(deps.public, payload)
-    except famly_writes.CreateRejected as exc:
-        raise StopJob(store.FAILED, exc.code) from None
-    except famly_writes.OutcomeUnknown:
-        # Did it land? Look; never send again.
+    except (famly_writes.CreateRejected, famly_writes.OutcomeUnknown) as exc:
+        # An error status or `errors` does not mean it did not run. Did it land? Look
+        # (by the deal-id reference); never send again. Only if the lookup finds
+        # nothing is a rejection reported.
         clean = False
+        rejected_code = exc.code if isinstance(exc, famly_writes.CreateRejected) else None
         landed, _via = _lookup_child(deps, deal, deal_id, urn_fallback=False)
         if len(landed) > 1:
             raise StopJob(store.NEEDS_REVIEW, "child_ambiguous") from None
         if not landed:
+            if rejected_code:
+                raise StopJob(store.FAILED, rejected_code) from None
             # The request may have landed and the lookup is blind to it: a person looks.
             raise StopJob(store.NEEDS_REVIEW, UNKNOWN_OUTCOME) from None
         child_id = landed[0]
@@ -622,10 +626,14 @@ def _create_one(deps, famly, contact, child_id, target, matches) -> tuple[str, l
 
     try:
         famly_writes.create_contact(deps.public, payload)
-    except famly_writes.CreateRejected as exc:
-        return exc.code, contact_warnings, 1
-    except famly_writes.OutcomeUnknown:
-        if len(matches(famly.child_contacts(child_id), target)) != 1:
+    except (famly_writes.CreateRejected, famly_writes.OutcomeUnknown) as exc:
+        # An error status or `errors` does not mean it did not run: look with the
+        # existing present-check. Found exactly once = it was created; nothing found =
+        # only now is a rejection reported. Never sent again.
+        found = len(matches(famly.child_contacts(child_id), target))
+        if found != 1:
+            if found == 0 and isinstance(exc, famly_writes.CreateRejected):
+                return exc.code, contact_warnings, 1
             return UNKNOWN_OUTCOME, contact_warnings, 1
 
     # Read-back: exactly once on the child, with the expected email.

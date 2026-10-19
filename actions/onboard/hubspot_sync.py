@@ -143,8 +143,20 @@ class Syncer:
             self.writer.write_deal_properties(self.deal_id, {prop: str(value)})
         except (HubSpotError, ValueError):
             logger.warning("onboard: HubSpot write failed for property %s", prop)
+            if prop in CRITICAL and self._landed(prop, value):
+                # The request failed (a 5xx after it ran, say) but the value IS there.
+                logger.info("onboard: HubSpot write for %s failed but the value is on the deal", prop)
+                return True
             return self._fail(prop, f"write_failed:{prop}")
         return True
+
+    def _landed(self, prop: str, value) -> bool:
+        """Re-read the deal: is `value` already there? A read that fails counts as no."""
+        try:
+            deal = self.writer.get_deal(self.deal_id)
+        except (HubSpotError, ValueError):
+            return False
+        return str(deal.get(prop) or "").strip() == str(value).strip()
 
     def write_gaps(self, codes) -> bool:
         """The things to check, as plain-English sentences (see `gaps_value`)."""

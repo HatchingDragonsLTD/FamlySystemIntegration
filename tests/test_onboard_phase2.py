@@ -78,6 +78,7 @@ class FakeHub(FakeHubSpot):
         self.write_error = None
         self.defs_error = None
         self.fail_props = set()            # writes to these properties fail
+        self.fail_after_write = set()      # the write LANDS (the deal has the value), then errors
         self.events = []                   # shared with FakeFamly: the order things happened
         self.get_deal_hooks = {}           # nth get_deal call -> callable run AFTER it answers
         self.get_deal_calls = 0
@@ -100,6 +101,9 @@ class FakeHub(FakeHubSpot):
             raise AssertionError("write of a property outside the sync four")
         if self.write_error or set(properties) & self.fail_props:
             raise self.write_error or HubSpotError("PATCH failed with HTTP 500", 500)
+        if set(properties) & self.fail_after_write:
+            self.deals[deal_id].update(properties)
+            raise HubSpotError("PATCH failed with HTTP 500", 500)
         self.writes.append((deal_id, dict(properties)))
         for prop, value in properties.items():
             self.events.append(("hubspot", prop))
@@ -119,6 +123,7 @@ class FakeFamly:
         self.child_effect = None          # called with the payload BEFORE it lands
         self.child_land_then_raise = None
         self.contact_effect = None
+        self.contact_land_then_raise = None   # payload -> exception to raise AFTER the contact landed
         self.hide_created_contacts = False
         self.site_children = []
         self.events = []
@@ -161,6 +166,10 @@ class FakeFamly:
             contact_id = self._new_id("contact")
             if not self.hide_created_contacts:
                 self.contacts[payload["childIds"][0]].append((contact_id, payload["email"]))
+            if self.contact_land_then_raise:
+                error = self.contact_land_then_raise(payload)
+                if error:
+                    raise error
             return {"data": {"contacts": {"create": [{"id": contact_id}]}}}
 
         if operation_name == "OnboardChildByExternalRef":
@@ -1894,6 +1903,105 @@ class ApprovalLoggingTests(Phase2Case):
         self.assertIn("plan_changed=True", out)
         for value in PII:
             self.assertNotIn(value, out)
+
+
+# --------------------------------------------------------------------------- #
+# An error response does not mean the create did not run: settle by a live lookup
+# --------------------------------------------------------------------------- #
+CHILD_DATA_403 = json.dumps({"errors": [{"message": "not allowed to read a field"}],
+                             "data": {"children": {"create": [{"id": "child-1", "externalId": "d"}]}}})
+CONTACT_DATA_403 = json.dumps({"errors": [{"message": "not allowed to read a field"}],
+                               "data": {"contacts": {"create": [{"id": "contact-x"}]}}})
+
+
+class SettleByLookupTests(Phase2Case):
+    def assert_child_recorded_as_ours(self, result):
+        self.assertEqual(result["status"], store.DONE)
+        self.assertEqual(len(self.famly.child_creates), 1)                  # never sent twice
+        self.assertEqual(self.job().child_id, "child-1")
+        self.assertEqual(store.created_child_ids_for_deal(DEAL), frozenset({"child-1"}))
+        self.assertEqual(len(self.famly.contact_creates), 2)                # the contacts went ahead
+
+    def test_a_child_create_403_with_created_rows_is_a_creation(self):
+        self.famly.child_land_then_raise = GraphQLHTTPError("forbidden", 403, CHILD_DATA_403)
+        self.assert_child_recorded_as_ours(self.run_through())
+
+    def test_a_200_with_errors_and_created_rows_is_a_creation(self):
+        body = json.loads(CHILD_DATA_403)
+        self.famly.child_land_then_raise = GraphQLError("errors", body["errors"], body=body)
+        self.assert_child_recorded_as_ours(self.run_through())
+
+    def test_a_child_create_400_with_no_rows_but_the_child_exists_is_settled_by_the_lookup(self):
+        self.famly.child_land_then_raise = GraphQLHTTPError("bad", 400, "{}")
+        self.assert_child_recorded_as_ours(self.run_through())
+
+    def test_a_child_create_graphql_error_with_no_rows_but_the_child_exists_is_settled(self):
+        self.famly.child_land_then_raise = GraphQLError("errors", [{"message": "x"}], body={"errors": []})
+        self.assert_child_recorded_as_ours(self.run_through())
+
+    def test_a_genuine_child_rejection_still_reports_rejected(self):
+        self.famly.child_effect = mock.Mock(side_effect=GraphQLHTTPError("bad", 400, "{}"))   # before it lands
+        result = self.run_through()
+        self.assertEqual(len(self.famly.child_creates), 1)
+        self.assertEqual((result["status"], result["code"]), (store.FAILED, "child_http_400"))
+        self.assertEqual(self.famly.contact_creates, [])
+
+    def test_a_contact_create_403_with_created_rows_is_a_creation(self):
+        self.famly.contact_land_then_raise = lambda payload: GraphQLHTTPError("forbidden", 403, CONTACT_DATA_403)
+        result = self.run_through()
+        self.assertEqual(result["status"], store.DONE)
+        self.assertEqual(self.job().outcomes, ["c1:created", "c2:created"])
+        self.assertEqual(len(self.famly.contact_creates), 2)                # each sent once
+
+    def test_a_contact_create_400_with_no_rows_but_the_contact_exists_is_settled(self):
+        first = {"done": False}
+
+        def land_then_fail(payload):
+            if not first["done"]:
+                first["done"] = True
+                return GraphQLHTTPError("bad", 400, "{}")
+        self.famly.contact_land_then_raise = land_then_fail
+        result = self.run_through()
+        self.assertEqual(result["status"], store.DONE)
+        self.assertEqual(self.job().outcomes, ["c1:created", "c2:created"])
+        self.assertEqual(len(self.famly.contact_creates), 2)
+
+    def test_a_genuine_contact_rejection_still_reports_rejected(self):
+        def reject_ada(payload):
+            if payload["email"] == "ada.l@example.org":
+                raise GraphQLHTTPError("bad", 400, "{}")
+        self.famly.contact_effect = reject_ada
+        result = self.run_through()
+        self.assertEqual(self.job().outcomes, ["c1:contact_http_400", "c2:created"])
+        self.assertEqual(result["status"], store.NEEDS_REVIEW)
+
+    def test_a_failed_critical_hubspot_write_that_did_land_is_not_a_failure(self):
+        self.hub.fail_after_write = {"famly_childid"}
+        result = self.run_through()
+        self.assertEqual(result["status"], store.DONE)                      # settled by re-reading the deal
+        self.assertEqual(self.hub.deals[DEAL]["famly_childid"], "child-1")
+
+    def test_a_defaulted_end_date_write_that_did_land_is_not_a_failure(self):
+        self.hub.deals[DEAL]["end_date"] = ""
+        self.hub.fail_after_write = {"end_date"}
+        result = self.run_through()
+        self.assertEqual(result["status"], store.DONE)
+        self.assertTrue(self.hub.deals[DEAL]["end_date"])
+
+    def test_a_critical_write_whose_value_is_genuinely_missing_still_needs_review(self):
+        self.hub.fail_props = {"famly_childid"}                             # nothing landed
+        result = self.run_through()
+        self.assertEqual((result["status"], result["code"]), (store.NEEDS_REVIEW, "hubspot_writeback_failed"))
+
+    def test_a_failed_re_read_counts_as_not_landed(self):
+        self.hub.fail_after_write = {"famly_childid"}
+        syncer = hubspot_sync.Syncer(self.hub, DEAL)
+
+        def broken(deal_id):
+            raise HubSpotError("GET failed with HTTP 500", 500)
+        self.hub.get_deal = broken
+        self.assertFalse(syncer.write("famly_childid", "child-9"))
+        self.assertEqual(syncer.critical_failed, ["famly_childid"])
 
 
 if __name__ == "__main__":
