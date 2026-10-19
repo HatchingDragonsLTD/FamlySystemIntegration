@@ -34,7 +34,8 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--create-test-child", action="store_true",
                         help="write: create one test child (isTestChild) and delete it at the end")
     parser.add_argument("--share", metavar="JSON",
-                        help="write: the child share value as JSON, in the format the schema report shows")
+                        help="write: the share; `1.0` is wrapped to the share input's own field "
+             '({"multiplier": 1.0}); a full JSON object is also accepted')
     parser.add_argument("--confirm", action="store_true", help="write: required")
     parser.add_argument(
         "--types", default="", metavar="A,B",
@@ -72,7 +73,11 @@ def handle(args: argparse.Namespace):
     if missing:
         print(f"unknown or unconfigured site code(s): {', '.join(missing)}", file=sys.stderr)
         raise SystemExit(3)
-    return runner.audit(_client("public"), {c: sites[c]["institutionId"] for c in wanted})
+    try:
+        return runner.audit(_client("public"), {c: sites[c]["institutionId"] for c in wanted})
+    except runner.AuditRefused as exc:
+        print(str(exc), file=sys.stderr)
+        raise SystemExit(3) from None
 
 
 def _write(args: argparse.Namespace):
@@ -92,7 +97,7 @@ def _write(args: argparse.Namespace):
         try:
             share = json.loads(args.share)
         except ValueError:
-            print("refusing: --share must be valid JSON (for example 100 or 1.0)", file=sys.stderr)
+            print("refusing: --share must be valid JSON (for example 1.0)", file=sys.stderr)
             raise SystemExit(3) from None
     probe = write_probe.Probe(_client("public"), RestClient())
     try:

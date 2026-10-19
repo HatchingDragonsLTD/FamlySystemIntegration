@@ -11,13 +11,17 @@ from actions.probe_bill_payers import cli, runner, write_probe
 from core.client import GraphQLError, GraphQLHTTPError
 from core.rest_client import RestHTTPError
 from tests.test_probe_bill_payers import _list, _nn, _t
+from tests.test_probe_bill_payers import schema as read_schema
 
 SITE = "HDCW"
 TEST_EMAIL = "Probe.Owner+bp@Example.org"
 CHILD = "child-test-1"
 
 
-def schema(delete_with_site=False, with_delete=True, share_required=True, extra_required=False):
+def schema(delete_with_site=False, with_delete=True, share_required=True, extra_required=False,
+           include_deleted=True):
+    """The read schema (listBySiteIds with `includeDeleted: Boolean! = true`) plus the
+    bill payer mutations."""
     delete_args = [{"name": "billPayerIds", "type": _nn(_list(_nn(_t("SCALAR", "UniqueId"))))}]
     if delete_with_site:
         delete_args.append({"name": "siteIds", "type": _nn(_list(_nn(_t("SCALAR", "SiteId"))))})
@@ -36,42 +40,30 @@ def schema(delete_with_site=False, with_delete=True, share_required=True, extra_
     ]
     if extra_required:
         input_fields.append({"name": "accountType", "type": _nn(_t("SCALAR", "String"))})
-    share = {"name": "share", "type": _nn(_t("SCALAR", "Float")) if share_required else _t("SCALAR", "Float")}
-    return {
-        "queryType": {"name": "Query"}, "mutationType": {"name": "Mutation"},
-        "types": [
-            {"kind": "OBJECT", "name": "Mutation", "fields": [
-                {"name": "billPayers", "args": [], "type": _nn(_t("OBJECT", "BillPayersMutation"))}]},
-            {"kind": "OBJECT", "name": "BillPayersQuery", "fields": [
-                {"name": "listBySiteIds", "args": [
-                    {"name": "siteIds", "type": _nn(_list(_nn(_t("SCALAR", "SiteId"))))},
-                    {"name": "nextToken", "type": _t("SCALAR", "BillPayerCursor")},
-                    {"name": "includeDeleted", "type": _t("SCALAR", "Boolean"), "defaultValue": "false"}],
-                 "type": _nn(_t("OBJECT", "BillPayerPage"))}]},
-            {"kind": "OBJECT", "name": "BillPayersMutation", "fields": mut_fields},
-            {"kind": "OBJECT", "name": "BillPayer", "fields": [
-                {"name": "billPayerId", "args": [], "type": _nn(_t("SCALAR", "UniqueId"))},
-                {"name": "email", "args": [], "type": _t("SCALAR", "String")},
-                {"name": "externalId", "args": [], "type": _t("SCALAR", "String")},
-                {"name": "childShares", "args": [], "type": _nn(_list(_nn(_t("OBJECT", "ChildShare"))))}]},
-            {"kind": "OBJECT", "name": "ChildShare", "fields": [
-                {"name": "childId", "args": [], "type": _nn(_t("SCALAR", "ChildId"))}]},
-            {"kind": "INPUT_OBJECT", "name": "BillPayerInput", "inputFields": input_fields},
-            {"kind": "INPUT_OBJECT", "name": "BillPayerChildInput", "inputFields": [
-                {"name": "childId", "type": _nn(_t("SCALAR", "ChildId"))}, share]},
-        ],
-    }
+    share_type = _nn(_t("INPUT_OBJECT", "ChildShareInput")) if share_required else _t("INPUT_OBJECT", "ChildShareInput")
+    base = read_schema(include_deleted=include_deleted)
+    types = [t for t in base["types"] if t["name"] not in ("BillPayersMutation", "BillPayerChildInput")]
+    types += [
+        {"kind": "OBJECT", "name": "BillPayersMutation", "fields": mut_fields},
+        {"kind": "INPUT_OBJECT", "name": "BillPayerInput", "inputFields": input_fields},
+        {"kind": "INPUT_OBJECT", "name": "BillPayerChildInput", "inputFields": [
+            {"name": "childId", "type": _nn(_t("SCALAR", "ChildId"))},
+            {"name": "share", "type": share_type}]},
+    ]
+    return {**base, "types": types}
 
 
 class FakeFamly:
     """A tiny stateful Famly: bill payers with read-after-write lag, delete that hides
-    from includeDeleted=false, a test child create/delete. Records every write."""
+    from includeDeleted=false, a test child create/delete. Records every write and the
+    includeDeleted value of every scan."""
 
     def __init__(self, schema_=None, lag_scans=0):
         self.schema = schema_ or schema()
         self.payers = []                 # {"id", "email", "ext", "children", "deleted", "visible_at"}
         self.lag_scans = lag_scans
         self.scans = 0
+        self.scan_flags = []
         self.writes = []                 # (operation, variables, document text)
         self.create_error = None
         self.delete_error = None
@@ -109,13 +101,16 @@ class FakeFamly:
                 if payer["id"] in variables["id"]:
                     payer["deleted"] = True
             return {"data": {"billPayers": {"delete": variables["id"]}}}
-        # the list scan
+        # the list scan: includeDeleted must be passed, explicitly
         self.scans += 1
-        flag = variables.get("includeDeleted")
-        rows = [p for p in self.payers if self.scans > p["visible_at"] and (flag or not p["deleted"])]
+        flag = variables.get("includeDeleted", "OMITTED")
+        self.scan_flags.append(flag)
+        rows = [p for p in self.payers if self.scans > p["visible_at"] and (flag is True or not p["deleted"])]
         return {"data": {"billPayers": {"listBySiteIds": {"result": [
             {"billPayerId": p["id"], "email": p["email"], "externalId": p["ext"],
-             "childShares": [{"childId": c} for c in p["children"]]} for p in rows], "next": None}}}}
+             "deletedAt": "2026-01-01T00:00:00Z" if p["deleted"] else None,
+             "childShares": [{"childId": c, "multiplier": 1.0} for c in p["children"]]} for p in rows],
+            "next": None}}}}
 
     def mutations(self, operation):
         return [w for w in self.writes if w[0] == operation]
@@ -152,7 +147,7 @@ def run(famly=None, rest=None, **kw):
     probe = write_probe.Probe(famly, rest or FakeRest(), out=lines.append, clock=clock,
                               sleep=clock.sleep)
     args = dict(site_code=SITE, test_email=TEST_EMAIL, child_id=CHILD, create_test_child=False,
-                share=100, confirm=True)
+                share=1.0, confirm=True)
     args.update(kw)
     result = probe.run(**args)
     return famly, probe, result, lines, clock
@@ -218,12 +213,12 @@ class HappyPathTests(unittest.TestCase):
         self.assertIn("AFTER DELETE (includeDeleted=true): still returned = yes", text)
 
     def test_the_input_sent_has_the_probe_values_and_the_share(self):
-        famly, *_ = run(share=100)
+        famly, *_ = run(share=1.0)
         payload = famly.mutations(write_probe.CREATE_OP)[0][1]["input"][0]
         self.assertEqual(payload["name"], "ZZ Probe Test")
         self.assertEqual(payload["email"], TEST_EMAIL.strip())
         self.assertRegex(payload["externalId"], r"^probe-\d{8}T\d{6}Z$")
-        self.assertEqual(payload["children"], [{"childId": CHILD, "share": 100}])
+        self.assertEqual(payload["children"], [{"childId": CHILD, "share": {"multiplier": 1.0}}])
 
     def test_the_ids_are_printed_to_the_terminal_and_the_email_never_is(self):
         _famly, _probe, _result, lines, _clock = run()
@@ -368,7 +363,7 @@ class DocumentTests(unittest.TestCase):
         famly, _probe, result, lines, _clock = run(share=None)
         self.assertEqual(famly.writes, [])
         self.assertEqual(result.stopped, "share")
-        self.assertIn("share: Float!", "\n".join(lines))
+        self.assertIn("share: ChildShareInput!", "\n".join(lines))
 
 
 class AbortIfItExistsTests(unittest.TestCase):
@@ -438,6 +433,86 @@ class OutputTests(unittest.TestCase):
         blob = "\n".join(records).lower()
         for fragment in ("bp-1", CHILD, "example.org", "probe.owner"):
             self.assertNotIn(fragment, blob)
+
+
+class ShareAndFlagTests(unittest.TestCase):
+    def test_a_bare_number_is_wrapped_into_the_share_input(self):
+        plan = write_probe.plan_from_schema({"data": {"__schema": schema()}})
+        self.assertEqual(plan.share_wrap_key, "multiplier")
+        self.assertEqual(write_probe.build_share(plan, 1.0), {"multiplier": 1.0})
+        self.assertEqual(write_probe.build_share(plan, 2), {"multiplier": 2.0})
+        self.assertEqual(write_probe.build_share(plan, {"multiplier": 0.5}), {"multiplier": 0.5})
+
+    def test_a_bad_share_is_refused(self):
+        plan = write_probe.plan_from_schema({"data": {"__schema": schema()}})
+        for bad in ("1.0", [1.0], True):
+            with self.subTest(bad=bad), self.assertRaises(write_probe.ProbeRefused):
+                write_probe.build_share(plan, bad)
+
+    def test_the_cli_turns_1_0_into_the_wrapped_variable_and_prints_it_without_pii(self):
+        famly, _probe, _result, lines, _clock = run(share=1.0)
+        sent = famly.mutations(write_probe.CREATE_OP)[0][1]["input"][0]["children"]
+        self.assertEqual(sent, [{"childId": CHILD, "share": {"multiplier": 1.0}}])
+        printed = [l for l in lines if l.startswith("VARIABLES TO SEND: ")]
+        self.assertEqual(len(printed), 1)
+        text = printed[0]
+        self.assertIn('"share": {"multiplier": 1.0}', text)
+        self.assertIn("<test-email>", text)                        # the email is redacted
+        self.assertNotIn("example.org", text.lower())
+        # It is printed BEFORE the create is sent.
+        self.assertLess(lines.index(printed[0]), next(i for i, l in enumerate(lines) if l.startswith("SENDING billPayers.create")))
+
+    def test_a_full_json_share_is_sent_as_given(self):
+        famly, *_ = run(share={"multiplier": 0.5})
+        sent = famly.mutations(write_probe.CREATE_OP)[0][1]["input"][0]["children"]
+        self.assertEqual(sent[0]["share"], {"multiplier": 0.5})
+
+    def test_a_bad_share_refuses_before_any_write_or_scan(self):
+        famly = FakeFamly()
+        with self.assertRaises(write_probe.ProbeRefused):
+            run(famly=famly, share="1.0")
+        self.assertEqual(famly.writes, [])
+        self.assertEqual(famly.scans, 0)
+
+    def test_every_scan_passes_include_deleted_explicitly(self):
+        famly, *_ = run(famly=FakeFamly(lag_scans=1))
+        self.assertTrue(famly.scan_flags)
+        self.assertNotIn("OMITTED", famly.scan_flags)
+        self.assertTrue(all(isinstance(flag, bool) for flag in famly.scan_flags))
+        # pre-scan true; the three lag scans false; after the delete false then true.
+        self.assertEqual(famly.scan_flags, [True, False, False, False, False, True])
+
+    def test_it_refuses_before_any_write_when_include_deleted_is_not_detected(self):
+        famly = FakeFamly(schema(include_deleted=False))
+        with self.assertRaises(write_probe.ProbeRefused) as ctx:
+            run(famly=famly)
+        self.assertIn("server default", str(ctx.exception))
+        self.assertEqual(famly.writes, [])
+        self.assertEqual(famly.scans, 0)                            # no scan at the default either
+
+    def test_probe_scan_refuses_to_omit_the_flag(self):
+        shape = runner.discover_shape({"data": {"__schema": schema()}})
+        with self.assertRaises(write_probe.ProbeRefused):
+            write_probe.probe_scan(FakeFamly(), "S", shape, None, "e", "x", "c")
+
+    def test_the_cli_exits_3_for_a_non_json_share_and_for_undetected_include_deleted(self):
+        import argparse
+        import contextlib
+        import io
+        from unittest import mock
+        base = dict(report="write", env=None, sites="", site=SITE, test_email=TEST_EMAIL,
+                    child_id=CHILD, create_test_child=False, confirm=True, types="", api="public")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as ctx:
+            cli.handle(argparse.Namespace(share="not json", **base))
+        self.assertEqual(ctx.exception.code, 3)
+        famly = FakeFamly(schema(include_deleted=False))
+        with mock.patch.object(cli, "_client", return_value=famly), \
+                mock.patch("core.rest_client.RestClient", return_value=FakeRest()), \
+                contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as ctx:
+            cli.handle(argparse.Namespace(share="1.0", **base))
+        self.assertEqual(ctx.exception.code, 3)
+        self.assertEqual(famly.writes, [])
 
 
 if __name__ == "__main__":

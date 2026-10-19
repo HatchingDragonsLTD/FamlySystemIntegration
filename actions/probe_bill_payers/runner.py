@@ -164,19 +164,56 @@ def run_schema(client, type_names=()) -> list[str]:
 # --------------------------------------------------------------------------- #
 # Discovering the shape of a bill payer's children (names only, from the schema)
 # --------------------------------------------------------------------------- #
-def discover_shape(body: dict) -> dict:
-    """How to ask for a bill payer's children, externalId and `includeDeleted`.
+def _list_by_site_ids_field(by_name: dict, schema: dict) -> dict | None:
+    """The `listBySiteIds` field of the bill payers query object.
 
-    Returns {"children_field", "child_path", "external_id", "include_deleted_type",
-    "notes"}. `child_path` is the selection for one child id inside the children
-    field ("" when the field is a plain list of ids, "childId" or "child { id }"
-    otherwise). Anything that cannot be worked out is None and explained in notes.
+    Found through the root query's `billPayers` field, whatever the object type is
+    called (the old detector matched a type name that began "BillPayers" and so
+    missed the real one). Falls back to any object whose `listBySiteIds` returns a
+    bill payer page."""
+    root = by_name.get((schema.get("queryType") or {}).get("name") or "") or {}
+    entry = next((f for f in root.get("fields") or [] if f["name"] == "billPayers"), None)
+    holder = by_name.get(named_type(entry["type"]) if entry else "") or {}
+    for field in holder.get("fields") or []:
+        if field["name"] == "listBySiteIds":
+            return field
+    for node in by_name.values():
+        for field in (node or {}).get("fields") or []:
+            if field["name"] == "listBySiteIds" and re.search(
+                    r"bill\s*payer", named_type(field["type"]) or "", re.IGNORECASE):
+                return field
+    return None
+
+
+def discover_shape(body: dict) -> dict:
+    """How to ask for a bill payer's children, share, deletedAt, externalId and
+    `includeDeleted`.
+
+    Returns {"children_field", "child_path", "multiplier_field", "external_id",
+    "deleted_at", "include_deleted_type", "include_deleted_default", "notes"}.
+    `child_path` is the selection for one child id inside the children field ("" when
+    the field is a plain list of ids, "childId" or "child { id }" otherwise).
+    Anything that cannot be worked out is None/False and explained in notes.
     """
     types, roots = _types(body)
+    schema = ((body or {}).get("data") or {}).get("__schema") or {}
     by_name = {t.get("name"): t for t in types}
     notes: list[str] = []
-    shape = {"children_field": None, "child_path": None, "external_id": False,
-             "include_deleted_type": None, "include_deleted_default": None, "notes": notes}
+    shape = {"children_field": None, "child_path": None, "multiplier_field": None,
+             "external_id": False, "deleted_at": False, "include_deleted_type": None,
+             "include_deleted_default": None, "notes": notes}
+
+    # The list query: `includeDeleted` (NON_NULL or not, with or without a default).
+    listing = _list_by_site_ids_field(by_name, schema)
+    if listing is None:
+        notes.append("the bill payers listBySiteIds field was not found")
+    else:
+        for arg in listing.get("args") or []:
+            if arg["name"] == "includeDeleted":
+                shape["include_deleted_type"] = type_str(arg["type"])
+                shape["include_deleted_default"] = arg.get("defaultValue")
+        if shape["include_deleted_type"] is None:
+            notes.append("listBySiteIds has no includeDeleted argument")
 
     bill_payer = by_name.get("BillPayer")
     if bill_payer is None:
@@ -184,6 +221,9 @@ def discover_shape(body: dict) -> dict:
         return shape
     fields = {f["name"]: f for f in bill_payer.get("fields") or []}
     shape["external_id"] = "externalId" in fields
+    shape["deleted_at"] = "deletedAt" in fields
+    if not shape["deleted_at"]:
+        notes.append("BillPayer has no deletedAt field")
 
     candidates = []
     for name, field in fields.items():
@@ -200,37 +240,29 @@ def discover_shape(body: dict) -> dict:
             candidates.append((2, name, target))
     if not candidates:
         notes.append("no children field found on BillPayer")
-    else:
-        _rank, name, target = sorted(candidates)[0]
-        shape["children_field"] = name
-        target_type = by_name.get(target)
-        sub = {f["name"]: f for f in (target_type or {}).get("fields") or []}
-        if target_type is None or target_type.get("kind") in ("SCALAR", "ENUM"):
-            shape["child_path"] = ""
-        elif "childId" in sub:
-            shape["child_path"] = "childId"
-        elif "child" in sub:
-            inner = by_name.get(named_type(sub["child"]["type"]) or "") or {}
-            inner_fields = {f["name"] for f in inner.get("fields") or []}
-            pick = "childId" if "childId" in inner_fields else "id" if "id" in inner_fields else None
-            shape["child_path"] = f"child {{ {pick} }}" if pick else None
-        elif "id" in sub:
-            shape["child_path"] = "id"
-        if shape["child_path"] is None:
-            notes.append(f"cannot find a child id inside {target}")
+        return shape
 
-    # The list query: does it take `includeDeleted`, and what does the schema say
-    # its default is?
-    for node in types:
-        if (node.get("name") or "").lower().startswith("billpayers") and node.get("fields"):
-            for field in node["fields"]:
-                if field["name"] == "listBySiteIds":
-                    for arg in field.get("args") or []:
-                        if arg["name"] == "includeDeleted":
-                            shape["include_deleted_type"] = type_str(arg["type"])
-                            shape["include_deleted_default"] = arg.get("defaultValue")
-    if shape["include_deleted_type"] is None:
-        notes.append("listBySiteIds has no includeDeleted argument")
+    _rank, name, target = sorted(candidates)[0]
+    shape["children_field"] = name
+    target_type = by_name.get(target)
+    sub = {f["name"]: f for f in (target_type or {}).get("fields") or []}
+    if target_type is None or target_type.get("kind") in ("SCALAR", "ENUM"):
+        shape["child_path"] = ""
+    elif "childId" in sub:
+        shape["child_path"] = "childId"
+    elif "child" in sub:
+        inner = by_name.get(named_type(sub["child"]["type"]) or "") or {}
+        inner_fields = {f["name"] for f in inner.get("fields") or []}
+        pick = "childId" if "childId" in inner_fields else "id" if "id" in inner_fields else None
+        shape["child_path"] = f"child {{ {pick} }}" if pick else None
+    elif "id" in sub:
+        shape["child_path"] = "id"
+    if shape["child_path"] is None:
+        notes.append(f"cannot find a child id inside {target}")
+    if "multiplier" in sub and shape["child_path"]:
+        shape["multiplier_field"] = "multiplier"
+    elif shape["child_path"]:
+        notes.append(f"no multiplier field inside {target}")
     return shape
 
 
@@ -238,8 +270,13 @@ def build_query(shape: dict, with_include_deleted: bool) -> str:
     selection = ["billPayerId", "email"]
     if shape["external_id"]:
         selection.append("externalId")
+    if shape.get("deleted_at"):
+        selection.append("deletedAt")
     if shape["children_field"] and shape["child_path"] is not None:
-        inner = f" {{ {shape['child_path']} }}" if shape["child_path"] else ""
+        parts = [shape["child_path"]] if shape["child_path"] else []
+        if shape.get("multiplier_field"):
+            parts.append(shape["multiplier_field"])
+        inner = f" {{ {' '.join(parts)} }}" if parts else ""
         selection.append(shape["children_field"] + inner)
     declared = "$siteIds: [SiteId!]!, $next: BillPayerCursor"
     passed = "siteIds: $siteIds, nextToken: $next"
@@ -250,28 +287,45 @@ def build_query(shape: dict, with_include_deleted: bool) -> str:
             f"{{ result {{ {' '.join(selection)} }} next }} }} }}\n")
 
 
-def _child_ids(node: dict, shape: dict) -> set[str]:
+def _child_entries(node: dict, shape: dict) -> list[tuple[str, float | None]]:
+    """(child id, multiplier or None) for each child entry of a bill payer node."""
     field = shape["children_field"]
     if not field:
-        return set()
-    out = set()
+        return []
+    out = []
     for item in node.get(field) or []:
         value = item
         if isinstance(item, dict):
             for part in re.findall(r"\w+", shape["child_path"] or ""):
                 value = value.get(part) if isinstance(value, dict) else None
-        if value:
-            out.add(str(value))
+        if not value:
+            continue
+        multiplier = None
+        if isinstance(item, dict) and shape.get("multiplier_field"):
+            try:
+                multiplier = float(item.get(shape["multiplier_field"]))
+            except (TypeError, ValueError):
+                multiplier = None
+        out.append((str(value), multiplier))
     return out
+
+
+def _child_ids(node: dict, shape: dict) -> set[str]:
+    return {child for child, _m in _child_entries(node, shape)}
 
 
 # --------------------------------------------------------------------------- #
 # Audit
 # --------------------------------------------------------------------------- #
+class AuditRefused(Exception):
+    """The audit cannot run as designed (for example `includeDeleted` was not
+    detected). It never falls back to the server default."""
+
+
 def scan_site(client, site_id: str, shape: dict, include_deleted, clock=time.monotonic) -> dict:
     """Every bill payer at one site. `include_deleted` None = do not pass the argument
-    (the server's default). Rows are held in memory: (id, canonical email, child ids,
-    has externalId)."""
+    (the server's default); only the audit's refusal-free callers use that. Rows are
+    held in memory only."""
     with_flag = include_deleted is not None
     text = build_query(shape, with_flag)
     handle = tempfile.NamedTemporaryFile("w", suffix=".graphql", delete=False, encoding="utf-8")
@@ -293,8 +347,16 @@ def scan_site(client, site_id: str, shape: dict, include_deleted, clock=time.mon
             listing = (((body or {}).get("data") or {}).get("billPayers") or {}).get("listBySiteIds") or {}
             for node in listing.get("result") or []:
                 if isinstance(node, dict) and node.get("billPayerId"):
-                    rows.append((str(node["billPayerId"]), normalise_email(node.get("email")),
-                                 _child_ids(node, shape), bool(str(node.get("externalId") or "").strip())))
+                    entries = _child_entries(node, shape)
+                    rows.append({
+                        "id": str(node["billPayerId"]),
+                        "email": normalise_email(node.get("email")),
+                        "children": {c for c, _m in entries},
+                        "multipliers": [m for _c, m in entries if m is not None],
+                        "entries": len(entries),
+                        "ext": bool(str(node.get("externalId") or "").strip()),
+                        "deleted": bool(node.get("deletedAt")),
+                    })
             cursor = listing.get("next") or None
             if not cursor:
                 break
@@ -303,83 +365,119 @@ def scan_site(client, site_id: str, shape: dict, include_deleted, clock=time.mon
         os.unlink(handle.name)
 
 
+DEFINITIONS = {
+    "duplicate email group": "a canonical email (trimmed, lower case, googlemail.com = gmail.com) "
+                             "that maps to two or more bill payer ids",
+    "idsInGroups": "bill payer ids inside duplicate email groups",
+    "idsDeleted / idsLiveWithChildren / idsLiveWithNoChildren": "of those ids: deletedAt set; not "
+                             "deleted with at least one child; not deleted with no children",
+    "emailsNoneHaveChildren": "groups where no id has a child",
+    "emailsOneHasChildren": "groups where exactly one id has children",
+    "emailsAllIdentical": "groups with two or more ids that have children, all with the SAME child set",
+    "emailsAllDifferent": "groups with two or more ids that have children, every child set DIFFERENT",
+    "emailsMixed": "groups with two or more ids that have children where some share a child set "
+                   "and others differ (for example two identical sets and a third that differs)",
+    "multiplierEntries": "count of child entries by multiplier value, rounded to 3 decimal places",
+    "liveWith2PlusChildren": "bill payers not deleted that have two or more child entries",
+}
+
+
 def _duplicate_stats(rows) -> dict:
     """Counts for the canonical emails that map to two or more bill payer ids."""
-    by_email = defaultdict(dict)                     # email -> {id: child set}
-    for bill_payer_id, email, children, _ext in rows:
-        if email:
-            by_email[email][bill_payer_id] = children
-    duplicated = {e: ids for e, ids in by_email.items() if len(ids) >= 2}
-    zero = identical = different = 0
-    all_identical = all_different = mixed = 0
-    for ids in duplicated.values():
-        sets = list(ids.values())
-        zero += sum(1 for s in sets if not s)
-        non_empty = [frozenset(s) for s in sets if s]
+    by_email = defaultdict(list)
+    for row in rows:
+        if row["email"]:
+            by_email[row["email"]].append(row)
+    duplicated = {e: members for e, members in by_email.items() if len({m["id"] for m in members}) >= 2}
+    stats = Counter()
+    for members in duplicated.values():
+        for member in members:
+            stats["idsInGroups"] += 1
+            if member["deleted"]:
+                stats["idsDeleted"] += 1
+            elif member["children"]:
+                stats["idsLiveWithChildren"] += 1
+            else:
+                stats["idsLiveWithNoChildren"] += 1
+        non_empty = [frozenset(m["children"]) for m in members if m["children"]]
+        stats["idsWithZeroChildren"] += sum(1 for m in members if not m["children"])
         groups = Counter(non_empty)
         shared = sum(n for n in groups.values() if n >= 2)
-        identical += shared
-        different += len(non_empty) - shared
-        if non_empty and len(groups) == 1 and len(non_empty) >= 2:
-            all_identical += 1
-        elif non_empty and all(n == 1 for n in groups.values()) and len(non_empty) >= 2:
-            all_different += 1
-        elif non_empty:
-            mixed += 1
-    return {
-        "emailsWith2PlusBillPayerIds": len(duplicated),
-        "billPayerIdsInThoseEmails": sum(len(i) for i in duplicated.values()),
-        "idsWithZeroChildren": zero,
-        "idsSharingAnIdenticalChildSet": identical,
-        "idsWithADifferentChildSet": different,
-        "emailsWhereEveryNonEmptySetIsIdentical": all_identical,
-        "emailsWhereEveryNonEmptySetDiffers": all_different,
-        "emailsMixed": mixed,
-    }
+        stats["idsSharingAnIdenticalChildSet"] += shared
+        stats["idsWithADifferentChildSet"] += len(non_empty) - shared
+        if not non_empty:
+            stats["emailsNoneHaveChildren"] += 1
+        elif len(non_empty) == 1:
+            stats["emailsOneHasChildren"] += 1
+        elif len(groups) == 1:
+            stats["emailsAllIdentical"] += 1
+        elif all(n == 1 for n in groups.values()):
+            stats["emailsAllDifferent"] += 1
+        else:
+            stats["emailsMixed"] += 1
+    keys = ("idsInGroups", "idsDeleted", "idsLiveWithChildren", "idsLiveWithNoChildren",
+            "idsWithZeroChildren", "idsSharingAnIdenticalChildSet", "idsWithADifferentChildSet",
+            "emailsNoneHaveChildren", "emailsOneHasChildren", "emailsAllIdentical",
+            "emailsAllDifferent", "emailsMixed")
+    out = {"emailsWith2PlusBillPayerIds": len(duplicated)}
+    out.update({k: stats[k] for k in keys})
+    return out
 
 
 def _site_counts(scan: dict) -> dict:
     rows = scan["rows"]
+    multipliers = Counter(f"{m:.3f}" for r in rows for m in r["multipliers"])
     counts = {
-        "billPayers": len({r[0] for r in rows}),
+        "billPayers": len({r["id"] for r in rows}),
         "pages": scan["pages"],
         "seconds": scan["seconds"],
-        "withEmail": sum(1 for r in rows if r[1]),
-        "withoutEmail": sum(1 for r in rows if not r[1]),
-        "withExternalId": sum(1 for r in rows if r[3]),
-        "withNoChildren": sum(1 for r in rows if not r[2]),
+        "withEmail": sum(1 for r in rows if r["email"]),
+        "withoutEmail": sum(1 for r in rows if not r["email"]),
+        "withExternalId": sum(1 for r in rows if r["ext"]),
+        "withNoChildren": sum(1 for r in rows if not r["children"]),
+        "withDeletedAtSet": sum(1 for r in rows if r["deleted"]),
+        "liveWith2PlusChildren": sum(1 for r in rows if not r["deleted"] and r["entries"] >= 2),
+        "multiplierEntries": dict(sorted(multipliers.items())),
     }
     counts.update(_duplicate_stats(rows))
     return counts
 
 
+def require_include_deleted(shape: dict) -> None:
+    """Refuse (never fall back to the server default) when `includeDeleted` was not
+    detected on the list query."""
+    if shape.get("include_deleted_type") is None:
+        raise AuditRefused(
+            "refusing: the includeDeleted argument of listBySiteIds was not detected "
+            f"({'; '.join(shape['notes']) or 'no detail'}); the server default would "
+            "silently include deleted bill payers")
+
+
 def audit(client, sites: dict[str, str], clock=time.monotonic) -> dict:
     """Counts only. `sites` maps a site code to its institution id."""
     shape = discover_shape(fetch_schema(client))
-    variants = [("includeDeletedFalse", False), ("includeDeletedTrue", True)]
-    if shape["include_deleted_type"] is None:
-        variants = [("serverDefault", None)]
-
+    require_include_deleted(shape)
     per_site: dict[str, dict] = {}
     site_emails: dict[str, set] = defaultdict(set)
     total_pages, total_seconds = 0, 0.0
     for code, site_id in sites.items():
         per_site[code] = {}
-        for label, flag in variants:
+        for label, flag in (("includeDeletedFalse", False), ("includeDeletedTrue", True)):
             scan = scan_site(client, site_id, shape, flag, clock)
             per_site[code][label] = _site_counts(scan)
             total_pages += scan["pages"]
             total_seconds += scan["seconds"]
-            if label in ("includeDeletedFalse", "serverDefault"):
-                for _id, email, _children, _ext in scan["rows"]:
-                    if email:
-                        site_emails[email].add(code)
+            if flag is False:
+                for row in scan["rows"]:
+                    if row["email"]:
+                        site_emails[row["email"]].add(code)
     return {
-        # The scan the pipeline already has (pull_roster) passes no includeDeleted at
-        # all, so it gets the server's default (`shape.include_deleted_default`).
+        # The pipeline's existing scan (pull_roster) passes NO includeDeleted at all,
+        # so it gets the server default (`shape.include_deleted_default`).
         "existingScanPassesIncludeDeleted": "includedeleted" in BILL_PAYERS_QUERY.read_text(
             encoding="utf-8").lower(),
         "shape": {k: v for k, v in shape.items() if k != "notes"} | {"notes": list(shape["notes"])},
+        "definitions": DEFINITIONS,
         "sites": per_site,
         "emailsAtMoreThanOneSite": sum(1 for s in site_emails.values() if len(s) > 1),
         "totalPages": total_pages,
