@@ -107,7 +107,7 @@ Names, emails, phones, addresses and dates of birth are read from HubSpot at run
 ## 6. Deployment and first live test
 1. Commit locally once the full suite is clean (single commit is fine), including the fix to the stale origin lines in `docs/status.md` (lines 5 and 6).
 2. On the droplet, read-only: confirm the unit names with `systemctl list-unit-files` and `systemctl cat famly-queue-worker`, and the env variable names with the redacted `.env` listing.
-3. Push, pull in `/opt/famly-tool`, set `ONBOARD_MODE=off`, the allowlist and test-deal variables (the test deal only), and `HUBSPOT_TOKEN` in `.env`.
+3. Push, pull in `/home/drew/famly`, set `ONBOARD_MODE=off`, the allowlist and test-deal variables (the test deal only), and `HUBSPOT_TOKEN` in `.env`.
 4. Create the `famly-onboard-worker` systemd unit (same env file, `ExecStart=.../python main.py onboard-worker`, `Restart=always`), enable it.
 5. Restart gunicorn (the route loads at start-up), start the onboarding worker, restart `famly-queue-worker` so both run the same code.
 6. Check the endpoint with curl: wrong secret returns 401, correct secret in off mode returns 200 `refused_mode_off`.

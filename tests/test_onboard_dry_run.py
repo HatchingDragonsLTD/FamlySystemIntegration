@@ -13,6 +13,7 @@ are planted in the fakes and must never appear in any output or log line.
 import json
 import logging
 import os
+import random
 import tempfile
 import unittest
 from datetime import date
@@ -632,6 +633,99 @@ class ContactPlanTests(DryRunTestCase):
 # --------------------------------------------------------------------------- #
 # The HubSpot client itself: allow-list, GET only, retry.
 # --------------------------------------------------------------------------- #
+class ShufflingHubSpot(FakeHubSpot):
+    """HubSpot gives NO order guarantee: every list it returns (the contacts on a
+    deal, each link's association types, the label definitions) comes back in a
+    different random permutation on every call."""
+
+    def __init__(self, seed=1):
+        super().__init__()
+        self.rng = random.Random(seed)
+
+    def _shuffled(self, items):
+        items = list(items)
+        self.rng.shuffle(items)
+        return items
+
+    def associations(self, from_type, from_id, to_type):
+        return self._shuffled(
+            {**a, "types": self._shuffled(a["types"])}
+            for a in super().associations(from_type, from_id, to_type))
+
+    def association_labels(self, from_type, to_type):
+        return self._shuffled(super().association_labels(from_type, to_type))
+
+
+class PlanStabilityTests(DryRunTestCase):
+    """The same inputs must give the same plan, whatever order the sources answer
+    in. The plan hash is what Gate A compares, so an unstable plan loops."""
+
+    def _several_contacts(self):
+        self.hub = ShufflingHubSpot()
+        # The label is also defined from the contact's side, so non-payers' links to
+        # the deal are read back and their types are APPENDED to the entry's labels.
+        self.hub.labels[("contact", "deal")].append(
+            {"typeId": 93, "label": "Bill Payer", "category": "USER_DEFINED"})
+        ids = ["101", "20", "3", "7"]
+        self.hub.assoc[("deals", "D1", "contacts")] = [
+            {"id": "101", "types": [{"typeId": 91, "label": "Bill Payer"},
+                                    {"typeId": 3, "label": None},
+                                    {"typeId": 5, "label": "Emergency"}]},
+            {"id": "20", "types": [{"typeId": 3, "label": None}, {"typeId": 7, "label": "Parent"}]},
+            {"id": "3", "types": [{"typeId": 3, "label": None}, {"typeId": 8, "label": "Guardian"},
+                                  {"typeId": 9, "label": "Other"}]},
+            {"id": "7", "types": [{"typeId": 3, "label": None}]},
+        ]
+        for contact_id in ids:
+            self.hub.assoc[("contacts", contact_id, "deals")] = [
+                {"id": "D1", "types": [{"typeId": 92, "label": "Childcare Account"},
+                                       {"typeId": 94, "label": "Zeta"},
+                                       {"typeId": 90, "label": "Alpha"}]}]
+        self.hub.contacts = {
+            "101": {"email": "a1@example.org", "firstname": "A", "lastname": "B",
+                    "mobilephone": "07700900001", "address": "1 St", "zip": "Z1", "city": "C"},
+            "20": {"email": "a2@example.org", "firstname": "A", "lastname": "B"},     # no phone
+            "3": {"email": "", "firstname": "A", "lastname": "B", "phone": "07700900003"},
+            "7": {"email": "a4@example.org", "firstname": "A"},                        # no surname
+        }
+
+    def test_the_plan_is_identical_whatever_order_hubspot_answers_in(self):
+        self._several_contacts()
+        first = self.plan()
+        self.assertEqual([c["hubspotContactId"] for c in first["contacts"]],
+                         ["3", "7", "20", "101"])                  # canonical: numeric id order
+        self.assertTrue(len(first["warnings"]) >= 2 and len(first["holds"]) >= 1)
+        for _ in range(15):
+            again = self.plan()
+            self.assertEqual(again["contacts"], first["contacts"])
+            self.assertEqual(again["warnings"], first["warnings"])
+            self.assertEqual(again["holds"], first["holds"])
+            self.assertEqual(runner.plan_hash(again), runner.plan_hash(first))
+
+    def test_labels_are_sorted_within_each_contact(self):
+        self._several_contacts()
+        for entry in self.plan()["contacts"]:
+            keys = [(r["typeId"], r["label"] or "", r["direction"]) for r in entry["labels"]]
+            self.assertEqual(keys, sorted(keys))
+
+    def test_existing_child_contact_ids_do_not_depend_on_famly_order(self):
+        self.famly.ext_refs["D1"] = ["child-1"]
+        rows = [("fc-9", "parent.one@example.org"), ("fc-10", "parent.one@example.org"),
+                ("fc-3", "parent.two@other.com"), ("fc-12", "parent.two@third.org"),
+                ("fc-5", "parent.two@fourth.net")]
+        self.famly.child_contacts["child-1"] = rows
+        first = self.plan()
+        self.famly.child_contacts["child-1"] = list(reversed(rows))
+        second = self.plan()
+        self.assertEqual(first["contacts"], second["contacts"])
+        self.assertEqual(first["holds"], second["holds"])
+        self.assertEqual(runner.plan_hash(first), runner.plan_hash(second))
+        self.assertEqual(first["contacts"][0]["candidateIds"], ["fc-10", "fc-9"])
+        ambiguous = [h for h in first["holds"] if h["reason"] == "contact_ambiguous_on_child"]
+        self.assertEqual(ambiguous[0]["contactIds"], ["fc-10", "fc-9"])
+        self.assertEqual(first["contacts"][1]["candidateIds"], ["fc-12", "fc-3", "fc-5"])
+
+
 class FakeResponse:
     def __init__(self, status, body=None, headers=None):
         self.status_code, self._body, self.headers = status, body or {}, headers or {}

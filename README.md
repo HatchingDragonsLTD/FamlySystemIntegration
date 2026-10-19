@@ -589,10 +589,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=famly
-WorkingDirectory=/opt/famly-tool
-EnvironmentFile=/opt/famly-tool/.env
-ExecStart=/opt/famly-tool/.venv/bin/python main.py queue-worker
+User=drew
+WorkingDirectory=/home/drew/famly
+EnvironmentFile=/home/drew/famly/.env
+ExecStart=/home/drew/famly/venv/bin/python main.py queue-worker
 Restart=always
 RestartSec=10
 

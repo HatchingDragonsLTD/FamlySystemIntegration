@@ -557,6 +557,64 @@ class GateATests(Phase2Case):
         self.assertEqual(self.job().status, store.DONE)
         self.assertEqual(len(self.notify.gates), 1)
 
+    def _reorder_hubspot(self):
+        """From now on HubSpot answers in the opposite order: contacts and types."""
+        original = self.hub.associations
+
+        def reversed_answer(from_type, from_id, to_type):
+            return [{**a, "types": list(reversed(a["types"]))}
+                    for a in reversed(original(from_type, from_id, to_type))]
+        self.hub.associations = reversed_answer
+
+    def _two_labels_each(self):
+        key = ("deals", DEAL, "contacts")
+        self.hub.assoc[key] = [
+            {"id": "c1", "types": [{"typeId": 91, "label": "Bill Payer"},
+                                   {"typeId": 3, "label": None}]},
+            {"id": "c2", "types": [{"typeId": 3, "label": None}, {"typeId": 1, "label": "Other"}]},
+        ]
+
+    def test_a_reordered_hubspot_answer_does_not_re_ask_after_approval(self):
+        self._two_labels_each()
+        self.run_to_approval()
+        self.approve()
+        self._reorder_hubspot()                    # the same plan, answered in another order
+        result = self.run_worker()
+        self.assertEqual(result["status"], store.DONE)
+        self.assertEqual(len(self.notify.gates), 1)           # never asked again
+        self.assertEqual(len(self.famly.child_creates), 1)
+
+    def test_a_plan_that_changes_again_after_one_re_ask_ends_plan_unstable(self):
+        self.run_to_approval()
+        self.approve()
+        self.hub.deals[DEAL]["actual_start_date_1"] = "2026-02-15"       # change one
+        self.hub.deals[DEAL]["child_date_of_birth"] = "2023-02-15"
+        self.assertEqual(self.run_worker()["status"], store.AWAITING_APPROVAL)
+        self.assertEqual(len(self.notify.gates), 2)           # re-asked once
+        self.assertEqual(self.job().reask_count, 1)
+        self.approve()
+        self.hub.contacts["c1"]["address"] = ""                           # change two
+        result = self.run_worker()
+        self.assertEqual((result["status"], result["code"]), (store.NEEDS_REVIEW, "plan_unstable"))
+        self.assertEqual(len(self.notify.gates), 2)           # NOT asked a third time
+        self.assertFalse(self.sent_anything)
+        notice = [n for n in self.notify.notices if "plan_unstable" in n]
+        self.assertEqual(len(notice), 1)                      # exactly one notice
+        self.assertIn("contacts:", notice[0])                 # the section that differed
+        self.assertNotIn("child:", notice[0])                 # and only that one
+        self.assertEqual(self.job().status, store.NEEDS_REVIEW)
+
+    def test_a_genuine_change_re_asks_exactly_once_and_then_proceeds(self):
+        self.run_to_approval()
+        self.approve()
+        self.hub.deals[DEAL]["actual_start_date_1"] = "2026-02-15"
+        self.hub.deals[DEAL]["child_date_of_birth"] = "2023-02-15"
+        self.assertEqual(self.run_worker()["status"], store.AWAITING_APPROVAL)
+        self.assertEqual(self.job().reask_count, 1)
+        self.approve()
+        self.assertEqual(self.run_worker()["status"], store.DONE)      # unchanged since: proceeds
+        self.assertEqual(len(self.notify.gates), 2)
+
     def test_a_click_without_the_nonce_never_approves(self):
         job = self.run_to_approval()
         for value in (f"{job.id}:{job.plan_hash[:16]}", f"{job.id}:{job.plan_hash[:16]}:",
@@ -1192,7 +1250,8 @@ class GuaranteeTests(Phase2Case):
         self.assertEqual(columns, ["id", "deal_id", "status", "mode", "plan_hash", "approved_hash",
                                    "child_id", "attempts", "last_error_code", "approval_ref",
                                    "child_create_sent", "outcomes", "claimed_at", "created_at",
-                                   "updated_at", "source", "approval_nonce"])
+                                   "updated_at", "source", "approval_nonce", "reask_count",
+                                   "plan_sections"])
 
     def test_the_famly_writers_are_create_only_and_the_fake_would_catch_anything_else(self):
         for path in (famly_writes.CREATE_CHILD_QUERY, famly_writes.CREATE_CONTACT_QUERY):
@@ -1695,6 +1754,33 @@ class CreateSentOnceTests(unittest.TestCase):
 # Logging reaches the journal: the approval lines are emitted at INFO
 # --------------------------------------------------------------------------- #
 class ApprovalLoggingTests(Phase2Case):
+    def test_the_recheck_and_unstable_lines_carry_hashes_and_codes_only(self):
+        from core.logging_setup import configure_logging
+        root = logging.getLogger()
+        saved_handlers, saved_level = list(root.handlers), root.level
+        self.addCleanup(lambda: (root.handlers.clear(), root.handlers.extend(saved_handlers),
+                                 root.setLevel(saved_level)))
+        root.setLevel(logging.WARNING)
+        stream = io.StringIO()
+        configure_logging(stream=stream, force=True)
+        self.run_to_approval()
+        self.approve()
+        self.hub.deals[DEAL]["actual_start_date_1"] = "2026-02-15"
+        self.hub.deals[DEAL]["child_date_of_birth"] = "2023-02-15"
+        self.run_worker()
+        self.approve()
+        self.hub.contacts["c1"]["address"] = ""
+        self.run_worker()
+        out = stream.getvalue()
+        self.assertIn("approval re-check", out)
+        self.assertIn("plan unstable", out)
+        self.assertIn("contacts:", out)
+        for value in PII:
+            self.assertNotIn(value, out)
+        for line in self.notify.notices:
+            for value in PII:
+                self.assertNotIn(value, line.casefold())
+
     def test_ask_approve_recheck_and_reask_lines_are_emitted_once_logging_is_configured(self):
         from core.logging_setup import configure_logging
         root = logging.getLogger()
