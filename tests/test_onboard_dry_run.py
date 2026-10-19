@@ -702,6 +702,40 @@ class PlanStabilityTests(DryRunTestCase):
             self.assertEqual(again["holds"], first["holds"])
             self.assertEqual(runner.plan_hash(again), runner.plan_hash(first))
 
+    def _digest_with(self, c1_types, c2_types=None):
+        key = ("deals", "D1", "contacts")
+        self.hub.assoc[key] = [
+            {"id": "c1", "types": c1_types},
+            {"id": "c2", "types": c2_types or [{"typeId": 3, "label": None}]},
+        ]
+        plan = self.plan()
+        return runner.plan_hash(plan), plan
+
+    def test_label_order_and_irrelevant_labels_never_change_the_digest(self):
+        bill = {"typeId": 91, "label": "Bill Payer"}
+        plain = {"typeId": 3, "label": None}
+        base, plan = self._digest_with([bill, plain])
+        # The same labels in the other order.
+        self.assertEqual(self._digest_with([plain, bill])[0], base)
+        # An extra label that changes nothing (not the Bill Payer label).
+        extra, extra_plan = self._digest_with([plain, {"typeId": 77, "label": "Newsletter"}, bill])
+        self.assertEqual(extra, base)
+        # The labels are still in the plan for display, just not in the hash.
+        self.assertIn(77, [r["typeId"] for r in extra_plan["contacts"][0]["labels"]])
+        self.assertNotEqual(extra_plan["contacts"][0]["labels"], plan["contacts"][0]["labels"])
+        self.assertTrue(plan["contacts"][0]["isBillPayer"])
+
+    def test_the_bill_payer_label_changes_the_digest(self):
+        bill = {"typeId": 91, "label": "Bill Payer"}
+        plain = {"typeId": 3, "label": None}
+        base, _ = self._digest_with([bill, plain])
+        removed, _ = self._digest_with([plain])                      # c1 stops being the payer
+        self.assertNotEqual(removed, base)
+        moved, plan = self._digest_with([plain], [plain, bill])      # the payer is c2 instead
+        self.assertNotEqual(moved, base)
+        self.assertNotEqual(moved, removed)
+        self.assertEqual([c["isBillPayer"] for c in plan["contacts"]], [False, True])
+
     def test_labels_are_sorted_within_each_contact(self):
         self._several_contacts()
         for entry in self.plan()["contacts"]:

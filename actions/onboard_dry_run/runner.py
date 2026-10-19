@@ -520,13 +520,38 @@ def run(
     return result
 
 
+# Contact fields that stay in the plan for DISPLAY and diagnostics but are NOT part
+# of what Gate A approves. `labels` is the raw list of association labels on a
+# contact's link to the deal. The only label-derived value that changes behaviour is
+# `isBillPayer`, which stays in the hashed part, so a label's order or an irrelevant
+# extra label can never change the digest.
+#
+# IF A LATER PHASE WRITES DIFFERENTLY DEPENDING ON ANOTHER LABEL (for example the
+# non-parent label that decides app access), THAT LABEL MUST BE ADDED BACK TO THE
+# HASHED PART, as a SORTED SET (e.g. a sorted `appAccessLabels` list on the entry).
+UNHASHED_CONTACT_FIELDS = ("labels",)
+
+
+def hashed_plan(plan: dict) -> dict:
+    """The part of the plan that is hashed: the plan without the display-only
+    contact fields. Everything else, every list in it in canonical order, is in."""
+    view = dict(plan)
+    if isinstance(view.get("contacts"), list):
+        view["contacts"] = [
+            {k: v for k, v in c.items() if k not in UNHASHED_CONTACT_FIELDS}
+            if isinstance(c, dict) else c
+            for c in view["contacts"]
+        ]
+    return view
+
+
 def plan_hash(plan: dict) -> str:
-    """A hash of the plan JSON. The plan holds ids, codes and counts only (no
-    personal data), so the hash is safe to store; if anything the approver saw
-    changes, it changes."""
+    """A hash of the plan JSON (see `hashed_plan`). The plan holds ids, codes and
+    counts only (no personal data), so the hash is safe to store; if anything that
+    affects what is written, or that the approver saw, changes, it changes."""
     import hashlib
     import json
 
     return hashlib.sha256(
-        json.dumps(plan, sort_keys=True, default=str).encode("utf-8")
+        json.dumps(hashed_plan(plan), sort_keys=True, default=str).encode("utf-8")
     ).hexdigest()
