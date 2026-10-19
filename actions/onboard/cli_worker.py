@@ -6,7 +6,8 @@ polls (what a systemd unit would run on the server). Prints codes and ids only.
 """
 
 import argparse
-import logging
+
+from core.logging_setup import configure_logging
 
 from . import worker
 
@@ -26,7 +27,7 @@ def add_args(parser: argparse.ArgumentParser) -> None:
 
 
 def handle(args: argparse.Namespace):
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    configure_logging()
     if args.once:
         recovered = worker.recover()
         return {"recovered": recovered, **worker.run_once()}

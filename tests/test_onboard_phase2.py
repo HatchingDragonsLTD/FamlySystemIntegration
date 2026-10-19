@@ -1653,5 +1653,38 @@ class CreateSentOnceTests(unittest.TestCase):
                     self.assertEqual(post.call_count, 1)
 
 
+# --------------------------------------------------------------------------- #
+# Logging reaches the journal: the approval lines are emitted at INFO
+# --------------------------------------------------------------------------- #
+class ApprovalLoggingTests(Phase2Case):
+    def test_ask_approve_recheck_and_reask_lines_are_emitted_once_logging_is_configured(self):
+        from core.logging_setup import configure_logging
+        root = logging.getLogger()
+        saved_handlers, saved_level = list(root.handlers), root.level
+        self.addCleanup(lambda: (root.handlers.clear(), root.handlers.extend(saved_handlers),
+                                 root.setLevel(saved_level)))
+        root.setLevel(logging.WARNING)             # what gunicorn leaves behind
+        stream = io.StringIO()
+        configure_logging(stream=stream, force=True)
+
+        self.run_to_approval()                                  # ask
+        self.approve()                                          # approve (a click)
+        self.hub.deals[DEAL]["actual_start_date_1"] = "2026-02-15"
+        self.hub.deals[DEAL]["child_date_of_birth"] = "2023-02-15"
+        self.run_worker()                                       # re-check, then re-ask
+        out = stream.getvalue()
+
+        self.assertEqual(root.level, logging.INFO)
+        self.assertIn("ONBOARD APPROVED", out)
+        self.assertIn("ONBOARD CLICK action=onboard_approve", out)
+        self.assertIn("result=approved", out)
+        self.assertIn("approval re-check", out)
+        self.assertIn("unchanged=False", out)                   # the plan really changed
+        self.assertEqual(out.count("approval asked"), 2)        # the ask and the re-ask
+        self.assertIn("plan_changed=True", out)
+        for value in PII:
+            self.assertNotIn(value, out)
+
+
 if __name__ == "__main__":
     unittest.main()

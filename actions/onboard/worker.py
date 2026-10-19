@@ -219,6 +219,10 @@ def _process(job: store.Job, deps: Deps, run_mode: str) -> dict:
 
     # GATE A applies to ANY live plan that would perform a Famly write: a child
     # create, or only contact creates on a child that exists.
+    if job.approved_hash is not None:
+        # The re-check after an approval: the worker re-ran the plan and compares.
+        logger.info("onboard: approval re-check job=%s unchanged=%s digest=%s approved=%s",
+                    job.id, job.approved_hash == digest, digest, job.approved_hash)
     if famly_writes_planned(plan) and job.approved_hash != digest:
         _ask_for_approval(job, deps, plan, digest, run_mode, plan_changed=job.approved_hash is not None)
         return {}
