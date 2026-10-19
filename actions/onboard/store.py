@@ -124,6 +124,7 @@ class Job:
     updated_at: str | None = None
     source: str = "cli"
     approval_nonce: str | None = None
+    claimed_at: str | None = None
 
 
 def store_path() -> Path:
@@ -179,6 +180,7 @@ def _to_job(row: sqlite3.Row) -> Job:
         child_create_sent=bool(row["child_create_sent"]), outcomes=outcomes,
         created_at=row["created_at"], updated_at=row["updated_at"],
         source=row["source"], approval_nonce=row["approval_nonce"],
+        claimed_at=row["claimed_at"],
     )
 
 
@@ -348,6 +350,34 @@ def transition(job_id: str, from_status: str, to_status: str, **fields) -> bool:
             f"UPDATE onboard_jobs SET status = ?, claimed_at = NULL, updated_at = ?"
             f"{', ' + columns if columns else ''} WHERE id = ? AND status = ?",
             (to_status, _now(), *values, job_id, from_status),
+        )
+    return cursor.rowcount == 1
+
+
+def begin_approval_wait(job_id: str, claimed_at: str | None, plan_hash: str, nonce: str) -> bool:
+    """Move a job to `awaiting_approval` ONLY if it is still `queued` and still held
+    by the claim this run took (`claimed_at` is unchanged). A run that lagged behind
+    a click, a re-claim or the end of the job changes nothing and returns False, so
+    it cannot clear an approval or drag a moved-on job back to waiting."""
+    if claimed_at is None:
+        return False
+    with _open() as connection:
+        cursor = connection.execute(
+            "UPDATE onboard_jobs SET status = ?, claimed_at = NULL, updated_at = ?, "
+            "plan_hash = ?, approved_hash = NULL, approval_nonce = ? "
+            "WHERE id = ? AND status = ? AND claimed_at = ?",
+            (AWAITING_APPROVAL, _now(), plan_hash, nonce, job_id, QUEUED, claimed_at),
+        )
+    return cursor.rowcount == 1
+
+
+def set_approval_ref(job_id: str, nonce: str, ref: str) -> bool:
+    """Record the Slack ref of the request, only while that request is the current one."""
+    with _open() as connection:
+        cursor = connection.execute(
+            "UPDATE onboard_jobs SET approval_ref = ?, updated_at = ? "
+            "WHERE id = ? AND status = ? AND approval_nonce = ?",
+            (ref, _now(), job_id, AWAITING_APPROVAL, nonce),
         )
     return cursor.rowcount == 1
 
