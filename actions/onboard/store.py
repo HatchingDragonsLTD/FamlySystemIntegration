@@ -159,20 +159,32 @@ def _open():
         connection.close()
 
 
+# (column, DDL) added after the first release, in the order they were added.
+_ADDED_COLUMNS = (
+    ("source", "TEXT NOT NULL DEFAULT 'cli'"),
+    ("approval_nonce", "TEXT"),
+    ("reask_count", "INTEGER NOT NULL DEFAULT 0"),
+    ("plan_sections", "TEXT"),
+)
+
+
 def _migrate(connection: sqlite3.Connection) -> None:
-    """Add columns a store created before they existed does not have."""
+    """Add columns a store created before they existed does not have.
+
+    Safe when several processes open the store at once (two gunicorn workers, the
+    onboard worker, ...): the existing columns are read first, and an ADD COLUMN
+    that loses the race to another process ("duplicate column name") is the column
+    being there already, so it is ignored. Any other error is raised.
+    """
     columns = {row["name"] for row in connection.execute("PRAGMA table_info(onboard_jobs)")}
-    if "source" not in columns:
-        connection.execute(
-            "ALTER TABLE onboard_jobs ADD COLUMN source TEXT NOT NULL DEFAULT 'cli'"
-        )
-    if "approval_nonce" not in columns:
-        connection.execute("ALTER TABLE onboard_jobs ADD COLUMN approval_nonce TEXT")
-    if "reask_count" not in columns:
-        connection.execute(
-            "ALTER TABLE onboard_jobs ADD COLUMN reask_count INTEGER NOT NULL DEFAULT 0")
-    if "plan_sections" not in columns:
-        connection.execute("ALTER TABLE onboard_jobs ADD COLUMN plan_sections TEXT")
+    for name, ddl in _ADDED_COLUMNS:
+        if name in columns:
+            continue
+        try:
+            connection.execute(f"ALTER TABLE onboard_jobs ADD COLUMN {name} {ddl}")
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" not in str(exc).lower():
+                raise
 
 
 SOURCES = ("cli", "webhook")

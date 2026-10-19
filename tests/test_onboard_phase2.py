@@ -1224,6 +1224,76 @@ class WriteBackTests(Phase2Case):
 # --------------------------------------------------------------------------- #
 # Whole-run guarantees
 # --------------------------------------------------------------------------- #
+class MigrationTests(Phase2Case):
+    """The store is opened by several processes at once; the column migration must
+    be idempotent and survive losing the race to another process."""
+
+    def _old_store(self):
+        """A store as an older release left it: without the newer columns."""
+        path = store.store_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with contextlib.closing(sqlite3.connect(path)) as connection:
+            connection.execute(
+                "CREATE TABLE onboard_jobs (id TEXT PRIMARY KEY, deal_id TEXT NOT NULL, "
+                "status TEXT NOT NULL, mode TEXT NOT NULL, plan_hash TEXT, approved_hash TEXT, "
+                "child_id TEXT, attempts INTEGER NOT NULL DEFAULT 0, last_error_code TEXT, "
+                "approval_ref TEXT, child_create_sent INTEGER NOT NULL DEFAULT 0, outcomes TEXT, "
+                "claimed_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)")
+            connection.commit()
+
+    def _columns(self):
+        with contextlib.closing(sqlite3.connect(store.store_path())) as connection:
+            return [row[1] for row in connection.execute("PRAGMA table_info(onboard_jobs)")]
+
+    def test_migrating_twice_on_a_store_that_already_has_the_columns_changes_nothing(self):
+        self.enqueue()                                   # creates the current schema
+        before = self._columns()
+        with contextlib.closing(sqlite3.connect(store.store_path())) as connection:
+            connection.row_factory = sqlite3.Row
+            store._migrate(connection)
+            store._migrate(connection)
+        self.assertEqual(self._columns(), before)
+        self.assertEqual(self.job().status, store.QUEUED)           # and the data is intact
+
+    def test_an_old_store_gets_the_columns_once_however_often_it_is_opened(self):
+        self._old_store()
+        for _ in range(3):
+            store.get("nothing")                         # every open runs the migration
+        columns = self._columns()
+        for name in ("source", "approval_nonce", "reask_count", "plan_sections"):
+            self.assertEqual(columns.count(name), 1, name)
+
+    def test_a_duplicate_column_error_from_a_concurrent_process_is_tolerated(self):
+        self._old_store()
+        real = sqlite3.connect(store.store_path())
+        real.row_factory = sqlite3.Row
+
+        class RacingConnection:
+            """Another process adds each column between our check and our ALTER."""
+            def execute(self_inner, sql, *args):
+                if sql.startswith("ALTER TABLE"):
+                    real.execute(sql)                    # the other process wins the race
+                    real.commit()
+                return real.execute(sql, *args)          # ours now fails: duplicate column
+
+        try:
+            store._migrate(RacingConnection())           # must not raise
+        finally:
+            real.close()
+        for name in ("source", "approval_nonce", "reask_count", "plan_sections"):
+            self.assertEqual(self._columns().count(name), 1, name)
+
+    def test_any_other_migration_error_is_still_raised(self):
+        class BrokenConnection:
+            def execute(self_inner, sql, *args):
+                if sql.startswith("PRAGMA"):
+                    return []
+                raise sqlite3.OperationalError("disk I/O error")
+
+        with self.assertRaises(sqlite3.OperationalError):
+            store._migrate(BrokenConnection())
+
+
 class GuaranteeTests(Phase2Case):
     def test_no_slack_payload_database_row_or_log_line_carries_personal_data(self):
         self.run_through()
