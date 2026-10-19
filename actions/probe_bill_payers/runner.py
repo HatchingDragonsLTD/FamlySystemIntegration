@@ -293,6 +293,18 @@ def _selection(path: list[str]) -> str:
     return text
 
 
+def children_selection(shape: dict) -> str:
+    """The selection of a bill payer's children, e.g. `children { childId share { multiplier } }`
+    ("" when the children field is unknown)."""
+    if not (shape.get("children_field") and shape.get("child_path") is not None):
+        return ""
+    parts = [shape["child_path"]] if shape["child_path"] else []
+    if shape.get("multiplier_path"):
+        parts.append(_selection(shape["multiplier_path"]))
+    inner = f" {{ {' '.join(parts)} }}" if parts else ""
+    return shape["children_field"] + inner
+
+
 def build_query(shape: dict, with_include_deleted: bool) -> str:
     selection = ["billPayerId", "email"]
     if shape["external_id"]:
