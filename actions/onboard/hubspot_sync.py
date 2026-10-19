@@ -40,6 +40,10 @@ logger = logging.getLogger(__name__)
 STATUS_CHILD_READY = "child_ready"                # "Child created in Famly"
 STATUS_CONTACTS_LINKED = "contacts_linked"        # "Child and contacts in Famly"
 STATUS_NEEDS_ATTENTION = "needs_attention"        # "Needs attention"
+# After a SUCCESSFUL bill payer step. Written ONLY if the HubSpot dropdown already offers it
+# (internal value `bill_payer_linked`, label "Child, contacts and bill payer in Famly"); until
+# it does, the status stays `contacts_linked`.
+STATUS_BILL_PAYER_LINKED = "bill_payer_linked"
 STATUS_OPTIONS = (STATUS_CHILD_READY, STATUS_CONTACTS_LINKED, STATUS_NEEDS_ATTENTION)
 
 # The properties the pre-flight looks for.
@@ -161,6 +165,10 @@ class Syncer:
     def write_gaps(self, codes) -> bool:
         """The things to check, as plain-English sentences (see `gaps_value`)."""
         return self.write(hubspot.SYNC_GAPS_PROPERTY, gaps_value(codes))
+
+    def offered(self, prop: str, value: str) -> bool:
+        """True only if `prop` is a dropdown that explicitly lists `value`."""
+        return value in (self.pre.options.get(prop) or [])
 
     def write_status(self, status: str, note: str, gaps) -> None:
         """`status` is one of STATUS_OPTIONS; `note` and the gaps are plain English."""

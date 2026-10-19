@@ -9,6 +9,12 @@
     ONBOARD_TEST_DEAL_IDS     comma-separated; a subset of the allowlist. Only a
                               deal in BOTH lists creates its child with
                               isTestChild true. The flag is never set otherwise.
+    ONBOARD_BILL_PAYER        off | on   (default off). On: the plan shows the bill payer
+                              decision and, in live mode after Gate A, the worker creates or
+                              attaches the bill payer. Off: behaviour is unchanged.
+    ONBOARD_BILL_PAYER_DETAIL_SELECTION
+                              optional GraphQL selection for the name and phone fields of a
+                              BillPayer (enables the `bill_payer_differs` comparison).
     HUBSPOT_PORTAL_ID         optional; used only to build the deal link in Slack.
     ONBOARD_STORE_PATH        optional path to the jobs SQLite file (default
                               var/onboard_jobs.sqlite3, gitignored).
@@ -68,3 +74,8 @@ def deal_link(deal_id: str) -> str | None:
     if not portal:
         return None
     return f"https://app.hubspot.com/contacts/{portal}/record/0-3/{deal_id}"
+
+
+def bill_payer_enabled() -> bool:
+    """ONBOARD_BILL_PAYER=on (anything else, and the default, is off)."""
+    return os.environ.get("ONBOARD_BILL_PAYER", "").strip().lower() == "on"

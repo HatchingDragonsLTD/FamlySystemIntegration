@@ -25,6 +25,7 @@ could carry data.
     approval_ref       the Slack message ref of the approval request
     reask_count        how many times the plan CHANGED after an approval and was asked again
     plan_sections      short hash per plan section at the last ask (no personal data)
+    bill_payer_id      the Famly bill payer id the bill payer stage matched, created or attached
     approval_nonce     random token of the CURRENT approval request; only its buttons count
     child_create_sent  1 once a child create request has been SENT for this job:
                        a job never sends a second one
@@ -95,7 +96,8 @@ CREATE TABLE IF NOT EXISTS onboard_jobs (
     source            TEXT NOT NULL DEFAULT 'cli',
     approval_nonce    TEXT,
     reask_count       INTEGER NOT NULL DEFAULT 0,
-    plan_sections     TEXT
+    plan_sections     TEXT,
+    bill_payer_id     TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS onboard_one_active_per_deal
     ON onboard_jobs (deal_id)
@@ -106,7 +108,7 @@ CREATE INDEX IF NOT EXISTS onboard_jobs_by_status ON onboard_jobs (status, creat
 # Columns that update() may set.
 _UPDATABLE = {
     "plan_hash", "approved_hash", "child_id", "last_error_code", "approval_ref",
-    "outcomes", "mode", "approval_nonce",
+    "outcomes", "mode", "approval_nonce", "bill_payer_id",
 }
 
 
@@ -131,6 +133,7 @@ class Job:
     claimed_at: str | None = None
     reask_count: int = 0
     plan_sections: dict | None = None
+    bill_payer_id: str | None = None
 
 
 def store_path() -> Path:
@@ -165,6 +168,7 @@ _ADDED_COLUMNS = (
     ("approval_nonce", "TEXT"),
     ("reask_count", "INTEGER NOT NULL DEFAULT 0"),
     ("plan_sections", "TEXT"),
+    ("bill_payer_id", "TEXT"),
 )
 
 
@@ -208,6 +212,7 @@ def _to_job(row: sqlite3.Row) -> Job:
         created_at=row["created_at"], updated_at=row["updated_at"],
         source=row["source"], approval_nonce=row["approval_nonce"],
         claimed_at=row["claimed_at"], reask_count=row["reask_count"], plan_sections=sections,
+        bill_payer_id=row["bill_payer_id"],
     )
 
 

@@ -72,6 +72,8 @@ from actions.onboard import (
     store,
     summary_check,
 )
+from actions.onboard import bill_payer_writes
+from actions.onboard_dry_run import bill_payers as bill_payer_scan
 from actions.onboard_dry_run import derive
 from actions.onboard_dry_run.famly_reads import FamlyReads, normalise_email
 from actions.onboard_dry_run.runner import DryRun, hashed_plan, plan_hash
@@ -112,6 +114,7 @@ class Deps:
     rest: Any                    # internal REST client (the child summary)
     notifier: Any                # .gate(text, job_id, plan_hash, nonce) -> ref | None; .notice(text)
     famly_factory: Callable[[], FamlyReads] | None = None
+    sleep: Callable[[float], None] = time.sleep       # the bill payer stage's 10 s settle wait
 
     def famly(self) -> FamlyReads:
         """A FRESH set of live reads. Never reuse one across the plan and a
@@ -248,8 +251,11 @@ def _this_jobs_child(job) -> str | None:
 def famly_writes_planned(plan: dict) -> bool:
     """Whether the plan would write to Famly at all: a child create and/or any
     contact create. Such a plan needs a Slack approval (Gate A) in live mode."""
-    return plan["child"]["status"] == "child_would_create" or any(
-        c["status"] == "would_create" for c in plan["contacts"]
+    return (
+        plan["child"]["status"] == "child_would_create"
+        or any(c["status"] == "would_create" for c in plan["contacts"])
+        or (plan.get("billPayer") or {}).get("status") in (
+            bill_payer_scan.WOULD_CREATE, bill_payer_scan.WOULD_ATTACH)
     )
 
 
@@ -366,13 +372,32 @@ def _write_phase(job, deps, plan, context, digest) -> dict:
     outcomes, contact_warnings, all_ok = _create_contacts(job, deps, plan, context, child, own_child)
     store.update(job.id, outcomes=outcomes)
 
+    # THE BILL PAYER STAGE (ONBOARD_BILL_PAYER=on): after the child and contacts, never
+    # blocking either, never rolling either back. Any flag ends the job needs_review.
+    bill_payer = None
+    if config.bill_payer_enabled() and plan.get("billPayer"):
+        bill_payer = _bill_payer_stage(job, deps, plan, context, child)
+        store.update(job.id, outcomes=outcomes + [f"billpayer:{bill_payer.code}"])
+    # Any flag ends the job needs_review: a failure code, or a difference to look at.
+    bill_payer_failed = bill_payer is not None and (
+        bill_payer.code not in bill_payer_scan.SUCCESS_CODES or bool(bill_payer.differs))
+    bill_payer_codes = [] if bill_payer is None else [bill_payer.code, *bill_payer.extra]
+    bill_payer_footer = [f"differs:{','.join(bill_payer.differs)}"] if bill_payer and bill_payer.differs else []
+
     bad_codes = sorted({o.split(":", 1)[1] for o in outcomes if o.split(":", 1)[1] not in OK_OUTCOMES})
+    if bill_payer_failed:
+        bad_codes.append(bill_payer.code if bill_payer.code not in bill_payer_scan.SUCCESS_CODES
+                         else bill_payer_scan.DIFFERS)
     gaps = list(plan["warnings"]) + contact_warnings + flags
     contact_codes = [o.split(":", 1)[1] for o in outcomes]
-    summary = _summary_line(child.created, contact_codes)
-    if all_ok:
-        syncer.write_status(hubspot_sync.STATUS_CONTACTS_LINKED,
-                            hubspot_sync.note_done(summary), gaps)
+    summary = _summary_line(child.created, contact_codes, bill_payer)
+    if all_ok and not bill_payer_failed:
+        # `bill_payer_linked` only if HubSpot's dropdown already offers it.
+        status = hubspot_sync.STATUS_CONTACTS_LINKED
+        if (bill_payer is not None and bill_payer.code in bill_payer_scan.SUCCESS_CODES
+                and syncer.offered(hubspot.SYNC_STATUS_PROPERTY, hubspot_sync.STATUS_BILL_PAYER_LINKED)):
+            status = hubspot_sync.STATUS_BILL_PAYER_LINKED
+        syncer.write_status(status, hubspot_sync.note_done(summary), gaps)
     else:
         syncer.write_status(hubspot_sync.STATUS_NEEDS_ATTENTION,
                             hubspot_sync.note_needs_attention(summary, bad_codes), gaps)
@@ -383,23 +408,45 @@ def _write_phase(job, deps, plan, context, digest) -> dict:
     failures = []
     if not all_ok:
         failures.append("contact_outcomes")
+    if bill_payer_failed:
+        failures.append(bill_payer.code if bill_payer.code not in bill_payer_scan.SUCCESS_CODES
+                        else bill_payer_scan.DIFFERS)
     if syncer.critical_failed:
         failures.append("hubspot_writeback_failed")
     codes = (bad_codes + [f for f in failures if f != "contact_outcomes"] + flags
-             + syncer.reports + list(plan["warnings"]) + contact_warnings
+             + syncer.reports + list(plan["warnings"]) + contact_warnings + bill_payer_codes
              + ["created" if child.created else "child_existed"])
     if failures:
         store.set_status(job.id, store.NEEDS_REVIEW, last_error_code=",".join(failures))
         deps.notifier.notice(notifier_mod.notice_text(
-            deal_id, f"⚠️ {summary} The job needs a person.", codes))
+            deal_id, f"⚠️ {summary} The job needs a person.", codes, bill_payer_footer))
     else:
         store.set_status(job.id, store.DONE, last_error_code=None)
-        deps.notifier.notice(notifier_mod.notice_text(deal_id, f"✅ {summary}", codes))
+        deps.notifier.notice(notifier_mod.notice_text(deal_id, f"✅ {summary}", codes, bill_payer_footer))
     _admin_notice(deps, deal_id, codes)
     return info
 
 
-def _summary_line(child_created: bool, contact_codes: list[str]) -> str:
+def _bill_payer_stage(job, deps, plan, context, child: "ChildResult"):
+    """Run the bill payer stage. It never raises: an unexpected error after a request may
+    have gone out is an UNKNOWN outcome (type only is logged)."""
+    try:
+        site_id = plan["siteId"]
+        result = bill_payer_writes.run_stage(
+            public=deps.public, scan=lambda: deps.famly().bill_payers(site_id),
+            contacts=context["contacts"], approved=plan["billPayer"], site_id=site_id,
+            child_id=child.child_id, sleep=deps.sleep)
+    except Exception as exc:  # noqa: BLE001 - one stage must never stop the job's end
+        logger.error("onboard: bill payer stage hit %s", type(exc).__name__)
+        result = bill_payer_writes.StageResult(bill_payer_scan.OUTCOME_UNKNOWN)
+    if result.bill_payer_id:
+        store.update(job.id, bill_payer_id=result.bill_payer_id)      # the id only
+    logger.info("onboard: bill payer stage job=%s code=%s sent=%s id=%s", job.id, result.code,
+                result.sent, result.bill_payer_id)
+    return result
+
+
+def _summary_line(child_created: bool, contact_codes: list[str], bill_payer=None) -> str:
     """One plain sentence: what was done. Counts only."""
     created = contact_codes.count(CREATED)
     present = contact_codes.count(PRESENT)
@@ -407,6 +454,11 @@ def _summary_line(child_created: bool, contact_codes: list[str]) -> str:
     line = ("Child created in Famly. " if child_created else "Child was already in Famly. ")
     line += f"{created} contact(s) created, {present} already present"
     line += f", {missed} not added." if missed else "."
+    if bill_payer is not None:
+        line += {bill_payer_scan.CREATED: " Bill payer created.",
+                 bill_payer_scan.ATTACHED: " Child linked to the existing bill payer.",
+                 bill_payer_scan.PRESENT: " Child already linked to the bill payer."}.get(
+            bill_payer.code, "")
     return line
 
 
