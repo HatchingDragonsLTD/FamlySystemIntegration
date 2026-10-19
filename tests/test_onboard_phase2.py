@@ -791,7 +791,7 @@ class ChildCreateTests(Phase2Case):
                 self.assertEqual((result["status"], result["code"]),
                                  (store.NEEDS_REVIEW, "create_outcome_unknown"))
                 self.assertEqual(self.famly.contact_creates, [])
-                self.assertTrue(any("check Famly for the deal id before re-running" in n
+                self.assertTrue(any("Check Famly for the deal ID before running again" in n
                                     for n in self.notify.notices))
 
     def test_a_job_never_sends_a_second_child_create(self):
@@ -993,7 +993,7 @@ class ContactTests(Phase2Case):
                          ["ada.l@example.org", "ben.b@example.org"])    # none sent twice
         self.assertEqual(self.job().outcomes, ["c1:create_outcome_unknown", "c2:created"])
         self.assertEqual(result["status"], store.NEEDS_REVIEW)
-        self.assertTrue(any("check Famly for the deal id before re-running" in n
+        self.assertTrue(any("Check Famly for the deal ID before running again" in n
                             for n in self.notify.notices))
 
     def test_a_rejected_contact_does_not_stop_the_others_and_is_not_retried(self):

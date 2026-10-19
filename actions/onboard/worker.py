@@ -67,6 +67,7 @@ from actions.onboard import (
     famly_writes,
     hubspot_sync,
     inputs,
+    messages,
     notifier as notifier_mod,
     store,
     summary_check,
@@ -87,7 +88,6 @@ OK_OUTCOMES = (CREATED, PRESENT)
 
 # A create whose outcome is unknown and whose follow-up lookup finds nothing.
 UNKNOWN_OUTCOME = "create_outcome_unknown"
-UNKNOWN_OUTCOME_ADVICE = "check Famly for the deal id before re-running"
 
 # The plan changed AGAIN after one re-ask: stop instead of asking a third time.
 PLAN_UNSTABLE = "plan_unstable"
@@ -341,9 +341,7 @@ def _write_phase(job, deps, plan, context, digest) -> dict:
     info = {"hubspotSyncPropertiesFound": pre.found_famly}
     if pre.warnings:
         logger.warning("onboard: HubSpot property pre-flight: %s", pre.warnings)
-        deps.notifier.notice(notifier_mod.notice_text(
-            deal_id, "HubSpot property check: these writes will be skipped, Famly work goes on",
-            pre.warnings))
+        _admin_notice(deps, deal_id, pre.warnings)
     syncer = hubspot_sync.Syncer(deps.hubspot, deal_id, pre)
 
     store.set_status(job.id, store.CREATING_CHILD, plan_hash=digest)
@@ -384,19 +382,42 @@ def _write_phase(job, deps, plan, context, digest) -> dict:
         failures.append("contact_outcomes")
     if syncer.critical_failed:
         failures.append("hubspot_writeback_failed")
-    detail = bad_codes + syncer.critical_failed + flags + syncer.reports
+    contact_codes = [o.split(":", 1)[1] for o in outcomes]
+    summary = _summary_line(child.created, contact_codes)
+    codes = (bad_codes + [f for f in failures if f != "contact_outcomes"] + flags
+             + syncer.reports + list(plan["warnings"]) + contact_warnings
+             + ["created" if child.created else "child_existed"])
     if failures:
         store.set_status(job.id, store.NEEDS_REVIEW, last_error_code=",".join(failures))
-        headline = "the child is in Famly but the job needs a person"
-        if UNKNOWN_OUTCOME in bad_codes:
-            headline += f"; {UNKNOWN_OUTCOME_ADVICE}"
-        deps.notifier.notice(notifier_mod.notice_text(deal_id, headline, failures + detail))
+        deps.notifier.notice(notifier_mod.notice_text(
+            deal_id, f"⚠️ {summary} The job needs a person.", codes))
     else:
         store.set_status(job.id, store.DONE, last_error_code=None)
-        deps.notifier.notice(notifier_mod.notice_text(
-            deal_id, "child and contacts are in Famly",
-            ["created" if child.created else "child_existed"] + detail))
+        deps.notifier.notice(notifier_mod.notice_text(deal_id, f"✅ {summary}", codes))
+    _admin_notice(deps, deal_id, codes)
     return info
+
+
+def _summary_line(child_created: bool, contact_codes: list[str]) -> str:
+    """One plain sentence: what was done. Counts only."""
+    created = contact_codes.count(CREATED)
+    present = contact_codes.count(PRESENT)
+    missed = len(contact_codes) - created - present
+    line = ("Child created in Famly. " if child_created else "Child was already in Famly. ")
+    line += f"{created} contact(s) created, {present} already present"
+    line += f", {missed} not added." if missed else "."
+    return line
+
+
+def _admin_notice(deps, deal_id: str, codes) -> None:
+    """The ONE separate admin line for configuration problems (never the staff
+    list), also logged."""
+    admin = notifier_mod.admin_notice_text(deal_id, codes)
+    if admin is None:
+        return
+    logger.warning("onboard: configuration problem for deal %s: %s", deal_id,
+                   messages.codes_of_kind(codes, messages.ADMIN))
+    deps.notifier.notice(admin)
 
 
 # --------------------------------------------------------------------------- #
@@ -617,7 +638,8 @@ def _create_one(deps, famly, contact, child_id, target, matches) -> tuple[str, l
 # --------------------------------------------------------------------------- #
 def _held(job, deps, reasons: list[str], write_back: bool) -> None:
     store.set_status(job.id, store.HELD, last_error_code=",".join(reasons), outcomes=reasons)
-    deps.notifier.notice(notifier_mod.notice_text(job.deal_id, "held, nothing was written", reasons))
+    deps.notifier.notice(notifier_mod.notice_text(
+        job.deal_id, "Onboarding did not start. Nothing was created in Famly.", reasons))
     if write_back:
         # Best effort, one property per request: a held deal is visible in HubSpot too,
         # and a HubSpot problem is only ever reported, never an error here.
@@ -628,12 +650,11 @@ def _held(job, deps, reasons: list[str], write_back: bool) -> None:
 def _end(job, deps, status: str, code: str, detail: list[str] | None = None) -> None:
     store.set_status(job.id, status, last_error_code=code)
     try:
-        headline = f"{status}"
-        if code == UNKNOWN_OUTCOME:
-            headline = f"{status}, {UNKNOWN_OUTCOME_ADVICE}"
-        elif code == PLAN_UNSTABLE:
-            headline = (f"{status}, the plan changed again after re-approval, so it was not "
-                        "asked a third time; sections that differed")
-        deps.notifier.notice(notifier_mod.notice_text(job.deal_id, headline, [code, *(detail or [])]))
+        headline = ("Onboarding needs a person." if status == store.NEEDS_REVIEW
+                    else "Onboarding stopped.")
+        # `detail` (the plan sections that differed, as short hashes) is for the
+        # footer only: it is not a code with a sentence.
+        deps.notifier.notice(notifier_mod.notice_text(
+            job.deal_id, headline, [code], extra_footer=detail or []))
     except Exception:  # noqa: BLE001 - a notice must never mask the outcome
         logger.warning("onboard: notice failed for job %s", job.id)

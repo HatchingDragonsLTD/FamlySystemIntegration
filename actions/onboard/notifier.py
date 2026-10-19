@@ -9,7 +9,7 @@ import logging
 
 from integrations import slack
 
-from . import approval, config
+from . import approval, config, messages
 
 logger = logging.getLogger(__name__)
 
@@ -67,18 +67,28 @@ def gate_text(
         f"Child: {child_state} · Contacts: {len(contacts)} ({creating} to create, "
         f"{present} present) · Bill payer identified: {'yes' if bill_payer else 'no'}"
     )
-    warnings = sorted(set(plan.get("warnings") or []))
-    lines.append("Warnings: " + (", ".join(warnings) if warnings else "none"))
+    shown = messages.classify(plan.get("warnings") or [])
+    sentences = shown[messages.NOT_DONE] + shown[messages.CHECK]
+    lines.append("Warnings: " + (" ".join(sentences) if sentences else "none"))
     lines.append(f"Plan: `{plan_hash[:approval.HASH_PREFIX]}`")
     return "\n".join(lines)
 
 
-def notice_text(deal_id: str, headline: str, codes) -> str:
-    """A plain notice: deal id, a headline, and codes."""
+def deal_ref(deal_id: str) -> str:
     link = config.deal_link(deal_id)
-    deal = f"<{link}|{deal_id}>" if link else str(deal_id)
-    codes = [str(c) for c in codes if c]
-    return f"Onboarding deal {deal}: {headline}" + (f" [{', '.join(codes)}]" if codes else "")
+    return f"<{link}|{deal_id}>" if link else str(deal_id)
+
+
+def notice_text(deal_id: str, headline: str, codes, extra_footer=()) -> str:
+    """The staff notice: a headline, plain-English "Not done" and "To check" lists,
+    and a small code footer. Configuration (admin) codes are NOT in it: see
+    `admin_notice_text`."""
+    return messages.staff_text(deal_ref(deal_id), headline, codes, extra_footer)
+
+
+def admin_notice_text(deal_id: str, codes) -> str | None:
+    """The one separate admin line for configuration problems, or None."""
+    return messages.admin_text(deal_ref(deal_id), codes)
 
 
 class SlackNotifier:
