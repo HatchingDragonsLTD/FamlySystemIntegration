@@ -921,14 +921,27 @@ class LeftNurseryAndDatesTests(DryRunTestCase):
         self.hub.deals["D1"]["actual_start_date_1"] = "2026-08-31"
         self.assertNotIn("end_date_before_start", self.reasons(self.plan()))
 
-    def test_an_end_date_in_the_future_warns(self):
-        self.left()
-        self.hub.deals["D1"]["end_date"] = "2026-12-01"
+    def test_a_past_end_date_warns_except_for_left_nursery(self):
+        with mock.patch.object(derive, "today", return_value=date(2026, 10, 15)):
+            self.hub.deals["D1"]["end_date"] = "2026-10-14"
+            self.assertIn("end_date_in_past", self.plan()["warnings"])
+            self.hub.deals["D1"]["end_date"] = "2026-10-15"       # today is not the past
+            self.assertNotIn("end_date_in_past", self.plan()["warnings"])
+            self.hub.deals["D1"]["end_date"] = "2026-12-01"       # a future end is normal
+            plan = self.plan()
+            self.assertNotIn("end_date_in_past", plan["warnings"])
+            self.assertNotIn("end_date_in_future", plan["warnings"])
+            self.left(end_date="2026-10-14")                       # expected for Left Nursery
+            self.assertNotIn("end_date_in_past", self.plan()["warnings"])
+
+    def test_a_defaulted_end_date_in_the_past_warns(self):
+        # Born 2020-01-15: the default is 2024-08-31, long gone.
+        self.hub.deals["D1"] = make_deal(child_date_of_birth="2020-01-15",
+                                         end_date="", actual_start_date_1="2024-01-01")
         with mock.patch.object(derive, "today", return_value=date(2026, 10, 15)):
             plan = self.plan()
-            self.assertIn("end_date_in_future", plan["warnings"])
-            self.hub.deals["D1"]["end_date"] = "2026-10-15"  # today is not the future
-            self.assertNotIn("end_date_in_future", self.plan()["warnings"])
+        self.assertTrue(plan["dates"]["lastDayDefaulted"])
+        self.assertIn("end_date_in_past", plan["warnings"])
 
     def test_the_plan_reports_presence_and_whether_it_was_defaulted_never_the_dates(self):
         plan = self.plan()

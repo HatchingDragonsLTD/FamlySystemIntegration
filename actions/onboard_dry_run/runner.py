@@ -219,8 +219,9 @@ class DryRun:
         HOLDS: a Left Nursery deal without a start date; an end date (given or
         defaulted) BEFORE the start date (`end_date_before_start`, e.g. a child
         already past the default date when they start); an unparseable date.
-        WARNING: a GIVEN end date after today (`end_date_in_future`; a defaulted
-        one is normally in the future and says nothing)."""
+        WARNING: an end date (given or defaulted) before today on a deal that is not
+        Left Nursery (`end_date_in_past`): Famly would treat the child as inactive.
+        A past end date is expected for Left Nursery, so it says nothing there."""
         holds, warnings = plan["holds"], plan["warnings"]
 
         def hold_once(reason: str) -> None:
@@ -244,8 +245,8 @@ class DryRun:
             hold_once(derive.START_DATE_MISSING)
         if start is not None and end is not None and end < start:
             hold_once(derive.END_DATE_BEFORE_START)
-        if end is not None and not defaulted and end > derive.today():
-            warnings.append("end_date_in_future")
+        if end is not None and not left_nursery and end < derive.today():
+            warnings.append("end_date_in_past")
 
     # -- child ----------------------------------------------------------- #
     def _child(self, deal: dict, deal_id: str, plan: dict) -> dict:
