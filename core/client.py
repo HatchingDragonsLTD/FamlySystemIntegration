@@ -19,9 +19,13 @@ DEFAULT_TIMEOUT = 60
 class GraphQLError(RuntimeError):
     """The server returned a GraphQL `errors` array."""
 
-    def __init__(self, message: str, errors: list):
+    def __init__(self, message: str, errors: list, body: dict | None = None):
         super().__init__(message)
         self.errors = errors
+        # The whole parsed response. A response can carry `errors` AND `data`, and the
+        # mutation may have run: a caller that writes must look at `data` before it
+        # decides the request failed.
+        self.body = body
 
 
 class GraphQLHTTPError(RuntimeError):
@@ -107,6 +111,7 @@ class GraphQLClient:
             raise GraphQLError(
                 f"GraphQL request '{operation_name}' returned errors: {summary}",
                 errors=errors,
+                body=body,
             )
 
         return body
