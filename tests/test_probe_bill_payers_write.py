@@ -31,14 +31,15 @@ def schema(delete_with_site=False, with_delete=True, share_required=True, extra_
     if with_delete:
         mut_fields.append({"name": "delete", "args": delete_args,
                            "type": _nn(_list(_nn(_t("SCALAR", "UniqueId"))))})
+    share_entries = _nn(_list(_nn(_t("OBJECT", "BillPayerChildShareType"))))
     mut_fields.append({"name": "addChildren", "args": [
         {"name": "shares", "type": _nn(_list(_nn(_t("INPUT_OBJECT", "BillPayerChildAddInput"))))}],
-        "type": _nn(_t("OBJECT", "BillPayer"))})
+        "type": share_entries})
     if delete_children:
         delete_type = _nn(_t("INPUT_OBJECT", "ChildSharesDeleteInput"))
         mut_fields.append({"name": "deleteChildren", "args": [
             {"name": "shares", "type": _nn(_list(delete_type)) if delete_children_list else delete_type}],
-            "type": _nn(_t("OBJECT", "BillPayer"))})
+            "type": share_entries})
     input_fields = [
         {"name": "siteId", "type": _nn(_t("SCALAR", "SiteId"))},
         {"name": "name", "type": _nn(_t("SCALAR", "NameInput"))},
@@ -61,11 +62,61 @@ def schema(delete_with_site=False, with_delete=True, share_required=True, extra_
             {"name": "childId", "type": _nn(_t("SCALAR", "ChildId"))},
             {"name": "billPayerId", "type": _nn(_t("SCALAR", "UniqueId"))},
             {"name": "share", "type": share_type}]},
+        # What addChildren and deleteChildren RETURN: share entries, NOT a bill payer.
+        {"kind": "OBJECT", "name": "BillPayerChildShareType", "fields": [
+            {"name": "billPayerId", "args": [], "type": _nn(_t("SCALAR", "UniqueId"))},
+            {"name": "childId", "args": [], "type": _nn(_t("SCALAR", "ChildId"))},
+            {"name": "share", "args": [], "type": _nn(_t("OBJECT", "ShareValue"))}]},
+        {"kind": "OBJECT", "name": "ShareValue", "fields": [
+            {"name": "multiplier", "args": [], "type": _nn(_t("SCALAR", "Float"))}]},
         {"kind": "INPUT_OBJECT", "name": "ChildSharesDeleteInput", "inputFields": [
             {"name": "childId", "type": _nn(_t("SCALAR", "ChildId"))},
             {"name": "billPayerId", "type": _nn(_t("SCALAR", "UniqueId"))}]},
     ]
     return {**base, "types": types}
+
+
+def check_selection(types: dict, type_name: str, selection: str) -> list[str]:
+    """The names in a `{ a b { c } }` selection that are NOT fields of the type they are
+    selected on (an empty list when it is valid)."""
+    tokens = re.findall(r"\w+|[{}]", selection)
+    bad: list[str] = []
+
+    def walk(position: int, owner: str) -> int:
+        fields = {f["name"]: f for f in (types.get(owner) or {}).get("fields") or []}
+        while position < len(tokens) and tokens[position] != "}":
+            name = tokens[position]
+            position += 1
+            if name not in fields:
+                bad.append(f"{owner}.{name}")
+            if position < len(tokens) and tokens[position] == "{":
+                if name in fields:
+                    position = walk(position + 1, runner.named_type(fields[name]["type"]) or "")
+                else:                               # an unknown field: skip its block
+                    depth = 0
+                    while position < len(tokens):
+                        depth += {"{": 1, "}": -1}.get(tokens[position], 0)
+                        position += 1
+                        if depth == 0:
+                            break
+                    continue
+                position += 1                       # the closing brace
+        return position
+
+    if tokens and tokens[0] == "{":
+        walk(1, type_name)
+    return bad
+
+
+def document_problems(schema_: dict, text: str) -> list[str]:
+    """Selection problems of a probe mutation document, checked against the schema."""
+    types = {t["name"]: t for t in schema_["types"]}
+    match = re.search(r"\{ billPayers \{ (\w+)\([^)]*\)(.*?) \} \}\s*$", text, re.S)
+    if not match:
+        return ["unparseable document"]
+    field_name, selection = match.group(1), match.group(2).strip()
+    mutation = next(f for f in types["BillPayersMutation"]["fields"] if f["name"] == field_name)
+    return check_selection(types, runner.named_type(mutation["type"]), selection) if selection else []
 
 
 TRANSIENT_400 = json.dumps({"errors": [{"message": "can not archive a bill payer with shares",
@@ -78,8 +129,12 @@ class FakeFamly:
     includeDeleted=false once it works, test children with ids child-test-1, -2.
     Records every write and the includeDeleted value of every scan."""
 
-    def __init__(self, schema_=None, lag_scans=0, child_delete_releases_share=False):
+    def __init__(self, schema_=None, lag_scans=0, child_delete_releases_share=False,
+                 delete_children_noop=False):
         self.schema = schema_ or schema()
+        self.delete_children_noop = delete_children_noop     # answers with entries, removes nothing
+        self.validation_errors = {}                          # op -> raise "does not pass validation"
+        self.validation_failures = []
         self.payers = []     # {"id","email","ext","shares": {child: multiplier},"deleted","visible_at"}
         self.lag_scans = lag_scans
         self.child_delete_releases_share = child_delete_releases_share
@@ -102,6 +157,15 @@ class FakeFamly:
         op = operation_name
         if op == runner.SCHEMA_OP:
             return {"data": {"__schema": self.schema}}
+        if op in (write_probe.CREATE_OP, write_probe.ADD_CHILDREN_OP, write_probe.DELETE_CHILDREN_OP,
+                  write_probe.DELETE_OP):
+            problems = document_problems(self.schema, text)
+            if op in self.validation_errors:
+                problems = problems or ["forced"]
+            if problems:                       # like the live API: nothing is executed, nothing recorded
+                self.validation_failures.append((op, problems))
+                raise GraphQLError("Query does not pass validation",
+                                   [{"message": "Query does not pass validation: " + ", ".join(problems)}])
         if op == "ProbeChildCreate":
             self.writes.append((op, variables, text))
             child = f"child-test-{self.next_child}"
@@ -135,19 +199,23 @@ class FakeFamly:
             for entry in variables["input"]:
                 payer = self._payer(entry["billPayerId"])
                 payer["shares"][entry["childId"]] = (entry.get("share") or {}).get("multiplier", 1.0)
-            return {"data": {"billPayers": {"addChildren": {
-                "billPayerId": payer["id"],
-                "childShares": [{"childId": c, "multiplier": m} for c, m in payer["shares"].items()]}}}}
+            return {"data": {"billPayers": {"addChildren": [
+                {"billPayerId": e["billPayerId"], "childId": e["childId"],
+                 "share": {"multiplier": (e.get("share") or {}).get("multiplier", 1.0)}}
+                for e in variables["input"]]}}}
         if op == write_probe.DELETE_CHILDREN_OP:
             self.writes.append((op, variables, text))
             if self.delete_children_error:
                 raise self.delete_children_error
             entries = variables["input"] if isinstance(variables["input"], list) else [variables["input"]]
-            payer = None
             for entry in entries:
                 payer = self._payer(entry["billPayerId"])
-                payer["shares"].pop(entry["childId"], None)
-            return {"data": {"billPayers": {"deleteChildren": {"billPayerId": payer["id"]}}}}
+                if not self.delete_children_noop:
+                    payer["shares"].pop(entry["childId"], None)
+            # It answers with entries even for shares that never existed.
+            return {"data": {"billPayers": {"deleteChildren": [
+                {"billPayerId": e["billPayerId"], "childId": e["childId"], "share": {"multiplier": 1.0}}
+                for e in entries]}}}
         if op == write_probe.DELETE_OP:
             self.writes.append((op, variables, text))
             if self.delete_error:
@@ -320,7 +388,7 @@ class SendOnceTests(unittest.TestCase):
         self.assertEqual(famly.mutations(write_probe.DELETE_OP), [])           # nothing to delete
         self.assertFalse(result.bill_payer_created)
         text = "\n".join(lines)
-        self.assertIn("REJECTED (sent once, not retried, no variants tried)", text)
+        self.assertIn("create REFUSED by the API (sent once, not retried)", text)
         self.assertNotIn("example.org", text.lower())                          # echoed email redacted
         self.assertIn("<test-email>", text)
 
@@ -553,8 +621,9 @@ class ShareAndFlagTests(unittest.TestCase):
         self.assertTrue(famly.scan_flags)
         self.assertNotIn("OMITTED", famly.scan_flags)
         self.assertTrue(all(isinstance(flag, bool) for flag in famly.scan_flags))
-        # pre-scan true; the three lag scans false; after the delete false then true.
-        self.assertEqual(famly.scan_flags, [True, False, False, False, False, True])
+        # pre-scan true; the three lag scans false; after deleteChildren false; after the
+        # delete false then true.
+        self.assertEqual(famly.scan_flags, [True, False, False, False, False, False, True])
 
     def test_it_refuses_before_any_write_when_include_deleted_is_not_detected(self):
         famly = FakeFamly(schema(include_deleted=False))
@@ -689,7 +758,7 @@ class MutationGuardTests(unittest.TestCase):
 
     def test_the_add_children_select_reads_back_the_nested_share(self):
         plan, docs = self.docs()
-        self.assertIn("childShares { childId multiplier }", docs["addChildren"])
+        self.assertIn("addChildren(shares: $input) { billPayerId childId share { multiplier } }", docs["addChildren"])
 
 
 class AttachTests(unittest.TestCase):
@@ -743,7 +812,7 @@ class AttachTests(unittest.TestCase):
                                r"both test children listed=yes; child 1 listed=yes multiplier=1.000; "
                                r"child 2 listed=yes multiplier=0.500")
         self.assertIn("T+10s after addChildren", text)
-        self.assertIn("addChildren RETURNED the second child: yes; entries returned: 2", text)
+        self.assertIn("addChildren RETURNED 1 share entry; includes the second child: yes", text)
 
     def test_the_clean_up_removes_both_shares_in_one_request_then_the_payer_then_both_children(self):
         famly, *_ = self.attach()
@@ -893,6 +962,110 @@ class DeleteAfterChildDeleteTests(unittest.TestCase):
     def test_the_default_path_does_not_run_the_experiment(self):
         famly, *_ = run(child_id=None, create_test_child=True)
         self.assertEqual(famly.order()[2], write_probe.DELETE_CHILDREN_OP)   # shares first, not the child
+
+
+class SelectionTests(unittest.TestCase):
+    """Every selection set is built from the return type's own fields, read from the live
+    schema (the live addChildren answered with BillPayerChildShareType: billPayerId,
+    childId, share), never hand-assumed."""
+
+    def plan(self, **kw):
+        return write_probe.plan_from_schema({"data": {"__schema": schema(**kw)}})
+
+    def test_add_and_delete_children_select_the_share_entry_fields(self):
+        plan = self.plan()
+        self.assertEqual(plan.add_children.select, " { billPayerId childId share { multiplier } }")
+        self.assertEqual(plan.delete_children.select, " { billPayerId childId share { multiplier } }")
+        self.assertNotIn("children", plan.add_children.select)
+
+    def test_no_selection_names_a_field_that_is_not_on_the_return_type(self):
+        s_ = schema()
+        plan = write_probe.plan_from_schema({"data": {"__schema": s_}})
+        docs = {"create": write_probe.create_document(plan), "delete": write_probe.delete_document(plan),
+                "addChildren": write_probe.add_children_document(plan.add_children),
+                "deleteChildren": write_probe.delete_children_document(plan.delete_children)}
+        for kind, text in docs.items():
+            with self.subTest(kind=kind):
+                self.assertEqual(document_problems(s_, text), [])
+
+    def test_the_validator_catches_the_old_hand_assumed_selection(self):
+        s_ = schema()
+        old = ("mutation ProbeBillPayerAddChildren($input: [BillPayerChildAddInput!]!) { billPayers "
+               "{ addChildren(shares: $input) { billPayerId children { childId share { multiplier } } } } }\n")
+        self.assertEqual(document_problems(s_, old), ["BillPayerChildShareType.children"])
+
+    def test_the_selection_follows_the_type_whatever_its_fields_are(self):
+        s_ = schema()
+        for t in s_["types"]:
+            if t["name"] == "BillPayerChildShareType":
+                t["fields"] = [{"name": "billPayerId", "args": [], "type": _nn(_t("SCALAR", "UniqueId"))},
+                               {"name": "childId", "args": [], "type": _nn(_t("SCALAR", "ChildId"))},
+                               {"name": "addedAt", "args": [], "type": _t("SCALAR", "DateTime")},
+                               {"name": "owner", "args": [], "type": _t("OBJECT", "BillPayer")}]
+        plan = write_probe.plan_from_schema({"data": {"__schema": s_}})
+        self.assertEqual(plan.add_children.select, " { billPayerId childId addedAt }")   # no share, no objects
+
+    def test_create_selects_scalars_only_from_the_bill_payer_type(self):
+        plan = self.plan()
+        self.assertEqual(plan.create_select, " { billPayerId email externalId deletedAt }")
+
+    def test_a_scalar_return_gets_no_selection(self):
+        plan = self.plan()
+        self.assertEqual(plan.delete_select, "")
+
+
+class RejectionKindTests(unittest.TestCase):
+    def test_a_validation_failure_is_reported_as_nothing_executed_and_never_retried(self):
+        for op, mode in ((write_probe.ADD_CHILDREN_OP, "attach"), (write_probe.CREATE_OP, "write"),
+                         (write_probe.DELETE_CHILDREN_OP, "write"), (write_probe.DELETE_OP, "write")):
+            with self.subTest(op=op):
+                famly = FakeFamly()
+                famly.validation_errors[op] = True
+                if mode == "attach":
+                    famly, _p, _r, lines, _c = AttachTests().attach(famly=famly)
+                else:
+                    famly, _p, _r, lines, _c = run(famly=famly, child_id=None, create_test_child=True)
+                text = "\n".join(lines)
+                self.assertIn("rejected at validation, nothing was executed", text)
+                self.assertNotIn("REFUSED by the API", text)
+                self.assertEqual(len([f for f in famly.validation_failures if f[0] == op]), 1)   # once
+
+    def test_an_api_refusal_is_reported_differently(self):
+        famly = FakeFamly()
+        famly.delete_error = GraphQLHTTPError("bad", 400, TRANSIENT_400)
+        _f, _p, _r, lines, _c = run(famly=famly)
+        text = "\n".join(lines)
+        self.assertIn("delete REFUSED by the API (sent once, not retried)", text)
+        self.assertNotIn("rejected at validation", text)
+
+    def test_the_real_old_selection_would_have_been_rejected_at_validation(self):
+        # The fake validates like the live API: a hand-assumed selection fails, a built one does not.
+        famly = FakeFamly()
+        famly, _p, result, lines, _c = AttachTests().attach(famly=famly)
+        self.assertEqual(famly.validation_failures, [])
+        self.assertTrue(result.children_added)
+
+
+class AfterDeleteChildrenTests(unittest.TestCase):
+    def test_the_child_count_is_printed_after_delete_children_and_before_the_archive(self):
+        _famly, _probe, _result, lines, _clock = run(child_id=None, create_test_child=True)
+        at = next(i for i, l in enumerate(lines) if l.startswith("AFTER deleteChildren"))
+        sending = next(i for i, l in enumerate(lines) if l.startswith("SENDING billPayers.delete "))
+        self.assertLess(at, sending)
+        self.assertIn("AFTER deleteChildren: the payer lists 0 child entries", lines[at])
+
+    def test_a_delete_children_that_removed_nothing_is_visible_in_the_count(self):
+        famly = FakeFamly(delete_children_noop=True)
+        famly, _probe, _result, lines, _clock = run(famly=famly, child_id=None, create_test_child=True)
+        text = "\n".join(lines)
+        self.assertIn("AFTER deleteChildren: the payer lists 1 child entry (shares remain", text)
+        self.assertEqual(len(famly.mutations(write_probe.DELETE_CHILDREN_OP)), 1)     # still once
+        self.assertEqual(len(famly.mutations(write_probe.DELETE_OP)), 1)              # the archive is tried once
+
+    def test_attach_prints_the_count_after_removing_both_shares(self):
+        _famly, _probe, _result, lines, _clock = AttachTests().attach()
+        self.assertTrue(any(l.startswith("AFTER deleteChildren: the payer lists 0 child entries")
+                            for l in lines))
 
 
 if __name__ == "__main__":
