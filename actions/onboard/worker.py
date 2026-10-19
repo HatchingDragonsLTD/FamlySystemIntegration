@@ -89,15 +89,20 @@ OK_OUTCOMES = (CREATED, PRESENT)
 UNKNOWN_OUTCOME = "create_outcome_unknown"
 UNKNOWN_OUTCOME_ADVICE = "check Famly for the deal id before re-running"
 
+# The plan changed AGAIN after one re-ask: stop instead of asking a third time.
+PLAN_UNSTABLE = "plan_unstable"
+
 
 class StopJob(Exception):
     """End the job in `status` with `code`. Nothing further is written."""
 
-    def __init__(self, status: str, code: str, info: dict | None = None):
+    def __init__(self, status: str, code: str, info: dict | None = None,
+                 detail: list[str] | None = None):
         super().__init__(code)
         self.status = status
         self.code = code
         self.info = info or {}
+        self.detail = detail or []      # extra codes for the Slack notice
 
 
 @dataclass
@@ -150,7 +155,7 @@ def run_once(deps: Deps | None = None) -> dict:
         info = _process(job, deps, run_mode)
     except StopJob as stop:
         info = stop.info
-        _end(job, deps, stop.status, stop.code)
+        _end(job, deps, stop.status, stop.code, stop.detail)
     except Exception as exc:  # noqa: BLE001 - a job must never die silently
         # Type only: the message could carry a response body.
         logger.error("onboard: job %s hit %s", job.id, type(exc).__name__)
@@ -224,6 +229,11 @@ def _process(job: store.Job, deps: Deps, run_mode: str) -> dict:
         logger.info("onboard: approval re-check job=%s unchanged=%s digest=%s approved=%s",
                     job.id, job.approved_hash == digest, digest, job.approved_hash)
     if famly_writes_planned(plan) and job.approved_hash != digest:
+        if job.approved_hash is not None and job.reask_count >= 1:
+            # Approved, re-checked, DIFFERENT, asked once already, and different again.
+            differing = _differing_sections(job.plan_sections, plan_section_hashes(plan))
+            logger.warning("onboard: plan unstable job=%s sections=%s", job.id, differing)
+            raise StopJob(store.NEEDS_REVIEW, PLAN_UNSTABLE, detail=differing)
         _ask_for_approval(job, deps, plan, digest, run_mode, plan_changed=job.approved_hash is not None)
         return {}
 
@@ -279,12 +289,25 @@ def plan_section_hashes(plan: dict) -> dict:
     }
 
 
+def _differing_sections(before: dict | None, after: dict) -> list[str]:
+    """`section:old>new` for each plan section whose short hash differs (names and
+    short hashes only)."""
+    before = before or {}
+    return [
+        f"{name}:{before.get(name, '-')}>{after.get(name, '-')}"
+        for name in sorted(set(before) | set(after))
+        if before.get(name) != after.get(name)
+    ]
+
+
 def _ask_for_approval(job, deps, plan, digest, run_mode, plan_changed: bool) -> None:
     # A fresh nonce per ask: only THIS message's buttons can approve it.
     nonce = secrets.token_hex(8)
     # Compare-and-set: only the run that still holds the claim may ask. A run that
     # lagged (the job was approved, re-claimed or finished meanwhile) does nothing.
-    if not store.begin_approval_wait(job.id, job.claimed_at, digest, nonce):
+    if not store.begin_approval_wait(
+            job.id, job.claimed_at, digest, nonce,
+            sections=plan_section_hashes(plan), reask=plan_changed):
         logger.warning("onboard: approval ask skipped job=%s: the job moved on or was re-claimed",
                        job.id)
         return
@@ -600,10 +623,15 @@ def _held(job, deps, reasons: list[str], write_back: bool) -> None:
             hubspot_sync.STATUS_NEEDS_ATTENTION, "held:" + ",".join(reasons), [])
 
 
-def _end(job, deps, status: str, code: str) -> None:
+def _end(job, deps, status: str, code: str, detail: list[str] | None = None) -> None:
     store.set_status(job.id, status, last_error_code=code)
     try:
-        headline = f"{status}, {UNKNOWN_OUTCOME_ADVICE}" if code == UNKNOWN_OUTCOME else f"{status}"
-        deps.notifier.notice(notifier_mod.notice_text(job.deal_id, headline, [code]))
+        headline = f"{status}"
+        if code == UNKNOWN_OUTCOME:
+            headline = f"{status}, {UNKNOWN_OUTCOME_ADVICE}"
+        elif code == PLAN_UNSTABLE:
+            headline = (f"{status}, the plan changed again after re-approval, so it was not "
+                        "asked a third time; sections that differed")
+        deps.notifier.notice(notifier_mod.notice_text(job.deal_id, headline, [code, *(detail or [])]))
     except Exception:  # noqa: BLE001 - a notice must never mask the outcome
         logger.warning("onboard: notice failed for job %s", job.id)

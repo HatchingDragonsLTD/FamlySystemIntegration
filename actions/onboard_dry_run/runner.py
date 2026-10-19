@@ -406,7 +406,8 @@ class DryRun:
             completes the contacts that are missing.
         """
         target = normalise_email(contact.email)
-        here = list(dict.fromkeys(cid for cid, mail in on_child if mail == target))
+        here = sorted(dict.fromkeys(cid for cid, mail in on_child if mail == target),
+                      key=links.id_sort_key)
         if len(here) == 1:
             entry.update(status=PRESENT, famlyContactId=here[0])
         elif len(here) > 1:
@@ -422,10 +423,11 @@ class DryRun:
             entry["status"] = WOULD_CREATE
         else:
             wanted = local_part(contact.email)
-            candidates = list(
+            candidates = sorted(
                 dict.fromkeys(
                     cid for cid, mail in on_child if wanted and local_part(mail) == wanted
-                )
+                ),
+                key=links.id_sort_key,
             )
             entry.update(status=UNMATCHED_ON_EXISTING_CHILD, candidateIds=candidates)
             holds.append(

@@ -178,6 +178,22 @@ def has_first_and_last_name(properties: dict) -> bool:
     return _present(properties, "firstname") and _present(properties, "lastname")
 
 
+def id_sort_key(value) -> tuple:
+    """Numeric ids in numeric order, anything else after them in text order. HubSpot
+    and Famly return lists in no guaranteed order; the plan must not depend on it."""
+    text = str(value)
+    return (0, int(text), "") if text.isdigit() else (1, 0, text)
+
+
+def _label_sort_key(row: dict) -> tuple:
+    type_id = row.get("typeId")
+    return (
+        type_id if isinstance(type_id, int) else -1,
+        str(row.get("label") or ""),
+        str(row.get("direction") or ""),
+    )
+
+
 def _label_rows(types: list[dict], direction: str) -> list[dict]:
     return [
         {"typeId": t.get("typeId"), "label": t.get("label"), "direction": direction}
@@ -222,14 +238,16 @@ def deal_contacts(client: HubSpotClient, labels: LabelMap, deal_id: str) -> list
                 link["id"],
                 (props.get("email") or "").strip(),
                 is_bill_payer,
-                link_labels,
+                sorted(link_labels, key=_label_sort_key),
                 phone_source=phone_source(props),
                 has_complete_address=has_complete_address(props),
                 has_first_and_last_name=has_first_and_last_name(props),
                 props=dict(props),
             )
         )
-    return out
+    # CANONICAL ORDER: by contact id, whatever order HubSpot answered in. The plan
+    # (and so its hash, and the worker's tie order) must be the same on every run.
+    return sorted(out, key=lambda c: id_sort_key(c.hubspot_id))
 
 
 def sales_deal_ids(client: HubSpotClient, labels: LabelMap, deal_id: str) -> list[str]:

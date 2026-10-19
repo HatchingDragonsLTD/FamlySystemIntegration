@@ -23,6 +23,8 @@ could carry data.
     attempts           how many times a worker has taken the job
     last_error_code    a code
     approval_ref       the Slack message ref of the approval request
+    reask_count        how many times the plan CHANGED after an approval and was asked again
+    plan_sections      short hash per plan section at the last ask (no personal data)
     approval_nonce     random token of the CURRENT approval request; only its buttons count
     child_create_sent  1 once a child create request has been SENT for this job:
                        a job never sends a second one
@@ -91,7 +93,9 @@ CREATE TABLE IF NOT EXISTS onboard_jobs (
     created_at        TEXT NOT NULL,
     updated_at        TEXT NOT NULL,
     source            TEXT NOT NULL DEFAULT 'cli',
-    approval_nonce    TEXT
+    approval_nonce    TEXT,
+    reask_count       INTEGER NOT NULL DEFAULT 0,
+    plan_sections     TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS onboard_one_active_per_deal
     ON onboard_jobs (deal_id)
@@ -125,6 +129,8 @@ class Job:
     source: str = "cli"
     approval_nonce: str | None = None
     claimed_at: str | None = None
+    reask_count: int = 0
+    plan_sections: dict | None = None
 
 
 def store_path() -> Path:
@@ -162,6 +168,11 @@ def _migrate(connection: sqlite3.Connection) -> None:
         )
     if "approval_nonce" not in columns:
         connection.execute("ALTER TABLE onboard_jobs ADD COLUMN approval_nonce TEXT")
+    if "reask_count" not in columns:
+        connection.execute(
+            "ALTER TABLE onboard_jobs ADD COLUMN reask_count INTEGER NOT NULL DEFAULT 0")
+    if "plan_sections" not in columns:
+        connection.execute("ALTER TABLE onboard_jobs ADD COLUMN plan_sections TEXT")
 
 
 SOURCES = ("cli", "webhook")
@@ -172,6 +183,10 @@ def _to_job(row: sqlite3.Row) -> Job:
         outcomes = json.loads(row["outcomes"]) if row["outcomes"] else None
     except ValueError:
         outcomes = None
+    try:
+        sections = json.loads(row["plan_sections"]) if row["plan_sections"] else None
+    except ValueError:
+        sections = None
     return Job(
         id=row["id"], deal_id=row["deal_id"], status=row["status"], mode=row["mode"],
         plan_hash=row["plan_hash"], approved_hash=row["approved_hash"],
@@ -180,7 +195,7 @@ def _to_job(row: sqlite3.Row) -> Job:
         child_create_sent=bool(row["child_create_sent"]), outcomes=outcomes,
         created_at=row["created_at"], updated_at=row["updated_at"],
         source=row["source"], approval_nonce=row["approval_nonce"],
-        claimed_at=row["claimed_at"],
+        claimed_at=row["claimed_at"], reask_count=row["reask_count"], plan_sections=sections,
     )
 
 
@@ -354,7 +369,8 @@ def transition(job_id: str, from_status: str, to_status: str, **fields) -> bool:
     return cursor.rowcount == 1
 
 
-def begin_approval_wait(job_id: str, claimed_at: str | None, plan_hash: str, nonce: str) -> bool:
+def begin_approval_wait(job_id: str, claimed_at: str | None, plan_hash: str, nonce: str,
+                        sections: dict | None = None, reask: bool = False) -> bool:
     """Move a job to `awaiting_approval` ONLY if it is still `queued` and still held
     by the claim this run took (`claimed_at` is unchanged). A run that lagged behind
     a click, a re-claim or the end of the job changes nothing and returns False, so
@@ -364,9 +380,12 @@ def begin_approval_wait(job_id: str, claimed_at: str | None, plan_hash: str, non
     with _open() as connection:
         cursor = connection.execute(
             "UPDATE onboard_jobs SET status = ?, claimed_at = NULL, updated_at = ?, "
-            "plan_hash = ?, approved_hash = NULL, approval_nonce = ? "
+            "plan_hash = ?, approved_hash = NULL, approval_nonce = ?, plan_sections = ?, "
+            "reask_count = reask_count + ? "
             "WHERE id = ? AND status = ? AND claimed_at = ?",
-            (AWAITING_APPROVAL, _now(), plan_hash, nonce, job_id, QUEUED, claimed_at),
+            (AWAITING_APPROVAL, _now(), plan_hash, nonce,
+             json.dumps(sections) if sections is not None else None, 1 if reask else 0,
+             job_id, QUEUED, claimed_at),
         )
     return cursor.rowcount == 1
 
