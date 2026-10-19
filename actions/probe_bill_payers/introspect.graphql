@@ -10,10 +10,10 @@ query ProbeBillPayerSchema {
       name
       fields {
         name
-        args { name type { ...TypeRef } }
+        args { name defaultValue type { ...TypeRef } }
         type { ...TypeRef }
       }
-      inputFields { name type { ...TypeRef } }
+      inputFields { name defaultValue type { ...TypeRef } }
       enumValues { name }
     }
   }
