@@ -168,6 +168,34 @@ class WritePlan:
     blockers: list[str] = field(default_factory=list)
 
 
+def selection_for(by_name: dict, type_ref) -> str:
+    """The selection set for a mutation's RETURN TYPE, read from the live schema (never
+    hand-assumed): every scalar/enum field that needs no arguments, plus `share { ... }`
+    (its scalar fields, e.g. `share { multiplier }`) where the type has a share field.
+    "" when the return type is not an object (a scalar or a list of scalars)."""
+    node = by_name.get(runner.named_type(type_ref) or "") or {}
+    if node.get("kind") != "OBJECT":
+        return ""
+
+    def no_required_args(f) -> bool:
+        return not any(_required(a) for a in f.get("args") or [])
+
+    def scalar_names(obj) -> list[str]:
+        return [f["name"] for f in obj.get("fields") or []
+                if no_required_args(f)
+                and (by_name.get(runner.named_type(f["type"]) or "") or {}).get("kind", "SCALAR")
+                in ("SCALAR", "ENUM")]
+
+    parts = scalar_names(node)
+    for f in node.get("fields") or []:
+        inner = by_name.get(runner.named_type(f["type"]) or "") or {}
+        if f["name"] == "share" and inner.get("kind") == "OBJECT" and no_required_args(f):
+            inner_scalars = scalar_names(inner)
+            if inner_scalars:
+                parts.append("share { " + " ".join(inner_scalars) + " }")
+    return " { " + " ".join(parts) + " }" if parts else " { __typename }"
+
+
 def _required(arg) -> bool:
     return (arg.get("type") or {}).get("kind") == "NON_NULL" and arg.get("defaultValue") is None
 
@@ -184,8 +212,7 @@ def _share_info(by_name: dict, f: dict) -> dict:
     }
 
 
-def _list_op(by_name: dict, mut_fields: dict, name: str, shape_select: str,
-             want_share: bool) -> tuple[ListOp | None, str | None]:
+def _list_op(by_name: dict, mut_fields: dict, name: str, want_share: bool) -> tuple[ListOp | None, str | None]:
     """The plan for billPayers.<name>(<list of {childId, billPayerId[, share]}>)."""
     mutation = mut_fields.get(name)
     if mutation is None:
@@ -222,9 +249,7 @@ def _list_op(by_name: dict, mut_fields: dict, name: str, shape_select: str,
     unfillable = [n for n, f in fields.items() if n not in handled and _required(f)]
     if unfillable:
         return None, f"{input_type.get('name')} has other required fields: {', '.join(unfillable)}"
-    ret = by_name.get(runner.named_type(mutation["type"]) or "") or {}
-    if ret.get("kind") == "OBJECT" and any(f["name"] == "billPayerId" for f in ret.get("fields") or []):
-        op.select = " { billPayerId" + shape_select + " }"
+    op.select = selection_for(by_name, mutation["type"])
     return op, None
 
 
@@ -233,7 +258,6 @@ def plan_from_schema(body: dict, shape: dict | None = None) -> WritePlan:
     by_name = {t.get("name"): t for t in types}
     schema = ((body or {}).get("data") or {}).get("__schema") or {}
     shape = shape if shape is not None else runner.discover_shape(body)
-    children_text = runner.children_selection(shape)
     plan = WritePlan()
 
     mutation_root = by_name.get((schema.get("mutationType") or {}).get("name") or "") or {}
@@ -255,9 +279,9 @@ def plan_from_schema(body: dict, shape: dict | None = None) -> WritePlan:
         if others:
             plan.blockers.append(f"billPayers.create has other required arguments: {', '.join(others)}")
         ret = by_name.get(runner.named_type(create["type"]) or "") or {}
-        if ret.get("kind") == "OBJECT" and any(f["name"] == "billPayerId" for f in ret.get("fields") or []):
-            plan.create_select = " { billPayerId }"
-        elif ret.get("kind") == "OBJECT":
+        plan.create_select = selection_for(by_name, create["type"])
+        if ret.get("kind") == "OBJECT" and not any(
+                f["name"] == "billPayerId" for f in ret.get("fields") or []):
             plan.blockers.append("billPayers.create returns an object with no billPayerId")
 
     # ---- delete ---------------------------------------------------------------
@@ -280,15 +304,12 @@ def plan_from_schema(body: dict, shape: dict | None = None) -> WritePlan:
             arg = id_args[0]
             plan.delete_arg, plan.delete_arg_type = arg["name"], runner.type_str(arg["type"])
             plan.delete_is_list = "[" in plan.delete_arg_type
-        ret = by_name.get(runner.named_type(delete["type"]) or "") or {}
-        if ret.get("kind") == "OBJECT":
-            plan.delete_select = " { billPayerId }"
+        plan.delete_select = selection_for(by_name, delete["type"])
 
     # ---- the share operations (removing shares must work before a delete can) ---
-    plan.add_children, plan.add_children_unusable = _list_op(
-        by_name, mut_fields, "addChildren", (" " + children_text) if children_text else "", True)
+    plan.add_children, plan.add_children_unusable = _list_op(by_name, mut_fields, "addChildren", True)
     plan.delete_children, plan.delete_children_unusable = _list_op(
-        by_name, mut_fields, "deleteChildren", "", False)
+        by_name, mut_fields, "deleteChildren", False)
 
     # ---- the input ------------------------------------------------------------
     bp_input = by_name.get("BillPayerInput") or {}
@@ -512,6 +533,17 @@ class Probe:
 
     def _error(self, exc) -> str:
         return child_probe.error_text(exc)
+
+    def _rejection(self, label: str, exc) -> None:
+        """Say HOW a request was rejected. A validation failure (the document itself was
+        invalid) means nothing was executed; an API refusal means Famly looked at the
+        request and said no. Either way it is never retried automatically."""
+        text = self._error(exc)
+        if "pass validation" in text.lower():
+            self.say(f"{label} rejected at validation, nothing was executed (not retried, no variants "
+                     f"tried): {text}")
+        else:
+            self.say(f"{label} REFUSED by the API (sent once, not retried): {text}")
 
     # -- one send, never retried ---------------------------------------------- #
     def _send(self, text: str, variables: dict, operation: str, kind: str):
@@ -759,7 +791,7 @@ class Probe:
         try:
             body = self._send(create_document(run.plan), variables, CREATE_OP, "create")
         except (GraphQLError, GraphQLHTTPError) as exc:
-            self.say(f"REJECTED (sent once, not retried, no variants tried): {self._error(exc)}")
+            self._rejection("create", exc)
             self.result.stopped = "rejected"
             run.share_children.remove(child_id)
             return None
@@ -801,7 +833,7 @@ class Probe:
         try:
             body = self._send(add_children_document(op), variables, ADD_CHILDREN_OP, "addChildren")
         except (GraphQLError, GraphQLHTTPError) as exc:
-            self.say(f"addChildren REJECTED (sent once, not retried): {self._error(exc)}")
+            self._rejection("addChildren", exc)
             self.result.stopped = "add_rejected"
             return
         except (requests.RequestException, TimeoutError, ConnectionError) as exc:
@@ -810,15 +842,14 @@ class Probe:
         self.result.children_added = True
         self.say(f"addChildren RAW RESPONSE: {json.dumps(body)}")
         returned = ((body or {}).get("data") or {}).get("billPayers", {}).get("addChildren")
-        if isinstance(returned, list):
-            returned = returned[0] if returned else None
-        if isinstance(returned, dict) and run.shape["children_field"]:
-            entries = runner._child_entries(returned, run.shape)
-            ids = {c for c, _m in entries}
-            self.say(f"addChildren RETURNED the second child: {_yes(second_child in ids)}; "
-                     f"entries returned: {len(entries)}")
+        entries = returned if isinstance(returned, list) else [returned] if isinstance(returned, dict) else []
+        shares = [(e.get("childId"), (e.get("share") or {}).get("multiplier")) for e in entries
+                  if isinstance(e, dict) and e.get("childId")]
+        if shares:
+            self.say(f"addChildren RETURNED {len(shares)} share entr{'y' if len(shares) == 1 else 'ies'}; "
+                     f"includes the second child: {_yes(second_child in {c for c, _m in shares})}")
         else:
-            self.say("addChildren returned no children to inspect")
+            self.say("addChildren returned no share entries to inspect")
 
     def _measure_attach(self, run: _Run, first_child, second_child) -> None:
         started = self.clock()
@@ -888,13 +919,19 @@ class Probe:
                 body = self._send(delete_children_document(op), variables, DELETE_CHILDREN_OP,
                                   "deleteChildren")
             except (GraphQLError, GraphQLHTTPError) as exc:
-                self.say(f"deleteChildren REJECTED (sent once, not retried): {self._error(exc)}")
+                self._rejection("deleteChildren", exc)
                 return False
             except (requests.RequestException, TimeoutError, ConnectionError) as exc:
                 self.say(f"deleteChildren OUTCOME UNKNOWN ({type(exc).__name__}); not resent")
                 return False
             self.say(f"deleteChildren RAW RESPONSE: {json.dumps(body)}")
         self.result.shares_deleted = True
+        # deleteChildren answers with entries even for shares that never existed, so look.
+        found = probe_scan(self.public, run.site_id, run.shape, False, run.email_key,
+                           run.external_id, "", bill_payer_id=run.bill_payer_id)
+        count = len(found["entries"])
+        self.say(f"AFTER deleteChildren: the payer lists {count} child entr{'y' if count == 1 else 'ies'}"
+                 + ("" if count == 0 else " (shares remain: the archive will probably be refused)"))
         return True
 
     def _delete_test_children(self, run: _Run) -> None:
@@ -934,7 +971,7 @@ class Probe:
         try:
             body = self._send(delete_document(plan), variables, DELETE_OP, "delete")
         except (GraphQLError, GraphQLHTTPError) as exc:
-            self.say(f"DELETE REJECTED (sent once, not retried): {self._error(exc)}")
+            self._rejection("delete", exc)
             self.say(f"DELETE THIS BILL PAYER BY HAND: {run.bill_payer_id}")
             return False
         except (requests.RequestException, TimeoutError, ConnectionError) as exc:
