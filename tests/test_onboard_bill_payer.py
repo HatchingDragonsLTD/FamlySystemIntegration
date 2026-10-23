@@ -746,3 +746,42 @@ class MigrationTests(BPCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GateACountTests(BPCase):
+    """The Gate A "writes planned" count equals the writes the worker will make."""
+
+    def text(self, child_status, contact_statuses, bill_payer):
+        from actions.onboard import notifier
+        plan = {"dealId": "1", "siteCode": "S", "groupTitle": "G",
+                "child": {"status": child_status},
+                "contacts": [{"status": st, "isBillPayer": i == 0} for i, st in enumerate(contact_statuses)],
+                "dates": {}, "warnings": []}
+        if bill_payer is not None:
+            plan["billPayer"] = {"status": bill_payer}
+        return notifier.gate_text(plan, "h" * 64, "live")
+
+    def test_create(self):
+        self.assertIn("Famly writes planned: 1 child, 2 contact(s), 1 bill payer",
+                      self.text("child_would_create", ["would_create"] * 2, "would_create"))
+
+    def test_attach_counts_one_write(self):
+        self.assertIn("Famly writes planned: 1 child, 2 contact(s), 1 bill payer",
+                      self.text("child_would_create", ["would_create"] * 2, "would_attach"))
+
+    def test_flagged_and_present_count_zero(self):
+        for status in ("flagged", "present"):
+            self.assertIn("Famly writes planned: 1 child, 2 contact(s), 0 bill payer",
+                          self.text("child_would_create", ["would_create"] * 2, status))
+
+    def test_an_existing_child_counts_zero_child_writes(self):
+        self.assertIn("Famly writes planned: 0 child, 0 contact(s), 1 bill payer",
+                      self.text("child_found", ["present"], "would_create"))
+
+    def test_no_bill_payer_section_leaves_the_line_as_before(self):
+        self.assertIn("Famly writes planned: 1 child, 1 contact(s)\n",
+                      self.text("child_would_create", ["would_create"], None))
+
+    def test_the_real_message_for_a_new_deal_counts_the_payer(self):
+        self.run_to_approval()
+        self.assertIn("Famly writes planned: 1 child, 2 contact(s), 1 bill payer", self.notify.gates[-1][0])

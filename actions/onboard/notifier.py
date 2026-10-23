@@ -60,8 +60,14 @@ def gate_text(
     else:
         child_state = "already in Famly"
     child_writes = 1 if child.get("status") == "child_would_create" else 0
+    # The count equals the writes the worker will make: the bill payer create or attach
+    # is one write; a present or flagged payer is none.
+    bp_section = plan.get("billPayer")
+    bill_payer_writes = 1 if isinstance(bp_section, dict) and bp_section.get("status") in (
+        "would_create", "would_attach") else 0
     lines.append(
         f"Famly writes planned: {child_writes} child, {creating} contact(s)"
+        + (f", {bill_payer_writes} bill payer" if isinstance(bp_section, dict) else "")
     )
     lines.append(
         f"Child: {child_state} · Contacts: {len(contacts)} ({creating} to create, "
