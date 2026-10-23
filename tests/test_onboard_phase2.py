@@ -128,6 +128,8 @@ class FakeFamly:
         self.site_children = []
         self.events = []
         self.blind_after_create = False   # the next by-deal-id lookup finds nothing
+        self.post_create_script = None    # (n, ids) -> ids, or raises: by-deal-id lookups AFTER a create
+        self.post_create_lookups = 0
         self.after_first = {}     # operation -> callable run after its FIRST call
         self._n = 0
 
@@ -179,6 +181,10 @@ class FakeFamly:
                 for r in p.get("externalSystemsReferences", []))]
             if getattr(self, "_blind", False):
                 self._blind, ids = False, []
+            if self.child_creates:
+                self.post_create_lookups += 1
+                if self.post_create_script:
+                    ids = self.post_create_script(self.post_create_lookups, ids)
             response = {"data": {"children": {"listByExternalSystemReference": {
                 "result": [{"id": i} for i in ids]}}}}
             hook = self.after_first.pop(operation_name, None)
@@ -279,8 +285,10 @@ class Phase2Case(unittest.TestCase):
         self.rest, self.notify = FakeRest(self.famly), FakeNotifier()
         self.events = []
         self.hub.events = self.famly.events = self.events
+        self.sleeps = []
         self.deps = worker.Deps(self.hub, self.famly, self.rest, self.notify,
-                                famly_factory=lambda: FamlyReads(self.famly, site_ids=[SITE_ID]))
+                                famly_factory=lambda: FamlyReads(self.famly, site_ids=[SITE_ID]),
+                                sleep=self.sleeps.append)
 
         # Other test modules disable logging process-wide; this one must SEE every
         # log line to prove none carries personal data. Restored afterwards.
@@ -413,7 +421,8 @@ class ModeAndAllowlistTests(Phase2Case):
         other.events = self.events
         self.famly, self.rest = other, FakeRest(other)
         self.deps = worker.Deps(self.hub, other, self.rest, self.notify,
-                                famly_factory=lambda: FamlyReads(other, site_ids=[SITE_ID]))
+                                famly_factory=lambda: FamlyReads(other, site_ids=[SITE_ID]),
+                                sleep=self.sleeps.append)
         self.mode("live", test="")            # not a test deal
         store._reset_for_tests()
         self.run_through()
@@ -1551,14 +1560,14 @@ class OriginFromHistoryTests(Phase2Case):
         self.assertFalse(self.job().child_create_sent)             # the second job sent no create
 
     def test_a_child_whose_read_back_failed_is_still_the_pipelines_on_the_next_job(self):
-        self.famly.blind_after_create = True       # the read-back lookup finds nothing
+        self.famly.post_create_script = lambda n, ids: []   # the read-back never sees it
         self.run_through()
         self.assertEqual(self.job().last_error_code, "readback_child_lookup_failed")
         # Recorded at once, before the read-back, so the failure did not lose it.
         self.assertEqual(store.created_child_ids_for_deal(DEAL), frozenset({"child-1"}))
         self.assertEqual(self.famly.contact_creates, [])            # the one stopping read-back
 
-        self.famly.blind_after_create = False
+        self.famly.post_create_script = None
         self.enqueue()
         self.assertEqual(self.run_worker()["status"], store.AWAITING_APPROVAL)
         self.assertIn("created by pipeline", self.notify.gates[-1][0])
@@ -1792,7 +1801,8 @@ class ContactOrderAndLookupTests(Phase2Case):
         other.events = self.events
         self.famly, self.rest = other, FakeRest(other)
         self.deps = worker.Deps(self.hub, other, self.rest, self.notify,
-                                famly_factory=lambda: FamlyReads(other, site_ids=[SITE_ID]))
+                                famly_factory=lambda: FamlyReads(other, site_ids=[SITE_ID]),
+                                sleep=self.sleeps.append)
         self.hub.deals[DEAL]["end_date"] = "2028-08-31"
         other.child_land_then_raise = requests.exceptions.Timeout()
         self.run_through()
@@ -2006,3 +2016,81 @@ class SettleByLookupTests(Phase2Case):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SearchLagTests(Phase2Case):
+    """Famly's search lags a create: bounded, read-only retries (ids and counts only)."""
+
+    def lag(self, script):
+        self.famly.post_create_script = script
+
+    def test_readback_empty_twice_then_found_continues(self):
+        self.lag(lambda n, ids: [] if n <= 2 else ids)
+        result = self.run_through()
+        self.assertEqual(result["status"], store.DONE)
+        self.assertEqual(self.famly.post_create_lookups, 3)
+        self.assertEqual(len(self.famly.child_creates), 1)
+        self.assertEqual(self.sleeps, [1, 2])
+
+    def test_readback_always_empty_stops_after_five_with_one_log_line(self):
+        self.lag(lambda n, ids: [])
+        result = self.run_through()
+        self.assertEqual((result["status"], result["code"]),
+                         (store.NEEDS_REVIEW, "readback_child_lookup_failed"))
+        self.assertEqual(self.famly.post_create_lookups, 5)
+        self.assertEqual(len(self.famly.child_creates), 1)
+        self.assertEqual(self.sleeps, [1, 2, 4, 8])
+        lines = [l for l in self.logs if "did not settle" in l]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("attempts=5", lines[0])
+        self.assertIn("count=0", lines[0])
+
+    def test_readback_two_ids_stops_at_once(self):
+        self.lag(lambda n, ids: ids + ["other-child"])
+        result = self.run_through()
+        self.assertEqual(result["code"], "readback_child_lookup_failed")
+        self.assertEqual(self.famly.post_create_lookups, 1)
+        self.assertEqual(self.sleeps, [])
+
+    def test_readback_raising_twice_then_found_continues(self):
+        def script(n, ids):
+            if n <= 2:
+                raise GraphQLHTTPError("down", 503, "")
+            return ids
+        self.lag(script)
+        self.assertEqual(self.run_through()["status"], store.DONE)
+        self.assertEqual(self.famly.post_create_lookups, 3)
+
+    def test_readback_raising_every_time_is_unknown_outcome_not_failed(self):
+        def script(n, ids):
+            raise GraphQLHTTPError("down", 503, "")
+        self.lag(script)
+        result = self.run_through()
+        self.assertEqual((result["status"], result["code"]),
+                         (store.NEEDS_REVIEW, "create_outcome_unknown"))
+        self.assertEqual(self.famly.post_create_lookups, 5)
+        self.assertEqual(len(self.famly.child_creates), 1)
+
+    def test_settle_after_rejection_empty_then_found_is_landed(self):
+        self.famly.child_land_then_raise = GraphQLHTTPError("bad", 400, "{}")
+        self.lag(lambda n, ids: [] if n <= 1 else ids)
+        result = self.run_through()
+        self.assertEqual(result["status"], store.DONE)
+        self.assertEqual(len(self.famly.child_creates), 1)
+        self.assertEqual(self.job().child_id, "child-1")
+
+    def test_settle_after_rejection_always_empty_is_failed_with_the_rejected_code(self):
+        self.famly.child_effect = mock.Mock(side_effect=GraphQLHTTPError("bad", 400, "{}"))
+        result = self.run_through()
+        self.assertEqual((result["status"], result["code"]), (store.FAILED, "child_http_400"))
+        self.assertEqual(self.famly.post_create_lookups, 5)       # the settle lookups
+        self.assertEqual(len(self.famly.child_creates), 1)
+        self.assertEqual(self.sleeps, [1, 2, 4, 8])
+
+    def test_settle_after_unknown_outcome_always_empty_is_unknown_outcome(self):
+        self.famly.child_effect = mock.Mock(side_effect=requests.exceptions.ConnectionError())
+        result = self.run_through()
+        self.assertEqual((result["status"], result["code"]),
+                         (store.NEEDS_REVIEW, "create_outcome_unknown"))
+        self.assertEqual(self.sleeps, [1, 2, 4, 8])
+        self.assertEqual(len(self.famly.child_creates), 1)
