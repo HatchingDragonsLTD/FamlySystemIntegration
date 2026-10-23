@@ -16,6 +16,9 @@ HELP = "Queue a HubSpot deal for onboarding into Famly (child and contacts); ref
 
 def add_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--deal-id", metavar="ID", help="The HubSpot deal id")
+    parser.add_argument("--new-urn", action="store_true",
+                        help="--deal-id only: skip the returning-child check for THIS ONE JOB, for a "
+                             "genuinely different child (a new URN is still allocated, if the switch is on)")
     parser.add_argument("--file", metavar="PATH",
                         help="A file of deal ids (digits only, one per line; blank lines and # "
                              "comments ignored). Needs --limit N or --all")
@@ -44,7 +47,7 @@ def handle(args: argparse.Namespace):
         print("--deal-id must be a HubSpot deal id (digits only); nothing was queued.",
               file=sys.stderr)
         raise SystemExit(3)
-    result = store.enqueue(deal_id, mode)
+    result = store.enqueue(deal_id, mode, new_urn=bool(getattr(args, "new_urn", False)))
     return {
         "outcome": result.outcome,
         "jobId": result.job.id,
@@ -63,6 +66,9 @@ def _file(args: argparse.Namespace, mode: str):
 
     if args.deal_id:
         print("use --deal-id or --file, not both; nothing was queued", file=sys.stderr)
+        raise SystemExit(3)
+    if getattr(args, "new_urn", False):
+        print("--new-urn is for one --deal-id at a time; nothing was queued", file=sys.stderr)
         raise SystemExit(3)
     batch.require_scope(args.limit, args.all)
     ids, file_hash = batch.read_file(args.file)

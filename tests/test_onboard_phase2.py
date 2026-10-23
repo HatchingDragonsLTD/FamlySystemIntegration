@@ -73,7 +73,7 @@ class FakeHub(FakeHubSpot):
         }
         self.defs = {name: {"type": "string", "fieldType": "text", "options": []}
                      for name in ("famly_childid", "famly_sync_status", "famly_sync_note",
-                                  "famly_sync_gaps", "end_date", "dealname")}
+                                  "famly_sync_gaps", "end_date", "dealname", "child_urn")}
         self.writes = []
         self.write_error = None
         self.defs_error = None
@@ -107,8 +107,21 @@ class FakeHub(FakeHubSpot):
         self.writes.append((deal_id, dict(properties)))
         for prop, value in properties.items():
             self.events.append(("hubspot", prop))
-            if prop == "end_date":
-                self.deals[deal_id]["end_date"] = value
+            if prop in ("end_date", "child_urn"):
+                self.deals[deal_id][prop] = value
+
+    def search_deals(self, filters, properties, limit=100):
+        """READ-ONLY search over the fake deals (the filters the URN checks use)."""
+        def ok(deal):
+            for f in filters:
+                have = str(deal.get(f["propertyName"]) or "").strip()
+                if f["operator"] == "HAS_PROPERTY" and not have:
+                    return False
+                if f["operator"] == "EQ" and have.casefold() != str(f["value"]).casefold():
+                    return False
+            return True
+        return [{"id": str(i), **{p: d.get(p) for p in properties}}
+                for i, d in self.deals.items() if ok(d)]
 
 
 class FakeFamly:
@@ -209,7 +222,8 @@ class FakeFamly:
             return {"data": {"children": {"listBySiteIds": {"result": result, "next": None}}}}
 
         if operation_name == "OnboardSiteChildren":
-            result = [{"id": i, "birthday": b, "name": {"fullName": n}} for i, b, n in self.site_children]
+            result = [{"id": row[0], "birthday": row[1], "name": {"fullName": row[2]},
+                       "externalId": row[3] if len(row) > 3 else None} for row in self.site_children]
             return {"data": {"children": {"listBySiteIds": {"result": result, "next": None}}}}
 
         raise AssertionError(f"unexpected operation {operation_name}")
@@ -1360,7 +1374,7 @@ class GuaranteeTests(Phase2Case):
                                    "child_id", "attempts", "last_error_code", "approval_ref",
                                    "child_create_sent", "outcomes", "claimed_at", "created_at",
                                    "updated_at", "source", "approval_nonce", "reask_count",
-                                   "plan_sections", "bill_payer_id", "file_hash"])
+                                   "plan_sections", "bill_payer_id", "file_hash", "new_urn"])
 
     def test_the_famly_writers_are_create_only_and_the_fake_would_catch_anything_else(self):
         for path in (famly_writes.CREATE_CHILD_QUERY, famly_writes.CREATE_CONTACT_QUERY):

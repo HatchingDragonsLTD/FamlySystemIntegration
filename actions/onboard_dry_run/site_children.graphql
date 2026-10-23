@@ -11,6 +11,7 @@ query OnboardSiteChildren(
     listBySiteIds(siteIds: $siteIds, nextToken: $next, timeRange: $timeRange) {
       result {
         id
+        externalId
         birthday
         name {
           fullName

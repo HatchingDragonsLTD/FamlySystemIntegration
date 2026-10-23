@@ -76,6 +76,7 @@ from actions.onboard import (
 from actions.onboard import bill_payer_writes
 from actions.onboard_dry_run import bill_payers as bill_payer_scan
 from actions.onboard_dry_run import derive
+from actions.onboard_dry_run import urn as urn_fmt
 from actions.onboard_dry_run.famly_reads import FamlyReads, normalise_email
 from actions.onboard_dry_run.runner import DryRun, hashed_plan, plan_hash
 from core import hubspot
@@ -220,7 +221,10 @@ def _process(job: store.Job, deps: Deps, run_mode: str) -> dict:
     # create this pipeline sent produced. A child found by lookup that is not one
     # of them already existed, and is handled more strictly.
     plan = DryRun(deps.hubspot, deps.famly()).plan_deal(
-        deal_id, context, created_child_ids=store.created_child_ids_for_deal(deal_id)
+        deal_id, context, created_child_ids=store.created_child_ids_for_deal(deal_id),
+        # A live job RESERVES the deal's URN here (plan time), so the number approved in
+        # Slack is the number written; a dry job only shows the next number, reserving nothing.
+        urn={"allocate": run_mode == config.MODE_LIVE, "skip_returning": job.new_urn, "job_id": job.id},
     )
     if plan["status"] == "error":
         raise StopJob(store.FAILED, "plan_read_failed")
@@ -363,8 +367,12 @@ def _write_phase(job, deps, plan, context, digest) -> dict:
         _admin_notice(deps, deal_id, pre.warnings)
     syncer = hubspot_sync.Syncer(deps.hubspot, deal_id, pre)
 
-    store.set_status(job.id, store.CREATING_CHILD, plan_hash=digest)
     deal = context["deal"]
+    # The allocated URN goes onto the deal in HubSpot BEFORE any Famly write; if that
+    # fails nothing is sent to Famly and a retry reuses the same URN.
+    urn_written = _write_allocated_urn(job, deps, plan, deal)
+
+    store.set_status(job.id, store.CREATING_CHILD, plan_hash=digest)
     child = _ensure_child(job, deps, plan, deal)
     store.update(job.id, child_id=child.child_id)
     # The same history-based rule as the plan, applied at the last moment: ours if
@@ -378,11 +386,13 @@ def _write_phase(job, deps, plan, context, digest) -> dict:
     flags: list[str] = []
     if child.created:
         flags = _summary_flags(deps, deal, plan, child.child_id, config.is_test_deal(deal_id))
+        if urn_written:
+            flags += _urn_readback_flags(deps, urn_written, child.child_id)
 
     _write_child_back(deps, syncer, deal, deal_id, child)
 
     if plan.get("scope") == derive.SCOPE_CHILD_ONLY:
-        return _finish_child_only(job, deps, plan, syncer, child, flags, info)
+        return _finish_child_only(job, deps, plan, syncer, child, flags, info, urn_written)
 
     store.set_status(job.id, store.CREATING_CONTACTS)
     outcomes, contact_warnings, all_ok = _create_contacts(job, deps, plan, context, child, own_child)
@@ -430,6 +440,7 @@ def _write_phase(job, deps, plan, context, digest) -> dict:
         failures.append("hubspot_writeback_failed")
     codes = (bad_codes + [f for f in failures if f != "contact_outcomes"] + flags
              + syncer.reports + list(plan["warnings"]) + contact_warnings + bill_payer_codes
+             + (["urn_allocated"] if urn_written else [])
              + ["created" if child.created else "child_existed"])
     if failures:
         store.set_status(job.id, store.NEEDS_REVIEW, last_error_code=",".join(failures))
@@ -442,7 +453,45 @@ def _write_phase(job, deps, plan, context, digest) -> dict:
     return info
 
 
-def _finish_child_only(job, deps, plan, syncer, child: "ChildResult", flags, info) -> dict:
+def _write_allocated_urn(job, deps, plan, deal: dict) -> str | None:
+    """If the plan carries a URN allocated for this deal and the deal has none, write it to the
+    HubSpot deal and CONFIRM by re-reading the deal. Returns the URN written, or None when there
+    was nothing to write. Any failure ends the job needs_review (`urn_hubspot_write_failed`)
+    before a single Famly request; the allocation stays with the deal, so a retry reuses it."""
+    section = plan.get("urn") or {}
+    if section.get("status") != urn_fmt.ALLOCATED:
+        return None
+    urn = section["urn"]
+    try:
+        live = deps.hubspot.get_deal(job.deal_id)
+        current = str(live.get("child_urn") or "").strip()
+        if current and current.upper() != urn:
+            raise HubSpotError("the deal has a different child_urn now")
+        if current.upper() != urn:
+            deps.hubspot.write_deal_properties(job.deal_id, {hubspot.CHILD_URN_PROPERTY: urn})
+            confirmed = str(deps.hubspot.get_deal(job.deal_id).get("child_urn") or "").strip()
+            if confirmed.upper() != urn:
+                raise HubSpotError("the child_urn did not read back")
+    except (HubSpotError, ValueError) as exc:
+        logger.error("onboard: urn write to HubSpot failed job=%s (%s)", job.id, type(exc).__name__)
+        raise StopJob(store.NEEDS_REVIEW, "urn_hubspot_write_failed") from None
+    store.mark_urn_written(job.deal_id)
+    deal["child_urn"] = urn                       # the child is created with it as externalId
+    return urn
+
+
+def _urn_readback_flags(deps, urn: str, child_id: str) -> list[str]:
+    """A flag, never a stop: the new child should be the one child carrying the URN."""
+    try:
+        if deps.famly().children_by_urn(urn) == [child_id]:
+            return []
+    except Exception:  # noqa: BLE001 - a flag check must never stop a job
+        pass
+    return ["urn_readback_mismatch"]
+
+
+def _finish_child_only(job, deps, plan, syncer, child: "ChildResult", flags, info,
+                       urn_written: str | None = None) -> dict:
     """A deal in a child-only stage ends here: the child is in Famly, and no contact is
     read or created and no bill payer is scanned or written. The status is `child_linked`
     (never contacts_linked / bill_payer_linked)."""
@@ -452,6 +501,7 @@ def _finish_child_only(job, deps, plan, syncer, child: "ChildResult", flags, inf
     syncer.write_status(hubspot_sync.STATUS_CHILD_LINKED, hubspot_sync.note_done(summary), gaps)
     codes = (flags + syncer.reports + list(plan["warnings"])
              + (["hubspot_writeback_failed"] if syncer.critical_failed else [])
+             + (["urn_allocated"] if urn_written else [])
              + ["child_only_stage", "created" if child.created else "child_existed"])
     if syncer.critical_failed:
         store.set_status(job.id, store.NEEDS_REVIEW, last_error_code="hubspot_writeback_failed")
