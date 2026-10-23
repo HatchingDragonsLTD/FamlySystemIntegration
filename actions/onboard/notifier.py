@@ -115,3 +115,7 @@ class SlackNotifier:
 
     def notice(self, text: str) -> bool:
         return slack.post_notice(text)
+
+    def hold_notice(self, text: str, job_id: str, nonce: str) -> bool:
+        """A hold notice with a Retry button."""
+        return slack.post_onboard_hold(text, approval.button_value(job_id, "", nonce)) is not None

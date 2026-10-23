@@ -20,7 +20,7 @@ import logging
 
 from integrations import slack
 
-from . import store
+from . import config, store
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +31,14 @@ MSG_REJECTED = "🚫 Rejected. Nothing was written."
 MSG_HANDLED = "This approval request has already been handled."
 MSG_STALE = "⚠️ This approval request is out of date (the plan changed). Use the newer message."
 MSG_UNKNOWN = "⚠️ Unknown onboarding job."
+MSG_RETRY_QUEUED = ("🔁 Retry queued. The worker will read the deal again and post a new approval "
+                    "request if one is needed.")
+MSG_RETRY_HANDLED = "This Retry has already been used. Nothing new was started."
+MSG_RETRY_STALE = "⚠️ This Retry button is out of date. Use the newer message."
+MSG_RETRY_BUSY = "A job for this deal is already queued or running. Nothing new was started."
+MSG_RETRY_DONE = "This deal has already been onboarded. Nothing was queued."
+MSG_RETRY_OFF = "Onboarding is switched off. Nothing was queued."
+MSG_RETRY_NOT_ALLOWED = "This deal is not allowed for live onboarding. Nothing was queued."
 
 
 _RESULT_CODES = {}
@@ -63,6 +71,9 @@ def _decide(action_id: str, value: str | None, user: str | None) -> str:
     if job is None:
         return MSG_UNKNOWN
 
+    if action_id == slack.ACTION_ONBOARD_RETRY:
+        return _retry(job, nonce, user)
+
     if action_id == slack.ACTION_ONBOARD_REJECT:
         if (job.status == store.AWAITING_APPROVAL
                 and (not job.approval_nonce or nonce != job.approval_nonce)):
@@ -90,7 +101,38 @@ def _decide(action_id: str, value: str | None, user: str | None) -> str:
     return MSG_UNKNOWN
 
 
+def _retry(job, nonce, user) -> str:
+    """The Retry button on a hold notice: the same enqueue as `onboard-enqueue` (same mode
+    and allowlist checks, a fresh job), nothing skipped: the new job plans again and posts
+    its own Gate A. Only the CURRENT notice's nonce counts, and it is spent atomically, so
+    a second press does nothing."""
+    if job.status != store.HELD:
+        return MSG_RETRY_HANDLED
+    if not job.approval_nonce:
+        return MSG_RETRY_HANDLED                    # already spent by an earlier press
+    if nonce != job.approval_nonce:
+        return MSG_RETRY_STALE
+    mode = config.mode()
+    if mode == config.MODE_OFF:
+        logger.info("ONBOARD RETRY job=%s deal=%s result=mode_off", job.id, job.deal_id)
+        return MSG_RETRY_OFF
+    if mode == config.MODE_LIVE and not config.is_allowed(job.deal_id):
+        logger.info("ONBOARD RETRY job=%s deal=%s result=not_allowlisted", job.id, job.deal_id)
+        return MSG_RETRY_NOT_ALLOWED
+    if not store.consume_hold_nonce(job.id, nonce):
+        return MSG_RETRY_HANDLED
+    # The held job's own source: a webhook job keeps its Deposit Pending check.
+    result = store.enqueue(job.deal_id, mode, source=job.source)
+    logger.info("ONBOARD RETRY job=%s deal=%s result=%s new_job=%s user=%s",
+                job.id, job.deal_id, result.outcome, result.job.id, user)
+    return {store.CREATED: MSG_RETRY_QUEUED, store.ALREADY_QUEUED: MSG_RETRY_BUSY,
+            store.ALREADY_DONE: MSG_RETRY_DONE}[result.outcome]
+
+
 _RESULT_CODES.update({
+    MSG_RETRY_QUEUED: "retry_queued", MSG_RETRY_HANDLED: "retry_already_used", MSG_RETRY_STALE: "retry_stale",
+    MSG_RETRY_BUSY: "retry_job_active", MSG_RETRY_DONE: "retry_already_done",
+    MSG_RETRY_OFF: "retry_mode_off", MSG_RETRY_NOT_ALLOWED: "retry_not_allowlisted",
     MSG_APPROVED: "approved", MSG_REJECTED: "rejected", MSG_HANDLED: "already_handled",
     MSG_STALE: "stale", MSG_UNKNOWN: "unknown",
 })
