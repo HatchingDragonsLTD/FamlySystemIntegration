@@ -116,13 +116,13 @@ def _retry(job, nonce, user) -> str:
     if mode == config.MODE_OFF:
         logger.info("ONBOARD RETRY job=%s deal=%s result=mode_off", job.id, job.deal_id)
         return MSG_RETRY_OFF
-    if mode == config.MODE_LIVE and not config.is_allowed(job.deal_id):
+    if mode == config.MODE_LIVE and not config.allowed_for_job(job, mode):
         logger.info("ONBOARD RETRY job=%s deal=%s result=not_allowlisted", job.id, job.deal_id)
         return MSG_RETRY_NOT_ALLOWED
     if not store.consume_hold_nonce(job.id, nonce):
         return MSG_RETRY_HANDLED
     # The held job's own source: a webhook job keeps its Deposit Pending check.
-    result = store.enqueue(job.deal_id, mode, source=job.source)
+    result = store.enqueue(job.deal_id, mode, source=job.source, file_hash=job.file_hash)
     logger.info("ONBOARD RETRY job=%s deal=%s result=%s new_job=%s user=%s",
                 job.id, job.deal_id, result.outcome, result.job.id, user)
     return {store.CREATED: MSG_RETRY_QUEUED, store.ALREADY_QUEUED: MSG_RETRY_BUSY,

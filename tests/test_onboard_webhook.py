@@ -170,7 +170,7 @@ class SourceAndStageTests(WebhookCase):
         self.trigger()
         self.assertEqual(store.latest_for_deal(DEAL).source, "webhook")
         store._reset_for_tests()
-        cli_enqueue.handle(mock.Mock(deal_id=DEAL))
+        cli_enqueue.handle(mock.Mock(deal_id=DEAL, file=None))
         self.assertEqual(store.latest_for_deal(DEAL).source, "cli")
         with self.assertRaises(ValueError):
             store.enqueue("5", "live", source="carrier-pigeon")
@@ -206,7 +206,7 @@ class SourceAndStageTests(WebhookCase):
 
     def test_a_cli_job_has_no_stage_restriction(self):
         self.ineligible()
-        cli_enqueue.handle(mock.Mock(deal_id=DEAL))
+        cli_enqueue.handle(mock.Mock(deal_id=DEAL, file=None))
         result = self.run_worker()
         self.assertEqual(result["status"], store.AWAITING_APPROVAL)    # not held
         self.assertNotEqual(result["code"], "stage_not_eligible")

@@ -202,7 +202,7 @@ def _process(job: store.Job, deps: Deps, run_mode: str) -> dict:
     store.update(job.id, mode=run_mode)
 
     # Live mode writes only for allowlisted deals. Checked FIRST, before any read.
-    if run_mode == config.MODE_LIVE and not config.is_allowed(deal_id):
+    if run_mode == config.MODE_LIVE and not config.allowed_for_job(job, run_mode):
         _held(job, deps, ["deal_not_allowlisted"], write_back=False)
         return {}
 
@@ -349,7 +349,7 @@ def _ask_for_approval(job, deps, plan, digest, run_mode, plan_changed: bool) -> 
 def _write_phase(job, deps, plan, context, digest) -> dict:
     deal_id = job.deal_id
     # Re-checked at the point of writing, in case the environment changed.
-    if config.mode() != config.MODE_LIVE or not config.is_allowed(deal_id):
+    if config.mode() != config.MODE_LIVE or not config.allowed_for_job(job, config.mode()):
         raise StopJob(store.HELD, "deal_not_allowlisted")
 
     # PRE-FLIGHT. HubSpot never blocks Famly: a missing property, or a value a

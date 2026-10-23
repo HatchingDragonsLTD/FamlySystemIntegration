@@ -97,7 +97,8 @@ CREATE TABLE IF NOT EXISTS onboard_jobs (
     approval_nonce    TEXT,
     reask_count       INTEGER NOT NULL DEFAULT 0,
     plan_sections     TEXT,
-    bill_payer_id     TEXT
+    bill_payer_id     TEXT,
+    file_hash         TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS onboard_one_active_per_deal
     ON onboard_jobs (deal_id)
@@ -134,6 +135,7 @@ class Job:
     reask_count: int = 0
     plan_sections: dict | None = None
     bill_payer_id: str | None = None
+    file_hash: str | None = None     # source `file`: a hash of the ids file (never its contents)
 
 
 def store_path() -> Path:
@@ -169,6 +171,7 @@ _ADDED_COLUMNS = (
     ("reask_count", "INTEGER NOT NULL DEFAULT 0"),
     ("plan_sections", "TEXT"),
     ("bill_payer_id", "TEXT"),
+    ("file_hash", "TEXT"),
 )
 
 
@@ -191,7 +194,7 @@ def _migrate(connection: sqlite3.Connection) -> None:
                 raise
 
 
-SOURCES = ("cli", "webhook")
+SOURCES = ("cli", "webhook", "file")
 
 
 def _to_job(row: sqlite3.Row) -> Job:
@@ -212,7 +215,7 @@ def _to_job(row: sqlite3.Row) -> Job:
         created_at=row["created_at"], updated_at=row["updated_at"],
         source=row["source"], approval_nonce=row["approval_nonce"],
         claimed_at=row["claimed_at"], reask_count=row["reask_count"], plan_sections=sections,
-        bill_payer_id=row["bill_payer_id"],
+        bill_payer_id=row["bill_payer_id"], file_hash=row["file_hash"],
     )
 
 
@@ -230,7 +233,7 @@ class Enqueued:
     job: Job
 
 
-def enqueue(deal_id: str, mode: str, source: str = "cli") -> Enqueued:
+def enqueue(deal_id: str, mode: str, source: str = "cli", file_hash: str | None = None) -> Enqueued:
     """Enqueue a job for `deal_id`, with ONE atomic INSERT.
 
     * A deal that already has a `done` job creates no job (`already_done`).
@@ -242,6 +245,8 @@ def enqueue(deal_id: str, mode: str, source: str = "cli") -> Enqueued:
     """
     if source not in SOURCES:
         raise ValueError(f"unknown job source: {source!r}")
+    if (source == "file") != bool(file_hash):
+        raise ValueError("a file job needs a file hash, and only a file job has one")
     deal_id = str(deal_id).strip()
     with _open() as connection:
         done = connection.execute(
@@ -257,9 +262,9 @@ def enqueue(deal_id: str, mode: str, source: str = "cli") -> Enqueued:
     try:
         with _open() as connection:
             connection.execute(
-                "INSERT INTO onboard_jobs (id, deal_id, status, mode, created_at, updated_at, source) "
-                "VALUES (?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?, ?)",
-                (job_id, deal_id, QUEUED, mode, now, source),
+                "INSERT INTO onboard_jobs (id, deal_id, status, mode, created_at, updated_at, source, file_hash) "
+                "VALUES (?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?, ?, ?)",
+                (job_id, deal_id, QUEUED, mode, now, source, file_hash or None),
             )
     except sqlite3.IntegrityError:
         active = active_for_deal(deal_id)

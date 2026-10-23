@@ -58,6 +58,26 @@ def is_allowed(deal_id: str) -> bool:
     return str(deal_id).strip() in allowed_deal_ids()
 
 
+def allowed_for_job(job, mode: str) -> bool:
+    """Whether a job may write LIVE for its deal.
+
+    Either the deal is on ONBOARD_ALLOWED_DEAL_IDS (the original gate, unchanged), or the
+    job came from a FILE enqueue: the job row records the source `file` and a hash of the
+    file the id was in, it was enqueued LIVE (so a dry-mode job is never replayed live),
+    and the deal is not on ONBOARD_TEST_DEAL_IDS. The gate stays an explicit list of ids:
+    the ids in the file the operator passed. Gate A is separate and always applies."""
+    deal_id = str(job.deal_id).strip()
+    if is_allowed(deal_id):
+        return True
+    return (
+        mode == MODE_LIVE
+        and job.mode == MODE_LIVE
+        and getattr(job, "source", None) == "file"
+        and bool(getattr(job, "file_hash", None))
+        and deal_id not in test_deal_ids()
+    )
+
+
 def is_test_deal(deal_id: str) -> bool:
     """True only for a deal that is in BOTH lists (a test id outside the
     allowlist is not allowed to write at all, so it is not a test deal either)."""
