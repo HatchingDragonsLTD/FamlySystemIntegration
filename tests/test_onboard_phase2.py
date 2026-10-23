@@ -2061,13 +2061,14 @@ class SearchLagTests(Phase2Case):
         self.assertEqual(self.run_through()["status"], store.DONE)
         self.assertEqual(self.famly.post_create_lookups, 3)
 
-    def test_readback_raising_every_time_is_unknown_outcome_not_failed(self):
+    def test_readback_raising_every_time_says_created_but_not_found_again(self):
         def script(n, ids):
             raise GraphQLHTTPError("down", 503, "")
         self.lag(script)
         result = self.run_through()
         self.assertEqual((result["status"], result["code"]),
-                         (store.NEEDS_REVIEW, "create_outcome_unknown"))
+                         (store.NEEDS_REVIEW, "readback_child_lookup_failed"))
+        self.assertEqual(self.job().child_id, "child-1")           # recorded
         self.assertEqual(self.famly.post_create_lookups, 5)
         self.assertEqual(len(self.famly.child_creates), 1)
 
@@ -2094,3 +2095,21 @@ class SearchLagTests(Phase2Case):
                          (store.NEEDS_REVIEW, "create_outcome_unknown"))
         self.assertEqual(self.sleeps, [1, 2, 4, 8])
         self.assertEqual(len(self.famly.child_creates), 1)
+
+    def test_a_lookup_that_settles_after_retries_logs_one_line_and_none_when_first_time(self):
+        self.lag(lambda n, ids: [] if n <= 2 else ids)
+        self.run_through()
+        lines = [l for l in self.logs if "settled after retries" in l]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("lookup=readback", lines[0])
+        self.assertIn("attempts=3", lines[0])
+        self.assertIn("count=1", lines[0])
+        store._reset_for_tests()
+        self.famly.children.clear()
+        self.famly.child_creates.clear()
+        self.famly.post_create_lookups = 0
+        self.famly.post_create_script = None
+        self.logs.clear()
+        self.run_through()
+        self.assertEqual([l for l in self.logs if "settled after retries" in l], [])
+

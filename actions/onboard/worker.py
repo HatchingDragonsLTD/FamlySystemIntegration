@@ -509,8 +509,8 @@ def _lookup_child(deps, deal: dict, deal_id: str, urn_fallback: bool) -> tuple[l
     return [], VIA_DEAL
 
 
-def _lookup_with_settle(job, deps, fn: Callable[[], list[str]],
-                        expect: str | None = None) -> tuple[list[str], bool]:
+def _lookup_with_settle(job, deps, fn: Callable[[], list],
+                        expect: str | None = None, label: str = "lookup") -> tuple[list, bool]:
     """Read `fn()` (a lookup; never a mutation) until it shows what is expected.
 
     Returns (ids from the last successful read, readable). Retries only on an empty
@@ -518,7 +518,7 @@ def _lookup_with_settle(job, deps, fn: Callable[[], list[str]],
     that raised; 2+ ids is not lag and returns at once. `readable` is False when the
     LAST attempt raised: an error is "could not read", never "not found"."""
     attempts = len(LOOKUP_RETRY_WAITS) + 1
-    ids: list[str] = []
+    ids: list = []
     readable = False
     for attempt in range(1, attempts + 1):
         try:
@@ -533,11 +533,16 @@ def _lookup_with_settle(job, deps, fn: Callable[[], list[str]],
                 return ids, True
             if (expect in ids) if expect else bool(ids):
                 return ids, True
+                if attempt > 1:
+                    # How long the lag lasts: ids and counts only.
+                    logger.info("onboard: lookup settled after retries job=%s deal=%s lookup=%s "
+                                "attempts=%d count=%d", job.id, job.deal_id, label, attempt, len(ids))
         if attempt < attempts:
             deps.sleep(LOOKUP_RETRY_WAITS[attempt - 1])
-    logger.warning("onboard: lookup did not settle job=%s deal=%s attempts=%d readable=%s count=%d ids=%s",
-                   job.id, job.deal_id, attempts, readable, len(ids) if readable else 0,
-                   ",".join(ids) if readable else "")
+    logger.warning("onboard: lookup did not settle job=%s deal=%s lookup=%s attempts=%d "
+                   "readable=%s count=%d ids=%s",
+                   job.id, job.deal_id, label, attempts, readable, len(ids) if readable else 0,
+                   ",".join(str(i) for i in ids) if readable else "")
     return (ids if readable else []), readable
 
 
@@ -572,7 +577,8 @@ def _ensure_child(job, deps, plan, deal) -> ChildResult:
         clean = False
         rejected_code = exc.code if isinstance(exc, famly_writes.CreateRejected) else None
         landed, readable = _lookup_with_settle(
-            job, deps, lambda: _lookup_child(deps, deal, deal_id, urn_fallback=False)[0])
+            job, deps, lambda: _lookup_child(deps, deal, deal_id, urn_fallback=False)[0],
+            label="settle")
         if len(landed) > 1:
             raise StopJob(store.NEEDS_REVIEW, "child_ambiguous") from None
         if not landed:
@@ -590,10 +596,11 @@ def _ensure_child(job, deps, plan, deal) -> ChildResult:
     # is this one. (The summary comparison below is a flag, never a stop.)
     # Famly's search lags a create, so an empty answer is read again (bounded).
     seen, readable = _lookup_with_settle(
-        job, deps, lambda: deps.famly().children_by_deal_id(deal_id), expect=child_id)
-    if not readable:
-        raise StopJob(store.NEEDS_REVIEW, UNKNOWN_OUTCOME)
-    if seen != [child_id]:
+        job, deps, lambda: deps.famly().children_by_deal_id(deal_id), expect=child_id,
+        label="readback")
+    # The child id is known and recorded, so an unreadable lookup is also "created but
+    # could not be found again" (not an unknown create outcome).
+    if not readable or seen != [child_id]:
         raise StopJob(store.NEEDS_REVIEW, "readback_child_lookup_failed")
     return ChildResult(child_id, created=True, clean_create=clean, via=VIA_DEAL)
 
@@ -698,7 +705,7 @@ def _create_contacts(
                 code = "contact_unmatched_on_existing_child"
             else:
                 code, contact_warnings, sent = _create_one(
-                    deps, famly, contact, child_id, target, matches)
+                    job, deps, famly, contact, child_id, target, matches)
                 warnings.extend(contact_warnings)
                 creates_sent += sent
         except Exception as exc:  # noqa: BLE001 - one contact must never stop the rest
