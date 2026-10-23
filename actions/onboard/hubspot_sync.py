@@ -44,6 +44,11 @@ STATUS_NEEDS_ATTENTION = "needs_attention"        # "Needs attention"
 # (internal value `bill_payer_linked`, label "Child, contacts and bill payer in Famly"); until
 # it does, the status stays `contacts_linked`.
 STATUS_BILL_PAYER_LINKED = "bill_payer_linked"
+# A CHILD-ONLY stage (e.g. Left Nursery): the child is in Famly and no contacts or bill payer
+# are wanted. Dropdown option to add in HubSpot: internal value `child_linked`, label
+# "Child in Famly (no contacts, left nursery)". If the portal does not offer it, the usual
+# `value_not_offered:` report applies and the status stays `child_ready`.
+STATUS_CHILD_LINKED = "child_linked"
 STATUS_OPTIONS = (STATUS_CHILD_READY, STATUS_CONTACTS_LINKED, STATUS_NEEDS_ATTENTION)
 
 # The properties the pre-flight looks for.

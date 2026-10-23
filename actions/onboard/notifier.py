@@ -33,8 +33,13 @@ def gate_text(
     bill_payer = any(c.get("isBillPayer") for c in contacts)
     dates = plan.get("dates") or {}
 
+    child_only = plan.get("scope") == "child_only"
     lines = []
-    if mode == config.MODE_DRY:
+    if child_only:
+        lines.append("*[DRY RUN] Onboarding: would create the child in Famly (child only)*"
+                     if mode == config.MODE_DRY
+                     else "*Onboarding approval: create the child in Famly (child only)*")
+    elif mode == config.MODE_DRY:
         lines.append("*[DRY RUN] Onboarding: would create the child and contacts in Famly*")
     else:
         lines.append("*Onboarding approval: create the child and contacts in Famly*")
@@ -60,6 +65,17 @@ def gate_text(
     else:
         child_state = "already in Famly"
     child_writes = 1 if child.get("status") == "child_would_create" else 0
+    if child_only:
+        stage_name = (plan.get("stage") or {}).get("name") or "a child-only stage"
+        lines.append(f"Scope: child only, because the deal is in {stage_name}. "
+                     "No contacts or bill payer will be created.")
+        lines.append(f"Famly writes planned: {child_writes} child")
+        lines.append(f"Child: {child_state}")
+        shown = messages.classify(plan.get("warnings") or [])
+        sentences = shown[messages.NOT_DONE] + shown[messages.CHECK]
+        lines.append("Warnings: " + (" ".join(sentences) if sentences else "none"))
+        lines.append(f"Plan: `{plan_hash[:approval.HASH_PREFIX]}`")
+        return "\n".join(lines)
     # The count equals the writes the worker will make: the bill payer create or attach
     # is one write; a present or flagged payer is none.
     bp_section = plan.get("billPayer")

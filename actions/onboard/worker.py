@@ -381,6 +381,9 @@ def _write_phase(job, deps, plan, context, digest) -> dict:
 
     _write_child_back(deps, syncer, deal, deal_id, child)
 
+    if plan.get("scope") == derive.SCOPE_CHILD_ONLY:
+        return _finish_child_only(job, deps, plan, syncer, child, flags, info)
+
     store.set_status(job.id, store.CREATING_CONTACTS)
     outcomes, contact_warnings, all_ok = _create_contacts(job, deps, plan, context, child, own_child)
     store.update(job.id, outcomes=outcomes)
@@ -436,6 +439,28 @@ def _write_phase(job, deps, plan, context, digest) -> dict:
         store.set_status(job.id, store.DONE, last_error_code=None)
         deps.notifier.notice(notifier_mod.notice_text(deal_id, f"✅ {summary}", codes, bill_payer_footer))
     _admin_notice(deps, deal_id, codes)
+    return info
+
+
+def _finish_child_only(job, deps, plan, syncer, child: "ChildResult", flags, info) -> dict:
+    """A deal in a child-only stage ends here: the child is in Famly, and no contact is
+    read or created and no bill payer is scanned or written. The status is `child_linked`
+    (never contacts_linked / bill_payer_linked)."""
+    stage = (plan.get("stage") or {}).get("name")
+    summary = messages.child_only_summary(child.created, stage)
+    gaps = list(plan["warnings"]) + flags
+    syncer.write_status(hubspot_sync.STATUS_CHILD_LINKED, hubspot_sync.note_done(summary), gaps)
+    codes = (flags + syncer.reports + list(plan["warnings"])
+             + (["hubspot_writeback_failed"] if syncer.critical_failed else [])
+             + ["child_only_stage", "created" if child.created else "child_existed"])
+    if syncer.critical_failed:
+        store.set_status(job.id, store.NEEDS_REVIEW, last_error_code="hubspot_writeback_failed")
+        deps.notifier.notice(notifier_mod.notice_text(
+            job.deal_id, f"⚠️ {summary} The job needs a person.", codes))
+    else:
+        store.set_status(job.id, store.DONE, last_error_code=None)
+        deps.notifier.notice(notifier_mod.notice_text(job.deal_id, f"✅ {summary}", codes))
+    _admin_notice(deps, job.deal_id, codes)
     return info
 
 
