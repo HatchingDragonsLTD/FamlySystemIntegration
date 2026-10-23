@@ -18,15 +18,26 @@ HELP = (
 
 def add_args(parser: argparse.ArgumentParser) -> None:
     group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--file", metavar="PATH",
+                       help="Dry-run the deal ids in a file (digits only, one per line; blank lines "
+                            "and # comments ignored). Needs --limit N or --all")
     group.add_argument("--deal-id", metavar="ID", help="Run one deal and print its plan")
     group.add_argument(
         "--deal-ids",
         metavar="A,B,C",
         help="Run several deals (comma-separated) and print a batch summary at the end",
     )
+    parser.add_argument("--limit", type=int, metavar="N", help="--file: only the first N ids")
+    parser.add_argument("--all", action="store_true", help="--file: every id in the file")
 
 
 def handle(args: argparse.Namespace):
+    if args.file:
+        from actions.onboard import batch
+
+        batch.require_scope(args.limit, args.all)
+        ids, _file_hash = batch.read_file(args.file)
+        return runner.run(ids if args.all else ids[: args.limit])
     if args.deal_id:
         result = runner.run([args.deal_id])
         # One deal: the plan itself, without the batch wrapper.
