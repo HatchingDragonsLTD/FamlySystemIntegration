@@ -54,10 +54,12 @@ READBACK_MISMATCH = "bill_payer_readback_mismatch"
 WRITE_REJECTED = "bill_payer_write_rejected"
 SCAN_FAILED = "bill_payer_scan_failed"
 DIFFERS = "bill_payer_differs"
+CREATE_UNCONFIRMED = "bill_payer_create_unconfirmed"   # an earlier write was unconfirmed and the scan does not show it
 NAME_INCOMPLETE = "contact_name_incomplete"        # an existing code: a create needs a name
 
 ALL_CODES = (CREATED, ATTACHED, PRESENT, AMBIGUOUS, NO_CONTACT, NO_EMAIL, CHILD_LINKED_ELSEWHERE,
-             PLAN_CHANGED, OUTCOME_UNKNOWN, READBACK_MISMATCH, WRITE_REJECTED, SCAN_FAILED, DIFFERS)
+             PLAN_CHANGED, OUTCOME_UNKNOWN, READBACK_MISMATCH, WRITE_REJECTED, SCAN_FAILED, DIFFERS,
+             CREATE_UNCONFIRMED)
 SUCCESS_CODES = (CREATED, ATTACHED, PRESENT)
 
 # plan statuses

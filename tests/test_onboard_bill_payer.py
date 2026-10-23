@@ -790,3 +790,47 @@ class GateACountTests(BPCase):
     def test_the_real_message_for_a_new_deal_counts_the_payer(self):
         self.run_to_approval()
         self.assertIn("Famly writes planned: 1 child, 2 contact(s), 1 bill payer", self.notify.gates[-1][0])
+
+
+class UnconfirmedPayerGuardTests(BPCase):
+    """After bill_payer_readback_mismatch / bill_payer_outcome_unknown a re-run must not
+    write the payer again while the scan does not show it."""
+
+    def creates(self):
+        return self.famly.ops().count(bpw.CREATE_OP)
+
+    def test_unresolved_outcome_and_a_lagging_scan_stops_without_a_write(self):
+        self.famly.lag_scans = 999                          # the payer never shows
+        self.run_through()
+        self.assertIn("bill_payer_readback_mismatch", self.codes())
+        self.assertEqual(self.creates(), 1)
+        result = self.run_through()                         # the re-run
+        self.assertEqual((result["status"], self.codes()), (store.NEEDS_REVIEW, "bill_payer_create_unconfirmed"))
+        self.assertEqual(self.creates(), 1)                 # no second create
+        self.assertIn("Check the child's bill payer in Famly", self.final_notice())
+
+    def test_unresolved_outcome_and_a_scan_that_shows_the_payer_proceeds_without_a_write(self):
+        self.famly.lag_scans = 999
+        self.run_through()
+        self.famly.payers[0]["visible_at"] = 0               # the scan has caught up
+        self.enqueue()
+        result = self.run_worker()                           # nothing to write: no Gate A
+        self.assertEqual(self.creates(), 1)
+        self.assertEqual(result["status"], store.DONE)
+        self.assertIn("bill_payer_present", self.final_notice())
+
+    def test_a_clean_create_earlier_is_not_blocked(self):
+        def reject_ben(payload):
+            if payload["email"] == "ben.b@example.org":
+                raise GraphQLHTTPError("bad", 400, "{}")
+        self.famly.contact_effect = reject_ben
+        self.run_through()                                   # payer created cleanly, a contact failed
+        self.assertEqual(self.creates(), 1)
+        self.famly.payers.clear()                            # removed in Famly by hand
+        self.famly.contact_effect = None
+        self.run_through()
+        self.assertEqual(self.creates(), 2)
+
+    def test_a_first_run_is_unchanged(self):
+        self.assertEqual(self.run_through()["status"], store.DONE)
+        self.assertEqual(self.creates(), 1)

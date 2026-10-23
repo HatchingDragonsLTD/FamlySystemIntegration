@@ -2309,3 +2309,66 @@ class RetryOverHttpTests(Phase2Case):
         self.assertEqual(update.call_args_list[0].args[1], approval.MSG_RETRY_QUEUED)
         self.assertEqual(update.call_args_list[1].args[1], approval.MSG_RETRY_HANDLED)
         self.assertEqual(store.active_for_deal(DEAL).status, store.QUEUED)
+
+
+class UnconfirmedContactGuardTests(Phase2Case):
+    """After readback_failed / create_outcome_unknown, a re-run must not create the parent
+    again while the child's list does not show them."""
+
+    ADA = "ada.l@example.org"
+
+    def hide(self, emails):
+        self.hidden = set(emails)
+        self.famly.contact_list_script = lambda n, rows: [r for r in rows if r[1] not in self.hidden]
+
+    def creates_for(self, email):
+        return [p for p in self.famly.contact_creates if p["email"] == email]
+
+    def first_job_with_unconfirmed_ada(self):
+        self.hide({self.ADA})                                  # the list lags: ada is never seen
+        result = self.run_through()
+        self.assertEqual(self.job().outcomes[0], "c1:readback_failed")
+        self.assertEqual(result["status"], store.NEEDS_REVIEW)
+        self.assertEqual(len(self.creates_for(self.ADA)), 1)
+
+    def test_unresolved_outcome_and_a_lagging_list_stops_without_a_create(self):
+        self.first_job_with_unconfirmed_ada()
+        result = self.run_through()                            # the re-run, list still lagging
+        self.assertEqual(self.job().outcomes[0], "c1:contact_create_unconfirmed")
+        self.assertEqual((result["status"], result["code"]),
+                         (store.NEEDS_REVIEW, "contact_outcomes"))
+        self.assertEqual(len(self.creates_for(self.ADA)), 1)    # no second create call
+        self.assertTrue(any("add the parent by hand" in n for n in self.notify.notices))
+        # Still unresolved on a third run: the way out is a person, never a create.
+        self.run_through()
+        self.assertEqual(len(self.creates_for(self.ADA)), 1)
+
+    def test_unresolved_outcome_and_a_list_that_shows_the_contact_proceeds_without_a_create(self):
+        self.first_job_with_unconfirmed_ada()
+        self.hide(set())                                       # the list has caught up
+        self.enqueue()
+        result = self.run_worker()                             # nothing to write: no Gate A
+        self.assertEqual(self.job().outcomes, ["c1:present", "c2:present"])
+        self.assertEqual(result["status"], store.DONE)
+        self.assertEqual(len(self.creates_for(self.ADA)), 1)
+
+    def test_a_clean_created_earlier_is_not_blocked(self):
+        def reject_ben(payload):
+            if payload["email"] == "ben.b@example.org":
+                raise GraphQLHTTPError("bad", 400, "{}")
+        self.famly.contact_effect = reject_ben
+        self.run_through()
+        self.assertEqual(self.job().outcomes, ["c1:created", "c2:contact_http_400"])
+        # ada is removed in Famly by hand; her last outcome was a CLEAN create.
+        self.famly.contacts["child-1"] = []
+        self.famly.contact_effect = None
+        self.run_through()
+        self.assertEqual(self.job().outcomes, ["c1:created", "c2:created"])
+        self.assertEqual(len(self.creates_for(self.ADA)), 2)
+
+    def test_a_first_run_is_unchanged(self):
+        self.assertEqual(self.run_through()["status"], store.DONE)
+        self.assertEqual(self.job().outcomes, ["c1:created", "c2:created"])
+
+    def test_history_ignores_other_children_and_unrecorded_jobs(self):
+        self.assertIsNone(store.last_outcome_for(DEAL, "child-x", "c1", "none"))

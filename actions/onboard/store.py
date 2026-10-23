@@ -462,6 +462,31 @@ def created_child_ids_for_deal(deal_id: str) -> frozenset[str]:
     return frozenset(row["child_id"] for row in rows)
 
 
+def last_outcome_for(deal_id: str, child_id: str, key: str, exclude_job_id: str) -> str | None:
+    """The most recent recorded outcome CODE for `key` (a HubSpot contact id, or
+    `billpayer`) from an EARLIER job for this deal on this same child, or None.
+
+    Outcomes are stored as `<key>:<code>` strings. A job that never got as far as
+    recording outcomes (it was interrupted) says nothing, and a job for another child
+    does not count."""
+    with _open() as connection:
+        rows = connection.execute(
+            "SELECT outcomes FROM onboard_jobs WHERE deal_id = ? AND child_id = ? AND id != ? "
+            "AND outcomes IS NOT NULL ORDER BY created_at DESC, rowid DESC",
+            (str(deal_id), child_id, exclude_job_id),
+        ).fetchall()
+    prefix = f"{key}:"
+    for row in rows:
+        try:
+            outcomes = json.loads(row["outcomes"])
+        except (TypeError, ValueError):
+            continue
+        for entry in reversed(outcomes if isinstance(outcomes, list) else []):
+            if isinstance(entry, str) and entry.startswith(prefix):
+                return entry[len(prefix):]
+    return None
+
+
 def recover_in_flight() -> int:
     """A job found mid-write (creating_child / creating_contacts) means a worker
     died after it may have written. It is NEVER replayed: it becomes
