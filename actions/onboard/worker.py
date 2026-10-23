@@ -69,6 +69,7 @@ from actions.onboard import (
     inputs,
     messages,
     notifier as notifier_mod,
+    phone as phone_mod,
     store,
     summary_check,
 )
@@ -453,6 +454,10 @@ def _bill_payer_stage(job, deps, plan, context, child: "ChildResult"):
     except Exception as exc:  # noqa: BLE001 - one stage must never stop the job's end
         logger.error("onboard: bill payer stage hit %s", type(exc).__name__)
         result = bill_payer_writes.StageResult(bill_payer_scan.OUTCOME_UNKNOWN)
+    if "phone_unnormalised" in result.extra:
+        payer = next((c for c in context["contacts"] if c.is_bill_payer), None)
+        if payer is not None:
+            _log_phone_reason(job, "bill_payer", payer.props)
     if result.bill_payer_id:
         store.update(job.id, bill_payer_id=result.bill_payer_id)      # the id only
     logger.info("onboard: bill payer stage job=%s code=%s sent=%s id=%s", job.id, result.code,
@@ -692,7 +697,7 @@ def _create_contacts(
     def matches(rows, target):
         return list(dict.fromkeys(cid for cid, mail in rows if mail == target))
 
-    for entry in entries:
+    for slot, entry in enumerate(entries):
         hubspot_id = entry["hubspotContactId"]
         code = "contact_error"
         try:
@@ -718,7 +723,7 @@ def _create_contacts(
                 code = CONTACT_UNCONFIRMED
             else:
                 code, contact_warnings, sent = _create_one(
-                    job, deps, famly, contact, child_id, target, matches)
+                    job, deps, famly, contact, child_id, target, matches, slot)
                 warnings.extend(contact_warnings)
                 creates_sent += sent
         except Exception as exc:  # noqa: BLE001 - one contact must never stop the rest
@@ -732,12 +737,22 @@ def _create_contacts(
     return outcomes, warnings, all_ok
 
 
-def _create_one(job, deps, famly, contact, child_id, target, matches) -> tuple[str, list[str], int]:
+def _log_phone_reason(job, slot, props) -> None:
+    """Why a phone was not normalised: the fixed reason code, the parent SLOT (an index,
+    or `bill_payer`) and the HubSpot property name. Never the number or any part of it."""
+    _source, _type, _number, reason, prop = phone_mod.pick_phone_detail(props or {})
+    logger.warning("onboard: phone not normalised job=%s deal=%s slot=%s property=%s reason=%s",
+                   job.id, job.deal_id, slot, prop, reason)
+
+
+def _create_one(job, deps, famly, contact, child_id, target, matches, slot) -> tuple[str, list[str], int]:
     """Create one contact. Returns (outcome code, warning codes, create requests sent)."""
     try:
         payload, contact_warnings = inputs.build_contact_input(contact, child_id)
     except inputs.InputIncomplete as exc:
         return exc.code, [], 0                              # held; nothing was sent
+    if "phone_unnormalised" in contact_warnings:
+        _log_phone_reason(job, slot, contact.props)
 
     try:
         famly_writes.create_contact(deps.public, payload)
