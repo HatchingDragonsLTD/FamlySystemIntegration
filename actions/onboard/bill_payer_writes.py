@@ -250,7 +250,7 @@ def _single_read(fn):
 
 
 def run_stage(*, public, scan, contacts, approved: dict, site_id: str, child_id: str,
-              sleep=time.sleep, lookup=_single_read) -> StageResult:
+              sleep=time.sleep, lookup=_single_read, unresolved: bool = False) -> StageResult:
     """The bill payer stage for one deal. `scan()` returns the site's live payers (a fresh
     read each call) or None if it failed; `approved` is the plan's `billPayer` section."""
     approved_decision = scan_mod.Decision(
@@ -276,6 +276,12 @@ def run_stage(*, public, scan, contacts, approved: dict, site_id: str, child_id:
     extra = ["bill_payer_differs"] if decision.differs else []
     if decision.status == scan_mod.STATUS_PRESENT:
         return StageResult(scan_mod.PRESENT, decision.bill_payer_id, extra, decision.differs)
+
+    if unresolved:
+        # An earlier job sent a payer write and never confirmed it, and the fresh scan
+        # does not show it (a "present" decision returned above): never write again.
+        logger.warning("onboard: bill payer write withheld, an earlier outcome is unconfirmed")
+        return StageResult(scan_mod.CREATE_UNCONFIRMED)
 
     bill_payer_contact = next(c for c in contacts if c.is_bill_payer)
     email_key = scan_mod.normalise_email(bill_payer_contact.email)

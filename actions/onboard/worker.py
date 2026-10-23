@@ -96,6 +96,13 @@ UNKNOWN_OUTCOME = "create_outcome_unknown"
 # these waits (seconds): 5 attempts in all, about 15 s worst case. Reads only.
 LOOKUP_RETRY_WAITS = (1, 2, 4, 8)
 
+# A contact create whose outcome was never confirmed: a later job must not create the
+# parent again while the child's contact list does not show it (the list can lag).
+CONTACT_UNCONFIRMED = "contact_create_unconfirmed"
+UNRESOLVED_CONTACT_OUTCOMES = ("readback_failed", UNKNOWN_OUTCOME, CONTACT_UNCONFIRMED)
+UNRESOLVED_PAYER_OUTCOMES = (bill_payer_scan.READBACK_MISMATCH, bill_payer_scan.OUTCOME_UNKNOWN,
+                             bill_payer_scan.CREATE_UNCONFIRMED)
+
 # The plan changed AGAIN after one re-ask: stop instead of asking a third time.
 PLAN_UNSTABLE = "plan_unstable"
 
@@ -440,6 +447,8 @@ def _bill_payer_stage(job, deps, plan, context, child: "ChildResult"):
             public=deps.public, scan=lambda: deps.famly().bill_payers(site_id),
             contacts=context["contacts"], approved=plan["billPayer"], site_id=site_id,
             child_id=child.child_id, sleep=deps.sleep,
+            unresolved=store.last_outcome_for(job.deal_id, child.child_id, "billpayer", job.id)
+            in UNRESOLVED_PAYER_OUTCOMES,
             lookup=lambda fn: _lookup_with_settle(job, deps, fn, label="bill_payer_readback"))
     except Exception as exc:  # noqa: BLE001 - one stage must never stop the job's end
         logger.error("onboard: bill payer stage hit %s", type(exc).__name__)
@@ -703,6 +712,10 @@ def _create_contacts(
                 # A child that already existed: an unmatched contact is never added
                 # to it (the plan holds on this; this is the last line).
                 code = "contact_unmatched_on_existing_child"
+            elif store.last_outcome_for(job.deal_id, child_id, hubspot_id, job.id)                     in UNRESOLVED_CONTACT_OUTCOMES:
+                # An earlier job sent this parent's create and never confirmed it, and the
+                # live list does not show it: do not create it a second time.
+                code = CONTACT_UNCONFIRMED
             else:
                 code, contact_warnings, sent = _create_one(
                     job, deps, famly, contact, child_id, target, matches)
