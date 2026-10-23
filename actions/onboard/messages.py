@@ -85,6 +85,7 @@ _STATIC: dict[str, tuple[str, str]] = {
     "bill_payer_scan_failed": (NOT_DONE, "Famly's bill payers could not be read, so none was created or linked. Run the job again later."),
     "bill_payer_differs": (CHECK, "The bill payer already in Famly has different details from HubSpot (the fields are in the codes below). Nothing was changed. Check the bill payer in Famly."),
     "contact_outcomes": (INFO, ""),
+    "child_only_stage": (INFO, ""),
     "created": (INFO, ""),
     "child_existed": (INFO, ""),
     "present": (INFO, ""),
@@ -200,3 +201,12 @@ def admin_text(deal_ref: str, codes) -> str | None:
         return None
     return (f"Onboarding admin (deal {deal_ref}): HubSpot setup needs attention. "
             f"{' '.join(classify(admin_codes)[ADMIN])} _Codes: {', '.join(admin_codes)}_")
+
+
+# Outcome sentences for a CHILD-ONLY stage (derive.CHILD_ONLY_STAGES), with the stage label.
+CHILD_ONLY_CREATED = "Child created in Famly. No contacts or bill payer, because the deal is in {stage}."
+CHILD_ONLY_EXISTED = "Child was already in Famly. No contacts or bill payer, because the deal is in {stage}."
+
+
+def child_only_summary(created: bool, stage: str | None) -> str:
+    return (CHILD_ONLY_CREATED if created else CHILD_ONLY_EXISTED).format(stage=stage or "a child-only stage")

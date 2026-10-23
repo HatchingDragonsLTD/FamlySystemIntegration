@@ -255,6 +255,19 @@ def is_left_nursery(stage_label: Any) -> bool:
     return norm_stage(stage_label) == LEFT_NURSERY
 
 
+# Deal stages whose deals are onboarded as a CHILD RECORD ONLY: no contacts, no bill payer
+# (the family has left; e.g. the backfill). Matched on the stage LABEL, exactly, ignoring
+# case and surrounding or repeated spaces. TO EXTEND: add the stage label here and nowhere
+# else (no .env setting); the plan, Gate A and the worker all read this one tuple.
+CHILD_ONLY_STAGES = ("Left Nursery",)
+SKIPPED_STAGE = "skipped_stage"
+SCOPE_CHILD_ONLY = "child_only"
+
+
+def is_child_only_stage(stage_label: Any) -> bool:
+    return norm_stage(stage_label) in {norm_stage(s) for s in CHILD_ONLY_STAGES}
+
+
 def deposit_state(pipeline_label: str, stage_label: str) -> str:
     """Whether a deposit would be unpaid (Deposit Pending), paid (a later
     Operations stage) or none (Left Nursery). `unknown` for any other stage,

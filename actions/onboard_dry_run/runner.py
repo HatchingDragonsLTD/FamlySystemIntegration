@@ -150,9 +150,19 @@ class DryRun:
         if plan["child"]["status"] == CHILD_WOULD_CREATE:
             self._check_creatable(deal, plan)
             self._check_possible_duplicate(deal, plan)
-        plan["contacts"] = self._contacts(deal_id, plan["child"], plan, context)
-        if bill_payers.enabled() and plan.get("siteId"):
-            self._bill_payer(plan, context)
+        if derive.is_child_only_stage(plan["stage"]["name"]):
+            # A child-only stage: the child stage above ran as normal (all its holds and
+            # warnings apply); no contact is read, matched or planned and the bill payer is
+            # not scanned, so nothing that exists only because of them can be raised.
+            plan["scope"] = derive.SCOPE_CHILD_ONLY
+            plan["contacts"] = []
+            plan["contactsStatus"] = derive.SKIPPED_STAGE
+            plan["billPayer"] = {"status": derive.SKIPPED_STAGE}
+            context["contacts"] = []
+        else:
+            plan["contacts"] = self._contacts(deal_id, plan["child"], plan, context)
+            if bill_payers.enabled() and plan.get("siteId"):
+                self._bill_payer(plan, context)
         plan["quotes"], quote_warnings = links.quote_summary(
             self._hubspot, self.labels(), deal_id
         )
