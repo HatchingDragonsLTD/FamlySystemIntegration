@@ -91,6 +91,11 @@ OK_OUTCOMES = (CREATED, PRESENT)
 # A create whose outcome is unknown and whose follow-up lookup finds nothing.
 UNKNOWN_OUTCOME = "create_outcome_unknown"
 
+# Famly's search (listByExternalSystemReference) lags a create. A read-back or settle
+# lookup that finds nothing (or not the expected child) is read again after each of
+# these waits (seconds): 5 attempts in all, about 15 s worst case. Reads only.
+LOOKUP_RETRY_WAITS = (1, 2, 4, 8)
+
 # The plan changed AGAIN after one re-ask: stop instead of asking a third time.
 PLAN_UNSTABLE = "plan_unstable"
 
@@ -504,6 +509,38 @@ def _lookup_child(deps, deal: dict, deal_id: str, urn_fallback: bool) -> tuple[l
     return [], VIA_DEAL
 
 
+def _lookup_with_settle(job, deps, fn: Callable[[], list[str]],
+                        expect: str | None = None) -> tuple[list[str], bool]:
+    """Read `fn()` (a lookup; never a mutation) until it shows what is expected.
+
+    Returns (ids from the last successful read, readable). Retries only on an empty
+    result, a result without `expect` (or, with no `expect`, no ids at all) and a read
+    that raised; 2+ ids is not lag and returns at once. `readable` is False when the
+    LAST attempt raised: an error is "could not read", never "not found"."""
+    attempts = len(LOOKUP_RETRY_WAITS) + 1
+    ids: list[str] = []
+    readable = False
+    for attempt in range(1, attempts + 1):
+        try:
+            ids = list(fn())
+            readable = True
+        except Exception as exc:  # noqa: BLE001 - HTTP/GraphQL errors; the text may carry a body
+            logger.warning("onboard: lookup failed job=%s attempt=%d error=%s",
+                           job.id, attempt, type(exc).__name__)
+            readable = False
+        if readable:
+            if len(ids) > 1:
+                return ids, True
+            if (expect in ids) if expect else bool(ids):
+                return ids, True
+        if attempt < attempts:
+            deps.sleep(LOOKUP_RETRY_WAITS[attempt - 1])
+    logger.warning("onboard: lookup did not settle job=%s deal=%s attempts=%d readable=%s count=%d ids=%s",
+                   job.id, job.deal_id, attempts, readable, len(ids) if readable else 0,
+                   ",".join(ids) if readable else "")
+    return (ids if readable else []), readable
+
+
 def _ensure_child(job, deps, plan, deal) -> ChildResult:
     deal_id = job.deal_id
 
@@ -534,11 +571,12 @@ def _ensure_child(job, deps, plan, deal) -> ChildResult:
         # nothing is a rejection reported.
         clean = False
         rejected_code = exc.code if isinstance(exc, famly_writes.CreateRejected) else None
-        landed, _via = _lookup_child(deps, deal, deal_id, urn_fallback=False)
+        landed, readable = _lookup_with_settle(
+            job, deps, lambda: _lookup_child(deps, deal, deal_id, urn_fallback=False)[0])
         if len(landed) > 1:
             raise StopJob(store.NEEDS_REVIEW, "child_ambiguous") from None
         if not landed:
-            if rejected_code:
+            if rejected_code and readable:
                 raise StopJob(store.FAILED, rejected_code) from None
             # The request may have landed and the lookup is blind to it: a person looks.
             raise StopJob(store.NEEDS_REVIEW, UNKNOWN_OUTCOME) from None
@@ -550,7 +588,12 @@ def _ensure_child(job, deps, plan, deal) -> ChildResult:
 
     # THE ONLY STOPPING READ-BACK: exactly one child by the deal-id reference, and it
     # is this one. (The summary comparison below is a flag, never a stop.)
-    if deps.famly().children_by_deal_id(deal_id) != [child_id]:
+    # Famly's search lags a create, so an empty answer is read again (bounded).
+    seen, readable = _lookup_with_settle(
+        job, deps, lambda: deps.famly().children_by_deal_id(deal_id), expect=child_id)
+    if not readable:
+        raise StopJob(store.NEEDS_REVIEW, UNKNOWN_OUTCOME)
+    if seen != [child_id]:
         raise StopJob(store.NEEDS_REVIEW, "readback_child_lookup_failed")
     return ChildResult(child_id, created=True, clean_create=clean, via=VIA_DEAL)
 
