@@ -18,6 +18,7 @@ from actions.contact_lookup import cli as contact_lookup
 from actions.create_timeline import chain_cancel, chain_resume, chain_status, chain_sweep
 from actions.delete_plans import delete_digest, delete_resume
 from actions.onboard import cli_enqueue as onboard_enqueue
+from actions.onboard import cli_phone_audit as onboard_phone_audit
 from actions.onboard import cli_status as onboard_status
 from actions.onboard import cli_worker as onboard_worker
 from actions.onboard_dry_run import cli as onboard_dry_run
@@ -65,6 +66,7 @@ ACTIONS = [
     onboard_enqueue,
     onboard_worker,
     onboard_status,
+    onboard_phone_audit,
     probe_contact_create,
     probe_bill_payers,
     probe_child_create,
