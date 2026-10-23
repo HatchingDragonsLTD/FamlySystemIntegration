@@ -452,15 +452,20 @@ class AttachTests(BPCase):
         self.assertEqual(len(self.famly.child_creates), 1)
         self.assertEqual(len(self.famly.contact_creates), 2)
 
-    def test_differences_are_flagged_by_field_name_and_never_by_value(self):
+    def test_differences_are_a_to_check_line_and_never_by_value_and_do_not_need_review(self):
         os.environ["ONBOARD_BILL_PAYER_DETAIL_SELECTION"] = "name phone"
         self.famly.payers.append(payer(self.email, {}, pid="the-one",
                                        details={"name": "Zed Zebra", "phone": "+447700900999"}))
         result = self.run_through()
-        self.assertEqual((result["status"], self.codes()), (store.NEEDS_REVIEW, "bill_payer_differs"))
+        self.assertEqual((result["status"], self.codes()), (store.DONE, ""))
         self.assertEqual(self.famly.ops(), [bpw.ADD_CHILDREN_OP])           # the link is still made
         notice = self.final_notice()
         self.assertIn("differs:name,phone", notice)
+        self.assertIn("To check", notice)
+        self.assertIn("has different details from HubSpot", notice)        # the plain sentence
+        self.assertIn("bill_payer_differs", notice)                         # and the code
+        self.assertNotIn("needs a person", notice)
+        self.assertIn("different details", self.written()["famly_sync_gaps"])
         for value in ("zed zebra", "900999"):
             self.assertNotIn(value, self.all_output())
         self.assertEqual(self.famly.payers[0]["details"]["name"], "Zed Zebra")   # nothing overwritten
