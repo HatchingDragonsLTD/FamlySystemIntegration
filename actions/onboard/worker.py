@@ -378,22 +378,22 @@ def _write_phase(job, deps, plan, context, digest) -> dict:
     store.update(job.id, outcomes=outcomes)
 
     # THE BILL PAYER STAGE (ONBOARD_BILL_PAYER=on): after the child and contacts, never
-    # blocking either, never rolling either back. Any flag ends the job needs_review.
+    # blocking either, never rolling either back. A flag ends the job needs_review; a
+    # difference in an existing payer's details (bill_payer_differs) is a "To check" line only.
     bill_payer = None
     if config.bill_payer_enabled() and plan.get("billPayer"):
         bill_payer = _bill_payer_stage(job, deps, plan, context, child)
         store.update(job.id, outcomes=outcomes + [f"billpayer:{bill_payer.code}"])
-    # Any flag ends the job needs_review: a failure code, or a difference to look at.
-    bill_payer_failed = bill_payer is not None and (
-        bill_payer.code not in bill_payer_scan.SUCCESS_CODES or bool(bill_payer.differs))
+    bill_payer_failed = bill_payer is not None and bill_payer.code not in bill_payer_scan.SUCCESS_CODES
     bill_payer_codes = [] if bill_payer is None else [bill_payer.code, *bill_payer.extra]
     bill_payer_footer = [f"differs:{','.join(bill_payer.differs)}"] if bill_payer and bill_payer.differs else []
 
     bad_codes = sorted({o.split(":", 1)[1] for o in outcomes if o.split(":", 1)[1] not in OK_OUTCOMES})
     if bill_payer_failed:
-        bad_codes.append(bill_payer.code if bill_payer.code not in bill_payer_scan.SUCCESS_CODES
-                         else bill_payer_scan.DIFFERS)
+        bad_codes.append(bill_payer.code)
     gaps = list(plan["warnings"]) + contact_warnings + flags
+    if bill_payer is not None and bill_payer.differs:
+        gaps.append(bill_payer_scan.DIFFERS)
     contact_codes = [o.split(":", 1)[1] for o in outcomes]
     summary = _summary_line(child.created, contact_codes, bill_payer)
     if all_ok and not bill_payer_failed:
@@ -414,8 +414,7 @@ def _write_phase(job, deps, plan, context, digest) -> dict:
     if not all_ok:
         failures.append("contact_outcomes")
     if bill_payer_failed:
-        failures.append(bill_payer.code if bill_payer.code not in bill_payer_scan.SUCCESS_CODES
-                        else bill_payer_scan.DIFFERS)
+        failures.append(bill_payer.code)
     if syncer.critical_failed:
         failures.append("hubspot_writeback_failed")
     codes = (bad_codes + [f for f in failures if f != "contact_outcomes"] + flags
