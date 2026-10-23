@@ -145,8 +145,7 @@ class HubSpotClient:
     ) -> dict:
         """The one transport: send, retry 429/5xx with backoff, return JSON.
 
-        Only `_get` and the writer's `_patch` call this; `HubSpotClient` itself
-        only ever passes GET."""
+        Only `_get`, `search_deals` (a read) and the writer's PATCH call this."""
         url = f"{self._base_url}{path}"
         headers = {"Authorization": f"Bearer {self._token}", "Accept": "application/json"}
 
@@ -206,6 +205,29 @@ class HubSpotClient:
             {"properties": ",".join(DEAL_PROPERTIES)},
         )
         return dict(body.get("properties") or {})
+
+    def search_deals(self, filters: list[dict], properties: list[str], limit: int = 100) -> list[dict]:
+        """READ-ONLY deal search (HubSpot's search endpoint is a POST, but it only reads).
+
+        `filters` is ONE filter group (ANDed): [{"propertyName", "operator", "value"}].
+        Returns every match's `{"id", **properties}` over all pages, requesting only the
+        named `properties`. Used for the child URN checks; it is the one POST this class
+        sends and the endpoint cannot write."""
+        found: list[dict] = []
+        after = None
+        for _ in range(500):                                  # a runaway cursor must end
+            body = {"filterGroups": [{"filters": filters}], "properties": list(properties),
+                    "limit": limit}
+            if after:
+                body["after"] = after
+            page = self._call("POST", "/crm/v3/objects/deals/search", json_body=body)
+            for row in page.get("results") or []:
+                if isinstance(row, dict):
+                    found.append({"id": str(row.get("id")), **(row.get("properties") or {})})
+            after = ((page.get("paging") or {}).get("next") or {}).get("after")
+            if not after:
+                return found
+        raise HubSpotError("deal search did not end")
 
     def get_contact(self, contact_id: str) -> dict:
         body = self._get(
@@ -284,8 +306,12 @@ SYNC_GAPS_PROPERTY = "famly_sync_gaps"
 # The deal's own end date: written ONLY when it was empty and the pipeline
 # DEFAULTED one (after the Famly write succeeded); never overwritten.
 END_DATE_PROPERTY = "end_date"
+# The child URN the pipeline ALLOCATED (ONBOARD_URN_GENERATION=on), written ONLY to a deal
+# that has none, before the Famly child is created; never overwritten.
+CHILD_URN_PROPERTY = "child_urn"
 WRITABLE_DEAL_PROPERTIES = frozenset(
     {
+        CHILD_URN_PROPERTY,
         FAMLY_CHILDID_PROPERTY,
         SYNC_STATUS_PROPERTY,
         SYNC_NOTE_PROPERTY,

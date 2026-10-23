@@ -45,6 +45,7 @@ No Flask, no Famly: importable and testable anywhere.
 """
 
 import json
+import time
 import logging
 import os
 import sqlite3
@@ -98,7 +99,19 @@ CREATE TABLE IF NOT EXISTS onboard_jobs (
     reask_count       INTEGER NOT NULL DEFAULT 0,
     plan_sections     TEXT,
     bill_payer_id     TEXT,
-    file_hash         TEXT
+    file_hash         TEXT,
+    new_urn           INTEGER NOT NULL DEFAULT 0
+);
+-- Child URN allocations (ONBOARD_URN_GENERATION): one per deal for life, one per number per site.
+CREATE TABLE IF NOT EXISTS onboard_urn_allocations (
+    site_code   TEXT NOT NULL,
+    number      INTEGER NOT NULL,
+    deal_id     TEXT NOT NULL,
+    job_id      TEXT,
+    state       TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    UNIQUE (site_code, number),
+    UNIQUE (deal_id)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS onboard_one_active_per_deal
     ON onboard_jobs (deal_id)
@@ -135,6 +148,7 @@ class Job:
     reask_count: int = 0
     plan_sections: dict | None = None
     bill_payer_id: str | None = None
+    new_urn: bool = False            # `onboard-enqueue --deal-id X --new-urn`: skip the returning-child check, this job only
     file_hash: str | None = None     # source `file`: a hash of the ids file (never its contents)
 
 
@@ -172,6 +186,7 @@ _ADDED_COLUMNS = (
     ("plan_sections", "TEXT"),
     ("bill_payer_id", "TEXT"),
     ("file_hash", "TEXT"),
+    ("new_urn", "INTEGER NOT NULL DEFAULT 0"),
 )
 
 
@@ -216,6 +231,7 @@ def _to_job(row: sqlite3.Row) -> Job:
         source=row["source"], approval_nonce=row["approval_nonce"],
         claimed_at=row["claimed_at"], reask_count=row["reask_count"], plan_sections=sections,
         bill_payer_id=row["bill_payer_id"], file_hash=row["file_hash"],
+        new_urn=bool(row["new_urn"]),
     )
 
 
@@ -233,7 +249,8 @@ class Enqueued:
     job: Job
 
 
-def enqueue(deal_id: str, mode: str, source: str = "cli", file_hash: str | None = None) -> Enqueued:
+def enqueue(deal_id: str, mode: str, source: str = "cli", file_hash: str | None = None,
+            new_urn: bool = False) -> Enqueued:
     """Enqueue a job for `deal_id`, with ONE atomic INSERT.
 
     * A deal that already has a `done` job creates no job (`already_done`).
@@ -262,9 +279,9 @@ def enqueue(deal_id: str, mode: str, source: str = "cli", file_hash: str | None 
     try:
         with _open() as connection:
             connection.execute(
-                "INSERT INTO onboard_jobs (id, deal_id, status, mode, created_at, updated_at, source, file_hash) "
-                "VALUES (?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?, ?, ?)",
-                (job_id, deal_id, QUEUED, mode, now, source, file_hash or None),
+                "INSERT INTO onboard_jobs (id, deal_id, status, mode, created_at, updated_at, source, file_hash, new_urn) "
+                "VALUES (?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?, ?, ?, ?)",
+                (job_id, deal_id, QUEUED, mode, now, source, file_hash or None, 1 if new_urn else 0),
             )
     except sqlite3.IntegrityError:
         active = active_for_deal(deal_id)
@@ -490,6 +507,74 @@ def last_outcome_for(deal_id: str, child_id: str, key: str, exclude_job_id: str)
             if isinstance(entry, str) and entry.startswith(prefix):
                 return entry[len(prefix):]
     return None
+
+
+# --------------------------------------------------------------------------- #
+# Child URN allocations
+# --------------------------------------------------------------------------- #
+def urn_allocation_for_deal(deal_id: str) -> tuple[str, int] | None:
+    """(site code, number) already allocated to this deal, or None."""
+    with _open() as connection:
+        row = connection.execute(
+            "SELECT site_code, number FROM onboard_urn_allocations WHERE deal_id = ?",
+            (str(deal_id),),
+        ).fetchone()
+    return (row["site_code"], row["number"]) if row else None
+
+
+def urn_max_allocated(site_code: str) -> int:
+    with _open() as connection:
+        row = connection.execute(
+            "SELECT COALESCE(MAX(number), 0) AS top FROM onboard_urn_allocations WHERE site_code = ?",
+            (site_code,),
+        ).fetchone()
+    return int(row["top"])
+
+
+def allocate_urn(deal_id: str, job_id: str | None, site_code: str, first_free, floor: int = 0) -> tuple[str, int]:
+    """Reserve the next number for `site_code` for this deal; (site code, number).
+
+    Atomic and idempotent: the table is UNIQUE on (site_code, number) and on deal_id, so
+    two deals never share a number (the loser of a race simply takes the next one) and a
+    deal that already holds one gets the SAME one back, whatever site is asked for.
+    `first_free(n)` returns the first number >= n that is not already used as a URN in
+    HubSpot or Famly (the caller does those reads; it may raise, and then nothing is
+    reserved). `floor` is the highest number seen outside the table."""
+    deal_id = str(deal_id)
+    for _ in range(100):
+        try:
+            held = urn_allocation_for_deal(deal_id)
+            if held is not None:
+                return held
+            number = first_free(max(urn_max_allocated(site_code), floor) + 1)
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
+                raise
+            time.sleep(0.05)            # another process holds the store for a moment
+            continue
+        try:
+            with _open() as connection:
+                connection.execute(
+                    "INSERT INTO onboard_urn_allocations (site_code, number, deal_id, job_id, state, created_at) "
+                    "VALUES (?, ?, ?, ?, 'allocated', ?)",
+                    (site_code, number, deal_id, job_id, _now()),
+                )
+            return site_code, number
+        except sqlite3.IntegrityError:
+            continue            # a number taken meanwhile, or this deal allocated: look again
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
+                raise
+            time.sleep(0.05)
+    raise RuntimeError("urn allocation did not settle")
+
+
+def mark_urn_written(deal_id: str) -> None:
+    with _open() as connection:
+        connection.execute(
+            "UPDATE onboard_urn_allocations SET state = 'hubspot_written' WHERE deal_id = ?",
+            (str(deal_id),),
+        )
 
 
 def recover_in_flight() -> int:

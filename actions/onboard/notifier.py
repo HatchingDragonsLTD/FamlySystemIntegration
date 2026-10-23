@@ -57,6 +57,13 @@ def gate_text(
         f"Start date: {'present' if dates.get('firstDayPresent') else 'missing'} · "
         f"End date: {end_text}"
     )
+    urn = plan.get("urn") or {}
+    if urn.get("status") == "allocated":
+        lines.append(f"Child URN: a NEW URN will be assigned: {urn.get('urn')}. It is written to the "
+                     "HubSpot deal first, then used for the Famly child (not counted as a Famly write).")
+    elif urn.get("status") == "would_allocate":
+        lines.append(f"Child URN: a new URN would be assigned (next number {urn.get('nextNumber'):04d} "
+                     f"for site {urn.get('siteCode')}, not reserved yet).")
     if child.get("status") == "child_would_create":
         child_state = "would be created"
     elif child.get("origin") == "created_by_pipeline":

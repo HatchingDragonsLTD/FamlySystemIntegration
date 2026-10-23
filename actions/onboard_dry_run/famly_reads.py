@@ -61,6 +61,7 @@ class SiteChild:
     child_id: str
     birthday: str | None
     full_name: str
+    external_id: str | None = None      # the URN, for the returning-child guard (ids only)
 
 
 class FamlyReads:
@@ -78,6 +79,16 @@ class FamlyReads:
         if self._client is None:
             self._client = urn_runner._public_client()
         return self._client
+
+    def site_ids(self) -> list[str]:
+        """Every Famly institution id in the catalogue."""
+        return list(self._sites())
+
+    def urn_roster(self) -> list:
+        """The live roster (id, externalId, name), fetched once per instance."""
+        if self._urn_roster is None:
+            self._urn_roster = urn_runner.fetch_roster(self._public())
+        return self._urn_roster
 
     def _sites(self) -> list[str]:
         if self._site_ids is None:
@@ -152,6 +163,7 @@ class FamlyReads:
                         child_id=str(node["id"]),
                         birthday=(str(node["birthday"])[:10] if node.get("birthday") else None),
                         full_name=str(name.get("fullName") or "") if isinstance(name, dict) else "",
+                        external_id=str(node["externalId"]) if node.get("externalId") else None,
                     )
                 )
             cursor = listing.get("next") or None

@@ -28,6 +28,7 @@ from collections import Counter
 from typing import Any
 
 from actions.onboard_dry_run import bill_payers, derive, links
+from actions.onboard_dry_run import urn as urn_fmt
 from actions.onboard_dry_run.famly_reads import (
     FamlyReads,
     local_part,
@@ -67,9 +68,10 @@ class DryRun:
     """One invocation. Holds the per-run memoised reads (label map, stage names,
     live scans) so a batch of deals does each of them once."""
 
-    def __init__(self, hubspot: HubSpotClient, famly: FamlyReads):
+    def __init__(self, hubspot: HubSpotClient, famly: FamlyReads, urn_service=None):
         self._hubspot = hubspot
         self._famly = famly
+        self._urn_service = urn_service
         self._labels: links.LabelMap | None = None
         self._stages: dict[str, tuple[str, str]] | None = None
 
@@ -89,6 +91,7 @@ class DryRun:
         deal_id: str,
         context: dict | None = None,
         created_child_ids=None,
+        urn: dict | None = None,
     ) -> dict:
         """The dry-run plan for one deal. Never raises for a read failure: that
         becomes `status: error` so one bad deal cannot stop a batch.
@@ -108,7 +111,7 @@ class DryRun:
         plan: dict[str, Any] = {"dealId": deal_id, "holds": [], "warnings": []}
         context = context if context is not None else {}
         try:
-            self._plan(deal_id, plan, context, created_child_ids)
+            self._plan(deal_id, plan, context, created_child_ids, urn or {})
         except HubSpotError as exc:
             if exc.status_code == 404:
                 plan["holds"].append({"reason": DEAL_NOT_FOUND})
@@ -125,7 +128,7 @@ class DryRun:
         return plan
 
     def _plan(
-        self, deal_id: str, plan: dict, context: dict, created_child_ids=None
+        self, deal_id: str, plan: dict, context: dict, created_child_ids=None, urn: dict | None = None
     ) -> None:
         deal = self._hubspot.get_deal(deal_id)
         context["deal"] = deal
@@ -167,6 +170,7 @@ class DryRun:
             self._hubspot, self.labels(), deal_id
         )
         warnings.extend(quote_warnings)
+        self._urn(deal, deal_id, plan, urn or {})
 
         if plan["quotes"]["count"] == 0:
             warnings.append("no_quote")
@@ -174,6 +178,64 @@ class DryRun:
             plan["stage"]["depositAmount"] is None
         ):
             warnings.append("deposit_amount_missing")
+
+    def _urn(self, deal: dict, deal_id: str, plan: dict, options: dict) -> None:
+        """The child URN section (ONBOARD_URN_GENERATION). Never reserves a number unless the
+        WORKER asked it to (`options["allocate"]`, live mode only), and only when the plan has
+        no hold of any kind. `options`: allocate, skip_returning (`--new-urn`), job_id.
+
+        Statuses: existing | would_allocate | allocated | candidate_returning | site_unknown |
+        generation_off_missing | child_exists. A deal that already has a child_urn, in ANY
+        format, is `existing` and untouched. With the switch off a deal WITH a URN has no
+        `urn` key at all (the plan is exactly as before)."""
+        existing = (deal.get("child_urn") or "").strip()
+        if not urn_fmt.enabled():
+            if not existing:
+                plan["urn"] = {"status": urn_fmt.GENERATION_OFF_MISSING}
+            return
+        if existing:
+            plan["urn"] = {"status": urn_fmt.EXISTING}
+            return
+        child_status = plan["child"]["status"]
+        if child_status == CHILD_FOUND:
+            plan["urn"] = {"status": urn_fmt.CHILD_EXISTS}
+            return
+        if child_status != CHILD_WOULD_CREATE or not plan.get("siteCode"):
+            return                                   # another hold explains it; nothing to number
+
+        service = self._urn_service
+        if service is None:
+            from actions.onboard.urn_alloc import UrnService
+            service = self._urn_service = UrnService(self._hubspot, self._famly)
+        suffix = urn_fmt.site_suffix(plan["siteCode"])
+        if suffix is None:
+            plan["urn"] = {"status": urn_fmt.SITE_UNKNOWN}
+            plan["holds"].append({"reason": urn_fmt.SITE_CODE_UNKNOWN, "siteCode": plan["siteCode"]})
+            return
+
+        own = service.own(deal_id)
+        if own:
+            plan["urn"] = {"status": urn_fmt.ALLOCATED, "urn": own, "reserved": True}
+        else:
+            if not options.get("skip_returning"):
+                found = service.returning_candidates(deal, deal_id)
+                if found["childIds"] or found["dealIds"]:
+                    plan["urn"] = {"status": urn_fmt.CANDIDATE_RETURNING}
+                    plan["holds"].append({"reason": urn_fmt.POSSIBLY_RETURNING, **found})
+                    return
+            try:
+                if options.get("allocate") and not plan["holds"]:
+                    allocated = service.allocate(deal_id, options.get("job_id"), plan["siteCode"])
+                    plan["urn"] = {"status": urn_fmt.ALLOCATED, "urn": allocated, "reserved": True}
+                else:
+                    _suffix, number = service.peek(plan["siteCode"])
+                    plan["urn"] = {"status": urn_fmt.WOULD_ALLOCATE, "siteCode": suffix,
+                                   "nextNumber": number, "reserved": False}
+            except ValueError:
+                plan["urn"] = {"status": urn_fmt.SITE_UNKNOWN}
+                plan["holds"].append({"reason": "urn_sequence_exhausted"})
+                return
+        plan["warnings"][:] = [w for w in plan["warnings"] if w != "child_urn_missing"]
 
     def _bill_payer(self, plan: dict, context: dict) -> None:
         """The bill payer decision at PLAN time (ONBOARD_BILL_PAYER=on): the child's site
