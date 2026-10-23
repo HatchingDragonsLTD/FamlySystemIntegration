@@ -63,7 +63,8 @@ ACTION_ADJUST = "plan_adjust"
 # contacts in Famly". The button value is `<job_id>:<plan hash prefix>`.
 ACTION_ONBOARD_APPROVE = "onboard_approve"
 ACTION_ONBOARD_REJECT = "onboard_reject"
-ONBOARD_ACTIONS = (ACTION_ONBOARD_APPROVE, ACTION_ONBOARD_REJECT)
+ACTION_ONBOARD_RETRY = "onboard_retry"
+ONBOARD_ACTIONS = (ACTION_ONBOARD_APPROVE, ACTION_ONBOARD_REJECT, ACTION_ONBOARD_RETRY)
 
 # Interaction types Slack posts to the same endpoint.
 TYPE_BLOCK_ACTIONS = "block_actions"
@@ -855,15 +856,43 @@ def _onboard_blocks(text: str, value: str) -> list:
     ]
 
 
+def _onboard_retry_blocks(text: str, value: str) -> list:
+    """A hold notice: the text plus one Retry button carrying `value`."""
+    return [
+        {"type": "section", "text": {"type": "mrkdwn", "text": text}},
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Retry", "emoji": True},
+                    "action_id": ACTION_ONBOARD_RETRY,
+                    "value": value,
+                },
+            ],
+        },
+    ]
+
+
 def post_onboard_gate(text: str, value: str) -> str | None:
     """Post the onboarding approval request. Returns a message ref
     (`<channel>:<ts>`) when Slack accepted it, else None. Never raises."""
+    return _post_onboard_blocks(text, _onboard_blocks(text, value), "onboarding approval request")
+
+
+def post_onboard_hold(text: str, value: str) -> str | None:
+    """Post a hold notice with a Retry button. Same posting and failure rules as the
+    approval request. Returns a message ref or None. Never raises."""
+    return _post_onboard_blocks(text, _onboard_retry_blocks(text, value), "onboarding hold notice")
+
+
+def _post_onboard_blocks(text: str, blocks: list, label: str) -> str | None:
     import os
 
     token = os.environ.get("SLACK_BOT_TOKEN", "").strip()
     channel = os.environ.get("SLACK_CHANNEL_ID", "").strip()
     if not token or not channel:
-        logger.warning("Slack not configured; dropping onboarding approval request")
+        logger.warning("Slack not configured; dropping %s", label)
         return None
     try:
         response = requests.post(
@@ -872,15 +901,15 @@ def post_onboard_gate(text: str, value: str) -> str | None:
                 "Authorization": f"Bearer {token}",
                 "Content-Type": "application/json; charset=utf-8",
             },
-            json={"channel": channel, "text": text, "blocks": _onboard_blocks(text, value)},
+            json={"channel": channel, "text": text, "blocks": blocks},
             timeout=POST_TIMEOUT,
         )
         body = response.json()
     except Exception as exc:  # noqa: BLE001 - Slack must never break the caller
-        logger.warning("Slack post failed (onboarding approval): %s", type(exc).__name__)
+        logger.warning("Slack post failed (%s): %s", label, type(exc).__name__)
         return None
     if response.status_code != 200 or not body.get("ok"):
-        logger.warning("Slack rejected the onboarding approval request: %s", body.get("error"))
+        logger.warning("Slack rejected the %s: %s", label, body.get("error"))
         return None
     return f"{body.get('channel') or channel}:{body.get('ts') or ''}"
 

@@ -386,6 +386,20 @@ def transition(job_id: str, from_status: str, to_status: str, **fields) -> bool:
     return cursor.rowcount == 1
 
 
+def consume_hold_nonce(job_id: str, nonce: str) -> bool:
+    """Spend a held job's Retry nonce: atomic, so only ONE press can win. True only if
+    the job is still `held` and the nonce is still the one of the notice pressed."""
+    if not nonce:
+        return False
+    with _open() as connection:
+        cursor = connection.execute(
+            "UPDATE onboard_jobs SET approval_nonce = NULL, updated_at = ? "
+            "WHERE id = ? AND status = ? AND approval_nonce = ?",
+            (_now(), job_id, HELD, nonce),
+        )
+    return cursor.rowcount == 1
+
+
 def begin_approval_wait(job_id: str, claimed_at: str | None, plan_hash: str, nonce: str,
                         sections: dict | None = None, reask: bool = False) -> bool:
     """Move a job to `awaiting_approval` ONLY if it is still `queued` and still held

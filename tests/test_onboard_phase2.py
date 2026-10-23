@@ -2182,3 +2182,130 @@ class ContactLagTests(Phase2Case):
         self.assertEqual(result["status"], store.DONE)
         self.assertEqual(self.job().outcomes, ["c1:created", "c2:created"])
         self.assertEqual(len(self.famly.contact_creates), 2)
+
+
+class RetryButtonTests(Phase2Case):
+    """The Retry button on a hold notice (ids and codes only)."""
+
+    def setUp(self):
+        super().setUp()
+        self.holds = []
+        self.notify.hold_notice = lambda text, job_id, nonce: self.holds.append((text, job_id, nonce)) or True
+        self.hub.deals[DEAL]["location_of_interest"] = "Shoreditch"      # a hold: site_unmapped
+
+    def held_job(self):
+        self.enqueue()
+        result = self.run_worker()
+        self.assertEqual(result["status"], store.HELD)
+        return self.job()
+
+    def press(self, job, nonce=None):
+        value = approval.button_value(job.id, "", nonce if nonce is not None else self.holds[-1][2])
+        return approval.handle_click(slack.ACTION_ONBOARD_RETRY, value, "U1")
+
+    def new_jobs(self):
+        return [j for j in (store.latest_for_deal(DEAL),) if j and j.status == store.QUEUED]
+
+    def test_a_hold_notice_carries_the_button_and_says_to_fix_the_deal_first(self):
+        self.held_job()
+        self.assertEqual(len(self.holds), 1)
+        self.assertIn("Fix the deal in HubSpot first, then press Retry.", self.holds[0][0])
+        self.assertEqual(self.notify.notices, [])           # the one hold notice IS the button message
+
+    def test_other_notices_and_config_holds_have_no_button(self):
+        self.mode("live", allowed="999")                    # not allowlisted: a config hold
+        self.enqueue()
+        self.run_worker()
+        self.assertEqual(self.holds, [])
+        self.assertTrue(self.notify.notices)
+        self.assertNotIn("Retry", self.notify.notices[-1])
+
+    def test_a_valid_press_enqueues_one_fresh_job_and_a_second_press_does_nothing(self):
+        held = self.held_job()
+        self.hub.deals[DEAL]["location_of_interest"] = "Westminster"       # fixed in HubSpot
+        self.assertEqual(self.press(held), approval.MSG_RETRY_QUEUED)
+        fresh = store.latest_for_deal(DEAL)
+        self.assertNotEqual(fresh.id, held.id)
+        self.assertEqual(fresh.status, store.QUEUED)
+        self.assertEqual(self.press(held), approval.MSG_RETRY_HANDLED)      # same notice again
+        self.assertEqual(store.latest_for_deal(DEAL).id, fresh.id)          # still one fresh job
+        # It does not skip Gate A: the fresh job posts its own approval request.
+        self.assertEqual(self.run_worker()["status"], store.AWAITING_APPROVAL)
+        self.assertEqual(len(self.notify.gates), 1)
+        self.assertEqual(len(self.famly.child_creates), 0)                  # nothing written before approval
+
+    def test_a_press_while_a_job_for_the_deal_is_live_is_a_no_op(self):
+        held = self.held_job()
+        live = store.enqueue(DEAL, config.mode()).job                       # someone enqueued by hand
+        self.assertEqual(self.press(held), approval.MSG_RETRY_BUSY)
+        self.assertEqual(store.latest_for_deal(DEAL).id, live.id)
+
+    def test_a_stale_or_wrong_nonce_is_rejected(self):
+        held = self.held_job()
+        self.assertEqual(self.press(held, nonce="not-the-nonce"), approval.MSG_RETRY_STALE)
+        self.assertEqual(store.get(held.id).status, store.HELD)
+        self.assertIsNone(store.active_for_deal(DEAL))
+
+    def test_the_mode_and_allowlist_checks_of_onboard_enqueue_apply(self):
+        held = self.held_job()
+        self.mode("off")
+        self.assertEqual(self.press(held), approval.MSG_RETRY_OFF)
+        self.mode("live", allowed="999")
+        self.assertEqual(self.press(held), approval.MSG_RETRY_NOT_ALLOWED)
+        self.assertIsNone(store.active_for_deal(DEAL))                       # nonce not spent
+        self.mode("live")
+        self.assertEqual(self.press(held), approval.MSG_RETRY_QUEUED)
+
+    def test_the_log_line_carries_ids_and_codes_only(self):
+        held = self.held_job()
+        self.press(held)
+        lines = [l for l in self.logs if "ONBOARD RETRY" in l or "ONBOARD CLICK" in l]
+        self.assertTrue(any(f"job={held.id}" in l and f"deal={DEAL}" in l and "result=created" in l for l in lines))
+
+
+class RetryOverHttpTests(Phase2Case):
+    """The press arrives through the existing signed interactivity route."""
+
+    SECRET = "test-signing-secret"
+
+    def setUp(self):
+        super().setUp()
+        os.environ["SLACK_SIGNING_SECRET"] = self.SECRET
+        self.addCleanup(os.environ.pop, "SLACK_SIGNING_SECRET", None)
+        import server
+        self.client = server.app.test_client()
+        self.hub.deals[DEAL]["location_of_interest"] = "Shoreditch"
+        self.holds = []
+        self.notify.hold_notice = lambda text, job_id, nonce: self.holds.append((job_id, nonce)) or True
+        self.enqueue()
+        self.assertEqual(self.run_worker()["status"], store.HELD)
+        self.held = self.job()
+
+    def post(self, secret):
+        import hashlib
+        import hmac
+        import time
+        from urllib.parse import urlencode
+        payload = {"type": "block_actions", "user": {"id": "U1"}, "response_url": "https://hooks.invalid/x",
+                   "actions": [{"action_id": slack.ACTION_ONBOARD_RETRY,
+                                "value": approval.button_value(self.held.id, "", self.holds[-1][1])}]}
+        body = urlencode({"payload": json.dumps(payload)})
+        stamp = str(int(time.time()))
+        digest = hmac.new(secret.encode(), f"v0:{stamp}:{body}".encode(), hashlib.sha256).hexdigest()
+        return self.client.post("/slack/interactivity", data=body, headers={
+            "X-Slack-Request-Timestamp": stamp, "X-Slack-Signature": f"v0={digest}",
+            "Content-Type": "application/x-www-form-urlencoded"})
+
+    def test_a_forged_signature_is_rejected_and_nothing_is_enqueued(self):
+        response = self.post("some-other-secret")
+        self.assertEqual(response.status_code, 401)
+        self.assertIsNone(store.active_for_deal(DEAL))
+        self.assertEqual(store.get(self.held.id).approval_nonce, self.holds[-1][1])   # nonce unspent
+
+    def test_a_signed_press_enqueues_once_and_retires_the_buttons(self):
+        with mock.patch.object(slack, "update_message") as update:
+            self.assertEqual(self.post(self.SECRET).status_code, 200)
+            self.assertEqual(self.post(self.SECRET).status_code, 200)       # a second press
+        self.assertEqual(update.call_args_list[0].args[1], approval.MSG_RETRY_QUEUED)
+        self.assertEqual(update.call_args_list[1].args[1], approval.MSG_RETRY_HANDLED)
+        self.assertEqual(store.active_for_deal(DEAL).status, store.QUEUED)

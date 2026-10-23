@@ -752,10 +752,23 @@ def _create_one(job, deps, famly, contact, child_id, target, matches) -> tuple[s
 # --------------------------------------------------------------------------- #
 # Ending a job
 # --------------------------------------------------------------------------- #
+# A hold the person cannot fix in HubSpot (configuration): no Retry button.
+NO_RETRY_HOLDS = ("deal_not_allowlisted",)
+
+
 def _held(job, deps, reasons: list[str], write_back: bool) -> None:
-    store.set_status(job.id, store.HELD, last_error_code=",".join(reasons), outcomes=reasons)
-    deps.notifier.notice(notifier_mod.notice_text(
-        job.deal_id, "Onboarding did not start. Nothing was created in Famly.", reasons))
+    retry = hasattr(deps.notifier, "hold_notice") and not set(reasons) & set(NO_RETRY_HOLDS)
+    nonce = secrets.token_hex(8) if retry else None      # the current notice's Retry nonce
+    store.set_status(job.id, store.HELD, last_error_code=",".join(reasons), outcomes=reasons,
+                     approval_nonce=nonce)
+    headline = "Onboarding did not start. Nothing was created in Famly."
+    if retry:
+        headline += " Fix the deal in HubSpot first, then press Retry."
+    text = notifier_mod.notice_text(job.deal_id, headline, reasons)
+    if retry:
+        deps.notifier.hold_notice(text, job.id, nonce)
+    else:
+        deps.notifier.notice(text)
     if write_back:
         # Best effort, one property per request: a held deal is visible in HubSpot too,
         # and a HubSpot problem is only ever reported, never an error here.
