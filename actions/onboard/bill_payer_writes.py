@@ -244,8 +244,13 @@ def _verified(payers, email_key: str, child_id: str, expect_id: str | None) -> s
     return payer.id if scan_mod.lists_child_at(payer, child_id, MULTIPLIER) else None
 
 
+def _single_read(fn):
+    """The default read-back: one read (the worker passes the bounded-retry lookup)."""
+    return fn(), True
+
+
 def run_stage(*, public, scan, contacts, approved: dict, site_id: str, child_id: str,
-              sleep=time.sleep) -> StageResult:
+              sleep=time.sleep, lookup=_single_read) -> StageResult:
     """The bill payer stage for one deal. `scan()` returns the site's live payers (a fresh
     read each call) or None if it failed; `approved` is the plan's `billPayer` section."""
     approved_decision = scan_mod.Decision(
@@ -298,8 +303,21 @@ def run_stage(*, public, scan, contacts, approved: dict, site_id: str, child_id:
     extra += warnings
 
     if sent.clean:
-        # Read back with one scan and verify.
-        found = _verified(scan(), email_key, child_id, expect_id)
+        # Read back and verify, reading again (reads only) while the scan lags.
+        def read_back() -> list:
+            payers = scan()
+            if payers is None:
+                raise RuntimeError("scan_failed")         # could not read, never "not found"
+            same = [p.id for p in payers if p.email == email_key]
+            if len(same) > 1:
+                return same                               # not lag: stop at once
+            found_id = _verified(payers, email_key, child_id, expect_id)
+            return [found_id] if found_id else []
+        try:
+            ids, _readable = lookup(read_back)
+        except Exception:  # noqa: BLE001 - an unreadable read-back is a mismatch report
+            ids = []
+        found = ids[0] if len(ids) == 1 else None
         if found:
             return StageResult(success_code, found, extra, decision.differs, sent=True)
         return StageResult(scan_mod.READBACK_MISMATCH, sent.bill_payer_id, extra, sent=True)

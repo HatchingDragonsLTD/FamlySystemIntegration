@@ -440,7 +440,8 @@ def _bill_payer_stage(job, deps, plan, context, child: "ChildResult"):
         result = bill_payer_writes.run_stage(
             public=deps.public, scan=lambda: deps.famly().bill_payers(site_id),
             contacts=context["contacts"], approved=plan["billPayer"], site_id=site_id,
-            child_id=child.child_id, sleep=deps.sleep)
+            child_id=child.child_id, sleep=deps.sleep,
+            lookup=lambda fn: _lookup_with_settle(job, deps, fn, label="bill_payer_readback"))
     except Exception as exc:  # noqa: BLE001 - one stage must never stop the job's end
         logger.error("onboard: bill payer stage hit %s", type(exc).__name__)
         result = bill_payer_writes.StageResult(bill_payer_scan.OUTCOME_UNKNOWN)
@@ -532,11 +533,11 @@ def _lookup_with_settle(job, deps, fn: Callable[[], list],
             if len(ids) > 1:
                 return ids, True
             if (expect in ids) if expect else bool(ids):
-                return ids, True
                 if attempt > 1:
                     # How long the lag lasts: ids and counts only.
                     logger.info("onboard: lookup settled after retries job=%s deal=%s lookup=%s "
                                 "attempts=%d count=%d", job.id, job.deal_id, label, attempt, len(ids))
+                return ids, True
         if attempt < attempts:
             deps.sleep(LOOKUP_RETRY_WAITS[attempt - 1])
     logger.warning("onboard: lookup did not settle job=%s deal=%s lookup=%s attempts=%d "
@@ -719,7 +720,7 @@ def _create_contacts(
     return outcomes, warnings, all_ok
 
 
-def _create_one(deps, famly, contact, child_id, target, matches) -> tuple[str, list[str], int]:
+def _create_one(job, deps, famly, contact, child_id, target, matches) -> tuple[str, list[str], int]:
     """Create one contact. Returns (outcome code, warning codes, create requests sent)."""
     try:
         payload, contact_warnings = inputs.build_contact_input(contact, child_id)
@@ -732,14 +733,19 @@ def _create_one(deps, famly, contact, child_id, target, matches) -> tuple[str, l
         # An error status or `errors` does not mean it did not run: look with the
         # existing present-check. Found exactly once = it was created; nothing found =
         # only now is a rejection reported. Never sent again.
-        found = len(matches(famly.child_contacts(child_id), target))
+        # Reads only, with the search-lag retries; an unreadable lookup is never "found 0".
+        rows, readable = _lookup_with_settle(
+            job, deps, lambda: matches(famly.child_contacts(child_id), target), label="contact_settle")
+        found = len(rows)
         if found != 1:
-            if found == 0 and isinstance(exc, famly_writes.CreateRejected):
+            if found == 0 and readable and isinstance(exc, famly_writes.CreateRejected):
                 return exc.code, contact_warnings, 1
             return UNKNOWN_OUTCOME, contact_warnings, 1
 
     # Read-back: exactly once on the child, with the expected email.
-    if len(matches(famly.child_contacts(child_id), target)) != 1:
+    rows, _readable = _lookup_with_settle(
+        job, deps, lambda: matches(famly.child_contacts(child_id), target), label="contact_readback")
+    if len(rows) != 1:
         return "readback_failed", contact_warnings, 1
     return CREATED, contact_warnings, 1
 

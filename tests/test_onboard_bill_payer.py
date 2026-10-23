@@ -63,12 +63,13 @@ class BPFamly(FakeFamly):
             return self._write(query_path, variables, operation_name)
         return super().execute(query_path, variables, operation_name)
 
-    @staticmethod
-    def node(payer):
+    def node(self, payer):
         return {"billPayerId": payer["id"], "email": payer["email"],
                 "deletedAt": "2026-01-01T00:00:00Z" if payer["deleted"] else None,
                 "children": [{"childId": c, "share": {"multiplier": m}}
-                             for c, m in payer["children"].items()], **payer.get("details", {})}
+                             for c, m in payer["children"].items()
+                             if self.scans > payer.get("children_visible_after", 0)],
+                **payer.get("details", {})}
 
     def _scan(self, variables):
         self.scans += 1
@@ -115,6 +116,8 @@ class BPFamly(FakeFamly):
         for entry in entries:
             payer = next(p for p in self.payers if p["id"] == entry["billPayerId"])
             payer["children"][entry["childId"]] = self.stored_multiplier or entry["share"]["multiplier"]
+            if self.lag_scans:
+                payer["children_visible_after"] = self.scans + self.lag_scans
         if self.add_after_error:
             raise self.add_after_error
         return {"data": {"billPayers": {"addChildren": [
@@ -521,6 +524,26 @@ class SendOnceTests(BPCase):
         self.assertEqual(result["status"], store.DONE)
         self.assertIn("bill_payer_created", self.final_notice())
         self.assertEqual(self.job().bill_payer_id, "bp-1")
+
+    def test_a_clean_create_is_read_back_again_while_the_scan_lags(self):
+        self.famly.lag_scans = 2                  # not visible to the first two read-back scans
+        result = self.run_through()
+        self.assertEqual(result["status"], store.DONE)
+        self.assertEqual(self.famly.ops(), [bpw.CREATE_OP])           # one create, never resent
+        self.assertIn("bill_payer_created", self.final_notice())
+
+    def test_a_clean_create_that_never_shows_is_a_readback_mismatch_after_five_reads(self):
+        self.famly.lag_scans = 99
+        self.run_through()
+        self.assertEqual(self.famly.ops(), [bpw.CREATE_OP])
+        self.assertIn("bill_payer_readback_mismatch", self.codes())
+
+    def test_a_clean_attach_is_read_back_again_while_the_scan_lags(self):
+        self.famly.payers.append(payer(self.email, {}, pid="the-one"))
+        self.famly.lag_scans = 2
+        result = self.run_through()
+        self.assertEqual(self.famly.ops(), [bpw.ADD_CHILDREN_OP])
+        self.assertEqual(result["status"], store.DONE)
 
     def test_a_partial_response_that_cannot_be_verified_is_never_called_a_success(self):
         self.famly.lag_scans = 99                                    # never visible to the rescans

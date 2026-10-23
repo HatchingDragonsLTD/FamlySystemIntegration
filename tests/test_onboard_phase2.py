@@ -130,6 +130,8 @@ class FakeFamly:
         self.blind_after_create = False   # the next by-deal-id lookup finds nothing
         self.post_create_script = None    # (n, ids) -> ids, or raises: by-deal-id lookups AFTER a create
         self.post_create_lookups = 0
+        self.contact_list_script = None   # (n, rows) -> rows; n counts contact lists since the last contact create
+        self.contact_lists_since_create = 0
         self.after_first = {}     # operation -> callable run after its FIRST call
         self._n = 0
 
@@ -165,6 +167,7 @@ class FakeFamly:
             if self.contact_effect:
                 self.contact_effect(payload)
             self.events.append("contact_create")
+            self.contact_lists_since_create = 0
             contact_id = self._new_id("contact")
             if not self.hide_created_contacts:
                 self.contacts[payload["childIds"][0]].append((contact_id, payload["email"]))
@@ -194,6 +197,9 @@ class FakeFamly:
 
         if operation_name == "OnboardChildContacts":
             rows = self.contacts.get(variables["childIds"][0], [])
+            self.contact_lists_since_create += 1
+            if self.contact_list_script:
+                rows = self.contact_list_script(self.contact_lists_since_create, rows)
             return {"data": {"contacts": {"list": {
                 "result": [{"id": i, "email": e} for i, e in rows], "next": None}}}}
 
@@ -2113,3 +2119,66 @@ class SearchLagTests(Phase2Case):
         self.run_through()
         self.assertEqual([l for l in self.logs if "settled after retries" in l], [])
 
+
+class ContactLagTests(Phase2Case):
+    """The contact read-back and settle read again while Famly's contacts.list lags."""
+
+    def hide_first_contact(self, until):
+        first = []
+
+        def script(n, rows):
+            if not first and self.famly.contact_creates:
+                first.append(self.famly.contact_creates[0]["email"])
+            if len(self.famly.contact_creates) == 1 and n <= until:
+                return [r for r in rows if r[1] != first[0]]
+            return rows
+        self.famly.contact_list_script = script
+
+    def test_lag_then_found_is_created_and_sent_once(self):
+        self.hide_first_contact(2)
+        result = self.run_through()
+        self.assertEqual(result["status"], store.DONE)
+        self.assertEqual(self.job().outcomes, ["c1:created", "c2:created"])
+        self.assertEqual(len(self.famly.contact_creates), 2)
+        self.assertEqual(self.sleeps, [1, 2])
+
+    def test_always_empty_is_readback_failed_after_five_reads_and_sent_once(self):
+        self.hide_first_contact(99)
+        result = self.run_through()
+        self.assertEqual(self.job().outcomes[0], "c1:readback_failed")
+        self.assertEqual(result["status"], store.NEEDS_REVIEW)
+        self.assertEqual(self.sleeps, [1, 2, 4, 8])
+        self.assertEqual(len([p for p in self.famly.contact_creates]), 2)   # c1 once, c2 once
+
+    def test_a_read_that_raises_then_succeeds_is_created(self):
+        def script(n, rows):
+            if self.famly.contact_creates and len(self.famly.contact_creates) == 1 and n <= 2:
+                raise GraphQLHTTPError("down", 503, "")
+            return rows
+        self.famly.contact_list_script = script
+        self.assertEqual(self.run_through()["status"], store.DONE)
+        self.assertEqual(len(self.famly.contact_creates), 2)
+
+    def test_two_matches_stop_at_once(self):
+        def script(n, rows):
+            if len(self.famly.contact_creates) == 1:
+                return rows + [(f"{cid}-dup", mail) for cid, mail in rows]
+            return rows
+        self.famly.contact_list_script = script
+        self.run_through()
+        self.assertEqual(self.job().outcomes[0], "c1:readback_failed")
+        self.assertEqual(self.sleeps, [])                          # not lag: no retries
+
+    def test_settle_after_a_rejection_waits_for_the_lag_and_never_resends(self):
+        first = {"done": False}
+
+        def land_then_fail(payload):
+            if not first["done"]:
+                first["done"] = True
+                return GraphQLHTTPError("bad", 400, "{}")
+        self.famly.contact_land_then_raise = land_then_fail
+        self.hide_first_contact(1)
+        result = self.run_through()
+        self.assertEqual(result["status"], store.DONE)
+        self.assertEqual(self.job().outcomes, ["c1:created", "c2:created"])
+        self.assertEqual(len(self.famly.contact_creates), 2)
