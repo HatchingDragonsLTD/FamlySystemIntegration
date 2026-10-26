@@ -21,6 +21,7 @@ from actions.onboard import cli_enqueue as onboard_enqueue
 from actions.onboard import cli_phone_audit as onboard_phone_audit
 from actions.onboard import cli_status as onboard_status
 from actions.onboard import cli_worker as onboard_worker
+from actions.onboard_audit import cli as onboard_audit
 from actions.onboard_dry_run import cli as onboard_dry_run
 from actions.plan_write import cli as plan_write
 from actions.probe_bill_payers import cli as probe_bill_payers
@@ -67,6 +68,7 @@ ACTIONS = [
     onboard_worker,
     onboard_status,
     onboard_phone_audit,
+    onboard_audit,
     probe_contact_create,
     probe_bill_payers,
     probe_child_create,

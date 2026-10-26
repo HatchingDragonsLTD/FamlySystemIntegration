@@ -1,0 +1,47 @@
+# READ-ONLY. One site's children (past and future included) with what the onboarding audit
+# compares against HubSpot, plus each child's contacts (id, email, emergency flag, RELATION).
+# Values are held in memory and compared there; they are never printed, logged or stored.
+query AuditSiteChildren(
+  $siteIds: [SiteId!]!
+  $next: ChildCursor
+  $timeRange: NonEmptyLocalDateRangeInput
+) {
+  children {
+    listBySiteIds(siteIds: $siteIds, nextToken: $next, timeRange: $timeRange) {
+      result {
+        id
+        externalId
+        birthday
+        name {
+          firstName
+          lastName
+          fullName
+        }
+        currentGroup {
+          id
+        }
+        sitesRelation {
+          firstDay
+          lastDay
+          site {
+            siteId
+          }
+        }
+        externalSystemsReferences {
+          foreignId
+          system
+        }
+        contacts {
+          id
+          email
+          emergencyContact
+          records(keys: [RELATION]) {
+            key
+            value
+          }
+        }
+      }
+      next
+    }
+  }
+}

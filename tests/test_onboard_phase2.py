@@ -119,6 +119,8 @@ class FakeHub(FakeHubSpot):
                     return False
                 if f["operator"] == "EQ" and have.casefold() != str(f["value"]).casefold():
                     return False
+                if f["operator"] == "IN" and have not in [str(v) for v in f["values"]]:
+                    return False
             return True
         return [{"id": str(i), **{p: d.get(p) for p in properties}}
                 for i, d in self.deals.items() if ok(d)]
