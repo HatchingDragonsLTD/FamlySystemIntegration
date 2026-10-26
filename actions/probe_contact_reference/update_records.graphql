@@ -1,0 +1,9 @@
+# ONE-OFF PROBE WRITE 2 of 3. The schema's single-field `records` argument ("Update just the
+# record field"): it can touch no other field of the contact.
+mutation ProbeRefUpdateRecords($records: [ContactUpdateRecord!]) {
+  contacts {
+    update(records: $records) {
+      id
+    }
+  }
+}

@@ -1,0 +1,11 @@
+# READ-ONLY. ContactQueries.listByExternalSystemReference: contacts carrying a reference.
+query ProbeRefLookup($foreignId: String!, $system: String!) {
+  contacts {
+    listByExternalSystemReference(foreignId: $foreignId, system: $system) {
+      result {
+        id
+      }
+      next
+    }
+  }
+}
