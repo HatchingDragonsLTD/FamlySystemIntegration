@@ -53,6 +53,14 @@ DEAL_PROPERTIES = (
     "location_of_interest",
     "deposit_amount",
     "famly_childid",
+    # The booked slot per weekday ("morning" / "afternoon" / "full day", empty = not booked) and
+    # the expected fees; read by onboard-audit to compare a child's plan with the deal.
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "billable_fees",
 )
 # Child name properties, used ONLY for the in-memory possible-duplicate check
 # before a child would be created; never printed or logged. THE INTERNAL NAMES

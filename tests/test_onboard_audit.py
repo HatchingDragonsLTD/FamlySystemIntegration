@@ -59,9 +59,17 @@ class FakeGql:
         raise AssertionError(f"unexpected operation {operation_name}")
 
 
+def good_plan(**over):
+    plan = {"id": "pl1", "from": "2026-01-15", "to": None, "monthlyEstimate": 1050,
+            "planParts": [{"sessionBookings": [{"sessionId": "s-m", "day": "MONDAY"},
+                                               {"sessionId": "s-f", "day": "TUESDAY"}]}]}
+    plan.update(over)
+    return plan
+
+
 class FakeRest:
     def __init__(self):
-        self.plans = {"c1": [{"id": "pl1", "from": "2026-01-15", "to": None}]}
+        self.plans = {"c1": [good_plan()]}
         self.paths = []
 
     def get(self, path, params=None):
@@ -74,6 +82,16 @@ class AuditCase(Phase2Case):
         super().setUp()
         self.hub.stages["s-left"] = ("Operations", "Left Nursery")
         self.gql, self.rest = FakeGql(), FakeRest()
+        import os
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name, "sessions.json")
+        path.write_text(json.dumps({"institutions": {"HDWEST": {
+            "non_funded": {"morning": "s-m", "afternoon": "s-a", "full_day": "s-f"},
+            "funded": {"neither": {"morning": "f-m", "afternoon": "f-a", "full_day": "f-f"}}}}}), encoding="utf-8")
+        os.environ["SESSION_CATALOGUE_FILE"] = str(path)
+        self.addCleanup(os.environ.pop, "SESSION_CATALOGUE_FILE", None)
+        self.hub.deals[DEAL].update(monday="morning", tuesday="Full Day", billable_fees="1000")
         self.hub.calls_made = 0
 
     def audit(self, **kwargs):
@@ -91,7 +109,7 @@ class AuditCase(Phase2Case):
 class CodeTests(AuditCase):
     def test_a_matching_child_has_no_codes(self):
         summary, rows = self.audit()
-        self.assertEqual(rows[0].codes, [])
+        self.assertEqual(rows[0].codes, ["plan_matches"])
         self.assertEqual((rows[0].found_via, rows[0].child_id, rows[0].site_code, rows[0].stage),
                          ("deal_reference", "c1", "HDWEST", "Deposit Pending"))
         self.assertEqual(summary["childrenFoundBy"], {"deal_reference": 1})
@@ -159,15 +177,60 @@ class CodeTests(AuditCase):
                 self.gql.payers = payers
                 self.assertIn(code, self.codes())
 
-    def test_plan_codes_come_from_the_existing_plans_only(self):
+    def test_plan_missing_and_overlap_come_from_the_existing_plans(self):
         self.rest.plans = {"c1": []}
         self.assertEqual(self.codes(), ["plan_missing"])
-        self.rest.plans = {"c1": [{"id": "a", "from": "2026-01-15", "to": "2026-09-01"},
-                                  {"id": "b", "from": "2026-06-01", "to": None}]}
-        self.assertEqual(self.codes(), ["plan_overlap_or_duplicate"])
-        self.rest.plans = {"c1": [{"id": "a", "from": "2026-01-15", "to": "2026-09-01"},
-                                  {"id": "b", "from": "2026-09-01", "to": None}]}       # `to` is exclusive: no overlap
-        self.assertEqual(self.codes(), [])
+        self.rest.plans = {"c1": [good_plan(to="2026-09-01"), good_plan(id="b", **{"from": "2026-06-01"})]}
+        self.assertIn("plan_overlap_or_duplicate", self.codes())
+        self.rest.plans = {"c1": [good_plan(to="2026-09-01"), good_plan(id="b", **{"from": "2026-09-01"})]}
+        self.assertNotIn("plan_overlap_or_duplicate", self.codes())      # `to` is exclusive
+
+    def test_a_plan_that_matches_the_deal(self):
+        self.assertEqual(self.codes(), ["plan_matches"])
+
+    def test_each_plan_difference(self):
+        cases = {
+            "plan_dates_differ": good_plan(**{"from": "2026-02-02"}),
+            "plan_sessions_differ": good_plan(planParts=[{"sessionBookings": [
+                {"sessionId": "s-a", "day": "MONDAY"}, {"sessionId": "s-f", "day": "TUESDAY"}]}]),
+            "plan_fees_differ": good_plan(monthlyEstimate=2000),
+        }
+        for code, plan in cases.items():
+            with self.subTest(code=code):
+                self.rest.plans = {"c1": [plan]}
+                codes = self.codes()
+                self.assertIn("plan_differs", codes)
+                self.assertIn(code, codes)
+        self.rest.plans = {"c1": [good_plan(to="2026-12-31")]}             # the deal has no end date
+        self.assertIn("plan_dates_differ", self.codes())
+        self.hub.deals[DEAL]["end_date"] = "2026-12-31"
+        self.rest.plans = {"c1": [good_plan(to="2027-01-01")]}
+        self.assertNotIn("plan_dates_differ", self.codes())
+        self.rest.plans = {"c1": [good_plan(monthlyEstimate=1090)]}        # within 10% of billable_fees
+        self.assertNotIn("plan_fees_differ", self.codes())
+
+    def test_not_derivable_names_the_missing_input_class(self):
+        deal = self.hub.deals[DEAL]
+        for key, code in (("monday", None), ("billable_fees", "plan_input_fees_missing"),
+                          ("actual_start_date_1", "plan_input_dates_missing")):
+            with self.subTest(missing=key):
+                before = deal[key]
+                deal[key] = ""
+                if key == "monday":
+                    deal["tuesday"] = ""
+                    code = "plan_input_sessions_missing"
+                codes = self.codes()
+                self.assertIn(code, codes)
+                self.assertTrue("plan_not_derivable" in codes or "plan_differs" in codes)
+                deal[key] = before
+                deal["tuesday"] = "Full Day"
+        deal["monday"] = "whenever"
+        self.assertIn("plan_input_sessions_missing", self.codes())
+
+    def test_a_site_missing_from_the_session_catalogue_is_a_gap_not_a_difference(self):
+        import os
+        Path(os.environ["SESSION_CATALOGUE_FILE"]).write_text('{"institutions": {}}', encoding="utf-8")
+        self.assertIn("plan_session_catalogue_gap", self.codes())
 
     def test_a_deal_with_no_child_is_counted_and_not_audited_further(self):
         self.gql.children = []

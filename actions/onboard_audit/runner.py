@@ -23,7 +23,10 @@ WHAT IS COMPARED (codes):
             bill_payer_scan_failed   (skipped for child-only stages)
   plans     plan_missing, plan_overlap_or_duplicate
 
-NOT BUILT (needs guidance): comparing the plans with the plan HubSpot implies. See docs/status.md.
+            plan_matches | plan_differs (+ plan_dates_differ, plan_sessions_differ, plan_fees_differ) |
+            plan_not_derivable (+ plan_input_dates_missing, plan_input_sessions_missing,
+            plan_input_fees_missing, plan_session_catalogue_gap): the expected plan is read from
+            the deal's own properties with NO preview request (see compare_plan)
 """
 
 import csv
@@ -330,17 +333,132 @@ def _end_of(value: str | None) -> str:
     return value or "9999-12-31"
 
 
-def plan_codes(result) -> list[str]:
-    """From the child's EXISTING plans only: none at all, or plans that overlap or repeat each
-    other (Famly's plan `to` is exclusive; an open end counts as far in the future)."""
+# How close the plan's current monthly estimate must be to the deal's `billable_fees`
+# (relative). billable_fees is "around what the fees should be", so this is a loose check.
+FEE_TOLERANCE = 0.10
+_DAY_KEYS = (("monday", "MONDAY"), ("tuesday", "TUESDAY"), ("wednesday", "WEDNESDAY"),
+             ("thursday", "THURSDAY"), ("friday", "FRIDAY"))
+
+
+def _slot_by_session(institution: str) -> dict[str, str]:
+    """Famly session id -> slot (morning / afternoon / full_day) for one institution, over every
+    funded variant and the non-funded branch of the local session catalogue. Raises
+    SessionCatalogueError when the institution is not in it."""
+    from integrations import session_catalogue as catalogue
+
+    entry = catalogue._find_institution((catalogue._read().get("institutions") or {}), institution)
+    if not isinstance(entry, dict):
+        raise catalogue.SessionCatalogueError("institution not in the session catalogue")
+    nodes = [entry.get("non_funded")] + list((entry.get("funded") or {}).values())
+    out: dict[str, str] = {}
+    for node in nodes:
+        for slot, uuid in (node or {}).items():
+            if uuid and slot in catalogue.VALID_SLOTS:
+                out[str(uuid)] = slot
+    return out
+
+
+def _booked(plan) -> list:
+    bookings = [b for part in plan.plan_parts for b in part.session_bookings]
+    return bookings or list(plan.session_bookings)
+
+
+def _number(value: Any) -> float | None:
+    try:
+        return float(str(value).replace(",", "").replace("£", "").strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def compare_plan(plans: list, deal: dict, institution: str | None, today=None) -> list[str]:
+    """Compare the child's existing plan with what the DEAL implies, as codes. No request is
+    made and nothing is previewed: the expected plan is read straight from the deal.
+
+      dates     the plan's `from` is `actual_start_date_1`, its exclusive `to` is the day after
+                the deal's `end_date` (open-ended when the deal has none);
+      sessions  the SET of (weekday, slot) from the deal's monday..friday properties, against the
+                plan's session bookings (a booking's slot is found from its session id in the
+                local session catalogue);
+      fees      the plan's current monthly estimate within FEE_TOLERANCE of `billable_fees`.
+
+    Codes: plan_matches | plan_differs + plan_dates_differ / plan_sessions_differ /
+    plan_fees_differ | plan_not_derivable + plan_input_dates_missing / plan_input_sessions_missing /
+    plan_input_fees_missing / plan_session_catalogue_gap."""
+    from actions.plan_write import hubspot_flatten
+    from integrations import session_catalogue as catalogue
+
+    try:
+        start = derive.parse_hubspot_date(deal.get("actual_start_date_1"))
+        last_day = derive.parse_hubspot_date(deal.get("end_date"))
+    except ValueError:
+        start = last_day = None
+    expected_from = start.isoformat() if start else None
+    # which of the child's plans: the one starting on the expected day, else the latest-starting
+    chosen = next((p for p in plans if str(p.from_ or "")[:10] == expected_from), None) \
+        or sorted(plans, key=lambda p: str(p.from_ or ""))[-1]
+
+    differs: list[str] = []
+    missing: list[str] = []
+
+    if expected_from is None:
+        missing.append("plan_input_dates_missing")
+    else:
+        expected_to = hubspot_flatten.exclusive_end(last_day.isoformat()) if last_day else None
+        if str(chosen.from_ or "")[:10] != expected_from or (str(chosen.to or "")[:10] or None) != expected_to:
+            differs.append("plan_dates_differ")
+
+    wanted = set()
+    unreadable = False
+    for key, enum in _DAY_KEYS:
+        slot = catalogue.normalise_slot(deal.get(key))
+        if not slot:
+            continue
+        if slot not in catalogue.VALID_SLOTS:
+            unreadable = True
+        wanted.add((enum, slot))
+    if not wanted or unreadable:
+        missing.append("plan_input_sessions_missing")
+    else:
+        try:
+            slots = _slot_by_session(institution or "")
+        except catalogue.SessionCatalogueError:
+            missing.append("plan_session_catalogue_gap")
+        else:
+            actual = {(str(b.day or "").upper(), slots.get(str(b.session_id), "?")) for b in _booked(chosen)}
+            if actual != wanted:
+                differs.append("plan_sessions_differ")
+
+    fees = _number(deal.get("billable_fees"))
+    if fees is None:
+        missing.append("plan_input_fees_missing")
+    else:
+        estimate = _number(chosen.current_monthly_estimate(today))
+        if estimate is None or abs(estimate - fees) > FEE_TOLERANCE * max(abs(fees), 1.0):
+            differs.append("plan_fees_differ")
+
+    if differs:
+        return ["plan_differs", *differs, *missing]
+    if missing:
+        return ["plan_not_derivable", *missing]
+    return ["plan_matches"]
+
+
+def plan_codes(result, deal: dict | None = None, institution: str | None = None, today=None) -> list[str]:
+    """From the child's EXISTING plans: none at all, plans that overlap or repeat each other
+    (Famly's plan `to` is exclusive; an open end counts as far in the future), and, given the
+    deal, the comparison with what the deal implies (`compare_plan`)."""
     plans = list(result.plans)
     if not plans:
         return ["plan_missing"]
+    codes: list[str] = []
     spans = sorted((str(p.from_ or "")[:10], _end_of(str(p.to or "")[:10] or None)) for p in plans)
     for (a_from, a_to), (b_from, b_to) in zip(spans, spans[1:]):
         if b_from < a_to:                    # the next plan starts before the previous one ends
-            return ["plan_overlap_or_duplicate"]
-    return []
+            codes.append("plan_overlap_or_duplicate")
+            break
+    if deal is not None:
+        codes += compare_plan(plans, deal, institution, today)
+    return codes
 
 
 # --------------------------------------------------------------------------- #
@@ -441,7 +559,7 @@ def run(hubspot, gql, rest, *, deal_ids: list[str] | None = None, operations: bo
                     row.codes += payer_codes(deal_contacts, payers_by_site[site_id], child.id)
 
         try:
-            row.codes += plan_codes(plans_runner.run(child.id, client=rest))
+            row.codes += plan_codes(plans_runner.run(child.id, client=rest), deal, row.site_code)
         except Exception as exc:  # noqa: BLE001 - one child's plan read must not stop the audit
             logger.warning("onboard-audit: plan read failed (%s)", type(exc).__name__)
             row.codes.append("plans_not_readable")
@@ -461,8 +579,8 @@ def summarise(rows: list[Row], hubspot, gql, rest) -> dict:
         "byStage": dict(sorted(Counter(r.stage or "unknown" for r in rows).items())),
         "requests": {"hubspot": getattr(hubspot, "calls", None), "famlyGraphql": getattr(gql, "calls", None),
                      "famlyRest": getattr(rest, "calls", None)},
-        "planComparison": "not_run: the expected plan is not derived (see docs/status.md); "
-                          "plan_missing and plan_overlap_or_duplicate come from the existing plans only",
+        "planComparison": "dates, sessions (monday..friday) and fees (billable_fees, within "
+                          f"{int(FEE_TOLERANCE * 100)}% of the current monthly estimate); no preview, no write",
     }
 
 
