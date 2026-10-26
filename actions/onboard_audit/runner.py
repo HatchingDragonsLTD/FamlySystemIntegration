@@ -34,6 +34,7 @@ import logging
 import re
 from collections import Counter
 from dataclasses import dataclass, field
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -182,7 +183,11 @@ class Index:
         self.children = children
         self.by_deal: dict[str, list[str]] = {}
         self.by_urn: dict[str, list[str]] = {}
+        self.contact_children: dict[str, set] = {}      # contact email -> the children it is on (memory only)
         for child in children.values():
+            for contact in child.contacts:
+                if contact.email:
+                    self.contact_children.setdefault(contact.email, set()).add(child.id)
             for system, foreign in child.references:
                 if system == "HUBSPOT" and foreign:
                     self.by_deal.setdefault(foreign.casefold(), []).append(child.id)
@@ -242,11 +247,13 @@ def child_codes(deal: dict, deal_id: str, stage: str | None, child: FamlyChild) 
     first = str(deal.get(hubspot_cfg.CHILD_NAME_PROPERTIES[0]) or "") if hubspot_cfg.CHILD_NAME_PROPERTIES else ""
     last = (str(deal.get(hubspot_cfg.CHILD_NAME_PROPERTIES[1]) or "")
             if len(hubspot_cfg.CHILD_NAME_PROPERTIES) > 1 else "")
-    deal_tokens = _tokens(f"{first} {last}")
+    deal_name = f"{first} {last}"
+    deal_tokens = _tokens(deal_name)
     if not deal_tokens:
         codes.append("child_name_not_comparable")
     elif deal_tokens != _tokens(child.full_name):
         codes.append("child_name_differs")
+        codes.append(name_difference(deal_name, child.full_name))
 
     try:
         dob = derive.parse_hubspot_date(deal.get("child_date_of_birth"))
@@ -254,6 +261,7 @@ def child_codes(deal: dict, deal_id: str, stage: str | None, child: FamlyChild) 
         dob = None
     if dob is None or dob.isoformat() != child.birthday:
         codes.append("child_dob_differs")
+        codes.append(dob_difference(dob, child.birthday))
 
     if want["group_id"] is not None and child.group_id != want["group_id"]:
         codes.append("child_group_differs")
@@ -278,13 +286,76 @@ def child_codes(deal: dict, deal_id: str, stage: str | None, child: FamlyChild) 
             _site, first_day, last_day = mine[0]
             if want["start"] is not None and first_day != want["start"]:
                 codes.append("child_start_differs")
+                codes.append(date_gap("child_start", first_day, want["start"]))
             if want["start"] is not None and (last_day or None) != (want["end"] or None):
                 codes.append("child_end_differs")
+                codes.append(date_gap("child_end", last_day, want["end"]))
     return codes
 
 
-def contact_codes(deal_contacts, child: FamlyChild) -> list[str]:
-    """For each HubSpot contact on the deal, by canonical email. No names, no phones."""
+# --------------------------------------------------------------------------- #
+# Sub-codes: HOW a value differs, never the values. Compared in memory only.
+# --------------------------------------------------------------------------- #
+def dob_difference(expected, famly_value: str) -> str:
+    """`dob_day_month_swapped` | `dob_year_differs` | `dob_month_differs` | `dob_day_differs` |
+    `dob_other`, from the deal's date (a `date`, or None) and Famly's ISO string."""
+    try:
+        actual = date.fromisoformat(str(famly_value or "")[:10])
+    except ValueError:
+        return "dob_other"
+    if expected is None:
+        return "dob_other"
+    if (expected.year == actual.year and expected.day == actual.month and expected.month == actual.day
+            and expected.day != expected.month):
+        return "dob_day_month_swapped"
+    same = (expected.year == actual.year, expected.month == actual.month, expected.day == actual.day)
+    if same == (False, True, True):
+        return "dob_year_differs"
+    if same == (True, False, True):
+        return "dob_month_differs"
+    if same == (True, True, False):
+        return "dob_day_differs"
+    return "dob_other"
+
+
+def name_difference(deal_name: str, famly_name: str) -> str:
+    """`name_case_or_spacing_only` | `name_punctuation_only` | `name_one_contains_the_other` (a
+    middle name or an extra word) | `name_different`. Words are compared, never printed."""
+    a, b = str(deal_name or "").casefold(), str(famly_name or "").casefold()
+    if "".join(a.split()) == "".join(b.split()):
+        return "name_case_or_spacing_only"
+    strip = lambda text: "".join(ch for ch in text if ch.isalnum())          # noqa: E731
+    if strip(a) == strip(b):
+        return "name_punctuation_only"
+    ta, tb = _tokens(a), _tokens(b)
+    if ta and tb and (ta <= tb or tb <= ta):
+        return "name_one_contains_the_other"
+    return "name_different"
+
+
+def date_gap(prefix: str, famly_value: str | None, expected: str | None) -> str:
+    """The size and direction of a start/end difference, as one code, e.g.
+    `child_start_famly_later_1_to_7_days`. When a side has no date there is no size."""
+    if not famly_value:
+        return f"{prefix}_famly_open_ended"
+    if not expected:
+        return f"{prefix}_deal_has_no_date"
+    try:
+        days = (date.fromisoformat(famly_value[:10]) - date.fromisoformat(expected[:10])).days
+    except ValueError:
+        return f"{prefix}_gap_unreadable"
+    direction = "famly_later" if days > 0 else "famly_earlier"
+    size = abs(days)
+    bucket = "1_to_7_days" if size <= 7 else "8_to_31_days" if size <= 31 else "over_31_days"
+    return f"{prefix}_{direction}_{bucket}"
+
+
+def contact_codes(deal_contacts, child: FamlyChild, index: "Index | None" = None) -> list[str]:
+    """For each HubSpot contact on the deal, by canonical email. No names, no phones.
+
+    `contact_missing` also says why: `child_has_no_contacts`,
+    `child_has_contacts_but_email_not_matched`, and (cheap, from the same pull)
+    `email_matches_a_contact_on_a_different_child_of_the_same_family`."""
     codes: list[str] = []
     on_child = {c.email: c for c in child.contacts if c.email}
     for contact in deal_contacts:
@@ -297,6 +368,9 @@ def contact_codes(deal_contacts, child: FamlyChild) -> list[str]:
         found = on_child.get(email)
         if found is None:
             codes.append("contact_missing")
+            codes.append("child_has_contacts_but_email_not_matched" if child.contacts else "child_has_no_contacts")
+            if index is not None and (index.contact_children.get(email, set()) - {child.id}):
+                codes.append("email_matches_a_contact_on_a_different_child_of_the_same_family")
             if contact.is_bill_payer:
                 codes.append("bill_payer_contact_missing")
             continue
@@ -308,25 +382,74 @@ def contact_codes(deal_contacts, child: FamlyChild) -> list[str]:
 
 
 def payer_codes(deal_contacts, payers, child_id: str) -> list[str]:
-    """The planner's own decision, mapped to audit codes."""
+    """The planner's own decision, mapped to audit codes, plus sub-codes from the child's
+    payer links (ids and shares are compared in memory; only codes come out)."""
     decision = payer_scan.decide(deal_contacts, payers, child_id)
+    codes: list[str] = []
+    live = payers or []
+    matched = next((p for p in live if p.id == decision.bill_payer_id), None)
+    if matched is None:
+        # the planner's matched payer is only set when exactly one has the contact's email
+        contact = next((c for c in deal_contacts if c.is_bill_payer), None)
+        email = normalise_email(contact.email) if contact is not None else ""
+        same_email = [p for p in live if email and p.email == email]
+        matched = same_email[0] if len(same_email) == 1 else None
+
+    def share(payer):
+        return payer.children.get(child_id) if payer is not None else None
+
+    billing = [p for p in live if payer_scan.bills_the_child(p, child_id)]
+    others = [p for p in billing if matched is None or p.id != matched.id]
+
     if decision.status == payer_scan.STATUS_PRESENT:
-        matched = next((p for p in payers or [] if p.id == decision.bill_payer_id), None)
+        value = share(matched)
         if matched is not None and not payer_scan.lists_child_at(matched, child_id, 1.0):
-            return ["bill_payer_share_not_full"]
-        return []
-    if decision.status == payer_scan.WOULD_CREATE:
-        return ["bill_payer_missing"]
-    if decision.status == payer_scan.WOULD_ATTACH:
-        return ["bill_payer_not_linked"]
-    return {
-        payer_scan.AMBIGUOUS: ["bill_payer_ambiguous"],
-        payer_scan.CHILD_LINKED_ELSEWHERE: ["double_billing_risk"],
-        payer_scan.NO_CONTACT: ["bill_payer_no_contact"],
-        payer_scan.NO_EMAIL: ["bill_payer_no_email"],
-        payer_scan.SCAN_FAILED: ["bill_payer_scan_failed"],
-        payer_scan.NAME_INCOMPLETE: ["bill_payer_missing"],
-    }.get(decision.flag, [f"bill_payer_{decision.flag}"])
+            codes.append("bill_payer_share_not_full")
+            if value is not None and value <= 0:
+                codes.append("bill_payer_share_zero")
+            elif value is not None and 0 < value < 1:
+                codes.append("bill_payer_share_partial")
+    elif decision.status == payer_scan.WOULD_CREATE:
+        codes.append("bill_payer_missing")
+    elif decision.status == payer_scan.WOULD_ATTACH:
+        codes += ["bill_payer_not_linked", "bill_payer_share_row_missing"]
+    else:
+        codes += {
+            payer_scan.AMBIGUOUS: ["bill_payer_ambiguous"],
+            payer_scan.CHILD_LINKED_ELSEWHERE: ["double_billing_risk"],
+            payer_scan.NO_CONTACT: ["bill_payer_no_contact"],
+            payer_scan.NO_EMAIL: ["bill_payer_no_email"],
+            payer_scan.SCAN_FAILED: ["bill_payer_scan_failed"],
+            payer_scan.NAME_INCOMPLETE: ["bill_payer_missing"],
+        }.get(decision.flag, [f"bill_payer_{decision.flag}"])
+
+    if payers is not None:
+        if not billing:
+            codes.append("bill_payer_child_has_no_live_payer")
+        elif len(billing) > 1:
+            codes.append("bill_payer_child_has_multiple_live_payers")
+        if others:
+            codes.append("bill_payer_other_payer_billing")
+            # the double billing split: who bills at what, against the payer the deal expects
+            other_full = any((share(p) is None) or abs(share(p) - 1.0) < 1e-9 for p in others)
+            expected_value = share(matched)
+            expected_full = expected_value is not None and abs(expected_value - 1.0) < 1e-9
+            expected_zero = matched is None or expected_value is None or expected_value <= 0
+            if "double_billing_risk" not in codes and matched is not None and bills_positive(matched, child_id):
+                codes.append("double_billing_risk")           # the expected payer AND another both bill
+            if "double_billing_risk" in codes:
+                if other_full and expected_zero:
+                    codes.append("other_payer_full_and_expected_zero")
+                elif other_full and expected_full:
+                    codes.append("both_full")
+                else:
+                    codes.append("other")
+    return codes
+
+
+def bills_positive(payer, child_id: str) -> bool:
+    value = payer.children.get(child_id)
+    return value is not None and value > 0
 
 
 def _end_of(value: str | None) -> str:
@@ -356,6 +479,20 @@ def _slot_by_session(institution: str) -> dict[str, str]:
             if uuid and slot in catalogue.VALID_SLOTS:
                 out[str(uuid)] = slot
     return out
+
+
+def fee_bucket(estimate: float, fees: float) -> str:
+    """How far the plan's monthly estimate is from `billable_fees`, as ONE bucket code (the
+    first that fits): within 1 pound, under 2 percent, under 10 percent (FEE_TOLERANCE),
+    over 10 percent. Counts of these codes are the summary's fee buckets."""
+    gap = abs(estimate - fees)
+    if gap <= 1.0:
+        return "plan_fee_within_1_pound"
+    if gap < 0.02 * max(abs(fees), 1.0):
+        return "plan_fee_under_2_percent"
+    if gap <= FEE_TOLERANCE * max(abs(fees), 1.0):
+        return "plan_fee_under_10_percent"
+    return "plan_fee_over_10_percent"
 
 
 def _booked(plan) -> list:
@@ -399,6 +536,7 @@ def compare_plan(plans: list, deal: dict, institution: str | None, today=None) -
 
     differs: list[str] = []
     missing: list[str] = []
+    buckets: list[str] = []
 
     if expected_from is None:
         missing.append("plan_input_dates_missing")
@@ -435,12 +573,14 @@ def compare_plan(plans: list, deal: dict, institution: str | None, today=None) -
         estimate = _number(chosen.current_monthly_estimate(today))
         if estimate is None or abs(estimate - fees) > FEE_TOLERANCE * max(abs(fees), 1.0):
             differs.append("plan_fees_differ")
+        if estimate is not None:
+            buckets.append(fee_bucket(estimate, fees))
 
     if differs:
-        return ["plan_differs", *differs, *missing]
+        return ["plan_differs", *differs, *missing, *buckets]
     if missing:
-        return ["plan_not_derivable", *missing]
-    return ["plan_matches"]
+        return ["plan_not_derivable", *missing, *buckets]
+    return ["plan_matches", *buckets]
 
 
 def plan_codes(result, deal: dict | None = None, institution: str | None = None, today=None) -> list[str]:
@@ -488,8 +628,12 @@ def operations_deals(hubspot, stages: dict[str, tuple[str, str]], stage_names: l
 
 
 def run(hubspot, gql, rest, *, deal_ids: list[str] | None = None, operations: bool = False,
-        stage_names: list[str] | None = None, site_ids: list[str] | None = None) -> tuple[dict, list[Row]]:
-    """The audit. Exactly one of `deal_ids` / `operations`. Returns (summary, rows)."""
+        stage_names: list[str] | None = None, site_ids: list[str] | None = None,
+        include_left: bool = False) -> tuple[dict, list[Row]]:
+    """The audit. Exactly one of `deal_ids` / `operations`. Returns (summary, rows).
+
+    `include_left`: plans of a CHILD-ONLY stage (Left Nursery) are neither read nor compared
+    unless it is set (plan_missing for them is reported only with it)."""
     from actions.read_child_plans import runner as plans_runner
 
     stages = hubspot.stage_names()
@@ -546,7 +690,7 @@ def run(hubspot, gql, rest, *, deal_ids: list[str] | None = None, operations: bo
                 row.codes.append("contacts_not_readable")
                 deal_contacts = None
             if deal_contacts is not None:
-                row.codes += contact_codes(deal_contacts, child)
+                row.codes += contact_codes(deal_contacts, child, index)
                 site_id = None
                 try:
                     site_id = derive.site_for_location(deal.get("location_of_interest"))[1]
@@ -558,6 +702,8 @@ def run(hubspot, gql, rest, *, deal_ids: list[str] | None = None, operations: bo
                         payers_by_site[site_id] = FamlyReads(gql, site_ids=site_ids).bill_payers(site_id)
                     row.codes += payer_codes(deal_contacts, payers_by_site[site_id], child.id)
 
+        if derive.is_child_only_stage(stage) and not include_left:
+            continue
         try:
             row.codes += plan_codes(plans_runner.run(child.id, client=rest), deal, row.site_code)
         except Exception as exc:  # noqa: BLE001 - one child's plan read must not stop the audit
@@ -575,6 +721,10 @@ def summarise(rows: list[Row], hubspot, gql, rest) -> dict:
         "childrenFoundBy": dict(sorted(Counter(r.found_via for r in rows).items())),
         "childMissing": by_code.get(CHILD_MISSING, 0),
         "byCode": dict(sorted(by_code.items())),
+        "byCodeByStage": {code: dict(sorted(Counter(r.stage or "unknown" for r in rows if code in r.codes).items()))
+                          for code in sorted(by_code)},
+        "feeBuckets": {code.removeprefix("plan_fee_"): n for code, n in sorted(by_code.items())
+                       if code.startswith("plan_fee_") and code != "plan_fees_differ"},
         "bySite": dict(sorted(Counter(r.site_code or "unknown" for r in rows).items())),
         "byStage": dict(sorted(Counter(r.stage or "unknown" for r in rows).items())),
         "requests": {"hubspot": getattr(hubspot, "calls", None), "famlyGraphql": getattr(gql, "calls", None),
@@ -584,11 +734,16 @@ def summarise(rows: list[Row], hubspot, gql, rest) -> dict:
     }
 
 
-def write_csv(path: str, rows: list[Row]) -> None:
-    """dealId, siteCode, stage, childId, found_via, codes (`;`-joined). Ids and codes only."""
+def write_csv(path: str, rows: list[Row], only_codes=None) -> int:
+    """dealId, siteCode, stage, childId, found_via, codes (`;`-joined). Ids and codes only.
+    `only_codes`: keep only rows that carry ANY of these codes (a base code or a sub-code).
+    Returns the number of rows written."""
+    wanted = {c.strip() for c in only_codes or [] if c and c.strip()}
+    rows = [r for r in rows if not wanted or wanted & set(r.codes)]
     with open(path, "w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
         writer.writerow(["dealId", "siteCode", "stage", "childId", "found_via", "codes"])
         for r in rows:
             writer.writerow([r.deal_id, r.site_code or "", r.stage or "", r.child_id or "", r.found_via,
                              ";".join(dict.fromkeys(r.codes))])
+    return len(rows)

@@ -20,6 +20,11 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--stage", action="append", metavar="NAME",
                         help="--operations: only deals in this stage label (repeatable)")
     parser.add_argument("--out", metavar="PATH", help="Also write a CSV of ids and codes")
+    parser.add_argument("--codes", metavar="CODE1,CODE2",
+                        help="--out: only the rows that have ANY of these codes (a base code or a sub-code)")
+    parser.add_argument("--include-left", action="store_true",
+                        help="Also read and compare the plans of child-only stages (Left Nursery); "
+                             "skipped by default")
 
 
 def handle(args: argparse.Namespace):
@@ -28,6 +33,9 @@ def handle(args: argparse.Namespace):
 
     from actions.onboard import batch
 
+    if args.codes and not args.out:
+        print("--codes restricts the CSV: give --out too", file=sys.stderr)
+        raise SystemExit(3)
     if args.stage and not args.operations:
         print("--stage only applies with --operations", file=sys.stderr)
         raise SystemExit(3)
@@ -40,8 +48,8 @@ def handle(args: argparse.Namespace):
     gql = runner.ReadOnlyGraphQL(urn_runner._public_client())
     rest = runner.ReadOnlyRest(RestClient())
     summary, rows = runner.run(hubspot, gql, rest, deal_ids=deal_ids, operations=bool(args.operations),
-                               stage_names=args.stage)
+                               stage_names=args.stage, include_left=bool(args.include_left))
     if args.out:
-        runner.write_csv(args.out, rows)
-        summary["csv"] = {"rows": len(rows)}
+        written = runner.write_csv(args.out, rows, only_codes=(args.codes or "").split(","))
+        summary["csv"] = {"rows": written}
     return summary
