@@ -576,6 +576,7 @@ def _clean(value) -> str:
 
 VIA_DEAL = "external_system_reference"
 VIA_URN = "urn"
+VIA_RECORDED = "famly_childid"
 
 
 @dataclass
@@ -644,6 +645,13 @@ def _ensure_child(job, deps, plan, deal) -> ChildResult:
         raise StopJob(store.NEEDS_REVIEW, "child_ambiguous")
     if ids:
         return ChildResult(ids[0], created=False, clean_create=False, via=via)
+
+    # The plan also treats the deal's own recorded `famly_childid` as the child when no reference
+    # or URN finds one (an existing child by that route). Without this the worker would go on to
+    # CREATE it, and fail on a missing name that only a create needs.
+    recorded = _clean(deal.get("famly_childid"))
+    if recorded and deps.famly().child_exists(recorded):
+        return ChildResult(recorded, created=False, clean_create=False, via=VIA_RECORDED)
 
     is_test = config.is_test_deal(deal_id)
     try:
