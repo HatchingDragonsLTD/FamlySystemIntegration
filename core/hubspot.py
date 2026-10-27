@@ -223,6 +223,17 @@ class HubSpotClient:
         value = (body.get("properties") or {}).get(PLAN_UPLOADED_PROPERTY)
         return None if value in (None, "") else str(value)
 
+    def read_plan_state(self, deal_id: str) -> tuple[str | None, str | None]:
+        """(the deal's `famly_childid`, its `famly_plan_uploaded` value), each None when empty. One
+        read-only GET of those two properties. Raises HubSpotError (status 404) if there is no deal."""
+        body = self._get(f"/crm/v3/objects/deals/{deal_id}",
+                         {"properties": f"famly_childid,{PLAN_UPLOADED_PROPERTY}"})
+        props = body.get("properties") or {}
+
+        def clean(value):
+            return None if value in (None, "") else str(value).strip() or None
+        return clean(props.get("famly_childid")), clean(props.get(PLAN_UPLOADED_PROPERTY))
+
     def search_deals(self, filters: list[dict], properties: list[str], limit: int = 100) -> list[dict]:
         """READ-ONLY deal search (HubSpot's search endpoint is a POST, but it only reads).
 

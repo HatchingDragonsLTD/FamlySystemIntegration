@@ -178,7 +178,8 @@ class OnlyThisCommandMayWriteTheProperty(unittest.TestCase):
                 continue
             if "write_plan_uploaded(" in path.read_text(encoding="utf-8", errors="ignore"):
                 callers.append(path.relative_to(root).as_posix())
-        self.assertEqual(sorted(callers), ["actions/hubspot_plan_uploaded/runner.py", "core/hubspot.py"])
+        self.assertEqual(sorted(callers), ["actions/hubspot_plan_uploaded/runner.py",
+                                           "actions/plan_write/plan_flag.py", "core/hubspot.py"])
 
 
 if __name__ == "__main__":

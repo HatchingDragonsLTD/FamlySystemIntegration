@@ -60,6 +60,22 @@ def unwrap_payload(payload: Any) -> Any:
     return payload
 
 
+DEAL_ID_KEYS = ("dealId", "deal_id", "hs_object_id")
+
+
+def deal_id_of(payload: Any) -> str | None:
+    """The HubSpot deal record id the webhook carried, or None. Digits only (an id, never personal
+    data); anything else is ignored, never echoed."""
+    body = unwrap_payload(payload)
+    if not isinstance(body, dict):
+        return None
+    for key in DEAL_ID_KEYS:
+        value = str(body.get(key) if body.get(key) is not None else "").strip()
+        if value.isdigit():
+            return value
+    return None
+
+
 def parse_hubspot_payload(payload: Any) -> input_schema.PlanInput:
     """Parse a webhook payload into a PlanInput.
 

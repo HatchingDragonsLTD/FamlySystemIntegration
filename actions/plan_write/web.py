@@ -353,6 +353,9 @@ def prepare_preview(
             chain_index=chain_index,
             job_id=job_id,
             job_index=job_index,
+            # The deal's record id when the webhook sent one: lets a successful commit set
+            # famly_plan_uploaded. An id only.
+            deal_id=hubspot_intake.deal_id_of(payload),
         )
     except Exception as exc:  # noqa: BLE001 - storing must not break the preview
         logger.warning(

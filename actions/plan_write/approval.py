@@ -57,7 +57,7 @@ from actions.queue_timeline import jobs as queue_jobs
 from core.rest_client import RestHTTPError
 from integrations import child_lookup, slack
 
-from . import preview_store, rounding, runner
+from . import plan_flag, preview_store, rounding, runner
 
 logger = logging.getLogger(__name__)
 
@@ -288,6 +288,10 @@ def _approve(preview_id: str | None, user: str | None) -> str:
     preview_store.mark(preview_id or "", preview_store.STATUS_COMMITTED)
 
     plan_id = getattr(result.plan, "id", None)
+
+    # The Famly commit is done and final. The HubSpot flag is set off the request thread, never undoes
+    # or retries anything, and any failure is a code in the log and one Slack line.
+    _spawn(lambda: _set_plan_flag(claimed, plan_id))
     logger.info(
         "COMMITTED preview_id=%s child_id=%s plan_id=%s user=%s",
         preview_id,
@@ -314,6 +318,14 @@ def _approve(preview_id: str | None, user: str | None) -> str:
         queue_jobs.release_after_approval(claimed.job_id, claimed.job_index, plan_id)
 
     return text
+
+
+def _set_plan_flag(claimed, plan_id) -> None:
+    """Off the request thread: set the deal's famly_plan_uploaded (see plan_flag). Never raises."""
+    try:
+        plan_flag.after_commit(claimed, plan_id)
+    except Exception:  # noqa: BLE001 - nothing here may touch the Famly commit that already happened
+        logger.exception("PLAN FLAG failed preview_id=%s", getattr(claimed, "preview_id", None))
 
 
 def _start_day(value) -> date | None:
@@ -766,6 +778,7 @@ def _complete_adjustment(
             # plan advances the chain exactly as the original would have.
             chain_id=stored.chain_id,
             chain_index=stored.chain_index,
+            deal_id=stored.deal_id,
         )
 
         # Only now is the original replaced. Doing it earlier would strand the

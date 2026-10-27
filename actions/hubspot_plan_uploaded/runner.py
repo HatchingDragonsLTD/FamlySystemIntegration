@@ -1,6 +1,8 @@
-"""One-off: set `famly_plan_uploaded` to true or false on a list of HubSpot deals.
+"""Set `famly_plan_uploaded` on a list of HubSpot deals: to a chosen value (`run`), or to what Famly
+shows (`reconcile`, `--from-famly`). Counts, ids and codes only.
 
-The ONLY caller of `HubSpotDealWriter.write_plan_uploaded`. Counts, ids and codes only.
+Callers of `HubSpotDealWriter.write_plan_uploaded`: this command and, after a confirmed commit,
+`actions/plan_write/plan_flag.py` (the server owns the flag).
 
   * pre-flight: the deal property definitions are listed first; the property must exist and be a
     boolean checkbox, else nothing is read or written (a code is returned);
@@ -65,6 +67,81 @@ def preflight(writer: HubSpotDealWriter) -> str | None:
     if definition.get("type") not in ("bool", "boolean") and definition.get("fieldType") != "booleancheckbox":
         return PROPERTY_NOT_BOOLEAN
     return None
+
+
+def operations_states(writer) -> list[tuple[str, str | None, str | None]]:
+    """(deal id, famly_childid, flag) for every deal in the Operations pipeline, any stage (a child-only
+    stage such as Left Nursery is included): ONE stage-list read plus one search page per 100 deals."""
+    from actions.onboard_dry_run import derive
+
+    ids = [sid for sid, (pipeline, _stage) in writer.stage_names().items()
+           if derive.norm_stage(pipeline) == "operations"]
+    if not ids:
+        return []
+    rows = writer.search_deals([{"propertyName": "dealstage", "operator": "IN", "values": ids}],
+                               ["famly_childid", PLAN_UPLOADED_PROPERTY])
+
+    def clean(value):
+        return None if value in (None, "") else str(value).strip() or None
+    return [(str(r["id"]), clean(r.get("famly_childid")), clean(r.get(PLAN_UPLOADED_PROPERTY))) for r in rows]
+
+
+def file_states(writer, ids: list[str]) -> list[tuple[str, str | None, str | None] | tuple[str, str]]:
+    """(deal id, famly_childid, flag) for each id, or (deal id, code) when the deal could not be read."""
+    out = []
+    for deal_id in ids:
+        try:
+            child_id, flag = writer.read_plan_state(deal_id)
+            out.append((deal_id, child_id, flag))
+        except HubSpotError as exc:
+            out.append((deal_id, NOT_FOUND if exc.status_code == 404 else READ_FAILED))
+    return out
+
+
+def reconcile(writer, has_plan, states: list, confirm: bool, cap: int = MAX_DEALS) -> dict:
+    """Make the flag say what Famly says. For each deal with a `famly_childid`, `has_plan(child_id)`
+    (a read of the child's plans: True, False, or raises) gives the wanted value: true when the child has
+    a plan, false when not. A plan that cannot be read changes nothing. Dry run unless `confirm`; with it
+    only deals whose flag DIFFERS are written (one PATCH each, never retried), at most `cap` per run (the
+    rest are `deferred`). Per-deal results are ids and codes only."""
+    stopped = preflight(writer)
+    if stopped:
+        return {"mode": "stopped", "stopped": stopped, "written": 0}
+    results: dict[str, str] = {}
+    written = 0
+    for entry in states:
+        deal_id = entry[0]
+        if len(entry) == 2:
+            results[deal_id] = entry[1]                       # not_found | read_failed
+            continue
+        _deal, child_id, flag = entry
+        if not child_id:
+            results[deal_id] = "no_child"
+            continue
+        try:
+            wanted = "true" if has_plan(child_id) else "false"
+        except Exception:  # noqa: BLE001 - an unreadable plan list changes nothing
+            results[deal_id] = "plan_unreadable"
+            continue
+        if _state(flag) == wanted:
+            results[deal_id] = UNCHANGED
+        elif not confirm:
+            results[deal_id] = f"would_set_{wanted}"
+        elif written >= cap:
+            results[deal_id] = "deferred"
+        else:
+            try:
+                writer.write_plan_uploaded(deal_id, wanted)
+                results[deal_id] = f"{CHANGED}_{wanted}"
+                written += 1
+            except (HubSpotError, ValueError):
+                results[deal_id] = REJECTED
+    summary: dict[str, int] = {}
+    for code in results.values():
+        summary[code] = summary.get(code, 0) + 1
+    return {"mode": "write" if confirm else "dry_run", "deals": len(results), "results": dict(sorted(summary.items())),
+            "written": written, "cap": cap,
+            "perDeal": results if confirm else None}
 
 
 def _state(current: str | None) -> str:

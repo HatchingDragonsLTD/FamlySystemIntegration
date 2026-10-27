@@ -93,6 +93,9 @@ _ADDED_COLUMNS = {
     # for every other preview.
     "job_id": "TEXT",
     "job_index": "INTEGER",
+    # The HubSpot deal record id the preview came from (digits; an id, not personal data), so a
+    # successful commit can set the deal's famly_plan_uploaded. NULL when the webhook did not send one.
+    "deal_id": "TEXT",
 }
 
 # create_timeline's chains (see actions/create_timeline/chains.py, which owns
@@ -234,6 +237,8 @@ class StoredPreview:
     # queue_timeline: the job and position this preview is for. None otherwise.
     job_id: str | None = None
     job_index: int | None = None
+    # The HubSpot deal this preview came from, when the webhook carried its id.
+    deal_id: str | None = None
 
     @property
     def is_expired(self) -> bool:
@@ -449,6 +454,7 @@ def _row_to_preview(row: sqlite3.Row) -> StoredPreview:
         chain_index=_column(row, "chain_index"),
         job_id=_column(row, "job_id"),
         job_index=_column(row, "job_index"),
+        deal_id=_column(row, "deal_id"),
     )
 
 
@@ -479,6 +485,7 @@ def save(
     chain_index: int | None = None,
     job_id: str | None = None,
     job_index: int | None = None,
+    deal_id: str | None = None,
 ) -> None:
     """Record a previewed plan as pending approval.
 
@@ -504,8 +511,8 @@ def save(
             "(preview_id, plan_body, child_id, version, created_at, status, "
             "site_code, institution_id, pricing_group_id, monthly_estimate, "
             "old_plan_id, replace_old_plan, chain_id, chain_index, "
-            "job_id, job_index) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "job_id, job_index, deal_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 preview_id,
                 json.dumps(plan_body),
@@ -523,6 +530,7 @@ def save(
                 chain_index,
                 job_id,
                 job_index,
+                deal_id,
             ),
         )
 
