@@ -1,4 +1,5 @@
-# READ-ONLY. A child's contacts with ONLY the RELATION record (the key and whether it has a
+# READ-ONLY. A child's contacts with ONLY the RELATION record (Famly returns one for every contact, with an
+# empty value when unset; the key and whether the value is non-blank is all the caller keeps; the value is a
 # value is all the caller keeps; the value itself is never printed or stored).
 query OnboardChildContactRelations($childIds: [ChildId!]!, $next: ContactCursor) {
   contacts {

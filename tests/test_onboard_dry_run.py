@@ -144,7 +144,7 @@ class FakeFamlyClient:
                 raise self.relations_error
             rows = self.child_contacts.get(variables["childIds"][0], [])
             return {"data": {"contacts": {"list": {
-                "result": [{"id": i, "records": [] if i in self.no_relation
+                "result": [{"id": i, "records": [{"key": "RELATION", "value": ""}] if i in self.no_relation
                             else [{"key": "RELATION", "value": "Parent"}]} for i, _e in rows],
                 "next": None}}}}
         if operation_name == "OnboardContactsScan":

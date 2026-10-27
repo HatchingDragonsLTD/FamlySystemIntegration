@@ -157,7 +157,15 @@ class FakeFamly:
         self.relation_lands = True        # False: an accepted update changes nothing
         self.contact_ref_error = None     # raised by every by-reference lookup
         self.contact_ref_blind = False    # the by-reference lookup lags: it finds nothing
+        self.relation_values = {}         # contact id -> a RELATION word other than Parent (a value that is set)
+        self.relation_record_absent = False   # True: an unset RELATION has no record (Famly returns an EMPTY one)
         self._n = 0
+
+    def _relation_records(self, contact_id):
+        """What Famly returns: a RELATION record for every contact, its value empty when unset."""
+        if self.relations.get(contact_id, True):
+            return [{"key": "RELATION", "value": self.relation_values.get(contact_id, "Parent")}]
+        return [] if self.relation_record_absent else [{"key": "RELATION", "value": ""}]
 
     def _new_id(self, prefix):
         self._n += 1
@@ -233,6 +241,7 @@ class FakeFamly:
                 self.relation_effect(variables)
             if self.relation_lands:
                 self.relations[record["contactId"]] = True
+                self.relation_values.pop(record["contactId"], None)
             if self.relation_land_then_raise:
                 raise self.relation_land_then_raise
             return {"data": {"contacts": {"update": [{"id": record["contactId"]}]}}}
@@ -251,8 +260,7 @@ class FakeFamly:
         if operation_name == "OnboardChildContactRelations":
             rows = self.contacts.get(variables["childIds"][0], [])
             return {"data": {"contacts": {"list": {
-                "result": [{"id": i, "records": [{"key": "RELATION", "value": "Parent"}]
-                            if self.relations.get(i, True) else []} for i, _e in rows],
+                "result": [{"id": i, "records": self._relation_records(i)} for i, _e in rows],
                 "next": None}}}}
 
         if operation_name == "OnboardChildContacts":

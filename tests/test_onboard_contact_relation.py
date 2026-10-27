@@ -107,6 +107,52 @@ class AddTests(RelationCase):
             self.assertNotIn(value, blob, value)
 
 
+class BlankRelationTests(RelationCase):
+    """Famly returns a RELATION record for every contact, with an empty value when unset."""
+
+    def would_add(self):
+        return [c.get("relation") for c in self.plan()["contacts"]]
+
+    def test_an_empty_value_an_absent_record_and_a_blank_value_all_mean_not_set(self):
+        self.existing_child(missing=("fc-1",))                         # the fake returns an EMPTY record
+        self.assertEqual(self.would_add(), ["would_add", "present"])
+        self.famly.relation_record_absent = True                       # and no record at all
+        self.assertEqual(self.would_add(), ["would_add", "present"])
+        self.famly.relation_record_absent = False
+        self.famly.relations["fc-1"] = True
+        self.famly.relation_values["fc-1"] = "   "                      # whitespace only
+        self.assertEqual(self.would_add(), ["would_add", "present"])
+
+    def test_any_non_empty_value_is_set_and_left_alone(self):
+        self.existing_child(missing=())
+        for word in ("Parent", "Grandparent", "Mother", "x"):
+            self.famly.relation_values["fc-1"] = word
+            self.assertEqual(self.would_add(), ["present", "present"], word)
+
+    def test_an_empty_value_is_filled_in_with_parent_after_approval_and_confirmed(self):
+        self.existing_child(missing=("fc-1",))
+        self.run_to_approval()
+        self.approve()
+        self.assertEqual(self.run_worker()["status"], store.DONE)
+        self.assertEqual([c for c, _ in self.famly.relation_updates], ["fc-1"])
+        self.assertIn("relation:c1:relation_added", self.job().outcomes)
+
+    def test_a_value_set_after_approval_is_never_overwritten(self):
+        self.existing_child(missing=("fc-1",))
+        self.run_to_approval()
+        self.approve()
+        self.famly.relations["fc-1"] = True
+        self.famly.relation_values["fc-1"] = "Grandparent"              # a person filled it in meanwhile
+        self.run_worker()
+        self.assertEqual(self.famly.relation_updates, [])
+
+    def test_the_read_keeps_only_whether_a_value_is_set(self):
+        self.existing_child(missing=("fc-1",))
+        self.famly.relation_values["fc-2"] = "Mother"
+        reads = FamlyReads(self.famly, site_ids=[SITE_ID])
+        self.assertEqual(reads.child_contact_relations(CHILD), {"fc-1": False, "fc-2": True})
+
+
 class ChildOnlyTests(RelationCase):
     def test_a_child_only_stage_never_reads_or_writes_relations(self):
         self.hub.stages["s-left"] = ("Operations", "Left Nursery")

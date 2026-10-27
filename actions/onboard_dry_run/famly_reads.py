@@ -240,7 +240,9 @@ class FamlyReads:
         return Located(ids, BY_EMAIL if ids else None)
 
     def child_contact_relations(self, child_id: str) -> dict[str, bool]:
-        """contact id -> whether the contact has a RELATION record, for each contact on the child.
+        """contact id -> whether the contact has a RELATION SET, for each contact on the child. Famly returns a
+        RELATION record for every contact and leaves its value empty when unset, so a missing record or a
+        blank (empty or whitespace) value both mean "not set"; any non-empty value, whatever the word, means set.
         Only the presence is kept: the value is never returned."""
         out: dict[str, bool] = {}
         cursor: str | None = None
@@ -256,7 +258,7 @@ class FamlyReads:
             for row in listing.get("result") or []:
                 if isinstance(row, dict) and row.get("id"):
                     out[str(row["id"])] = any(
-                        isinstance(r, dict) and r.get("key") == "RELATION"
+                        isinstance(r, dict) and r.get("key") == "RELATION" and str(r.get("value") or "").strip()
                         for r in row.get("records") or []
                     )
             cursor = listing.get("next") or None
