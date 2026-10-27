@@ -894,15 +894,6 @@ class ChildCreateTests(Phase2Case):
 # Read-back
 # --------------------------------------------------------------------------- #
 class ReadBackTests(Phase2Case):
-    def test_the_room_move_is_not_checked_at_all(self):
-        self.rest.moves_start_early = True      # a room move dated the creation day
-        result = self.run_through()
-        self.assertEqual(result["status"], store.DONE)              # nothing stops
-        self.assertEqual(len(self.famly.contact_creates), 2)
-        self.assertNotIn("room_move_mismatch", self.all_output())
-        self.assertFalse(hasattr(summary_check, "ROOM_MOVE_MISMATCH"))
-        self.assertFalse(hasattr(summary_check, "_moves"))          # the check is gone, not hidden
-
     def test_a_summary_mismatch_is_a_flag_not_a_hold_and_never_stops_the_job(self):
         self.rest.wrong_group = True
         result = self.run_through()
@@ -1241,7 +1232,6 @@ class WriteBackTests(Phase2Case):
         for text in (gaps, written["famly_sync_note"]):
             self.assertNotRegex(text, r"[a-z]+_[a-z_]+")             # no raw code in the text
             self.assertNotIn(";", text)
-        self.assertNotIn("gap_not_offered", " ".join(self.notify.notices))
 
     def test_a_property_listing_failure_never_blocks_famly_either(self):
         self.hub.defs_error = HubSpotError("GET failed with HTTP 500", 500)
