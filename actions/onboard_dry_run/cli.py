@@ -44,6 +44,7 @@ def handle(args: argparse.Namespace):
         return {
             "mode": result["mode"],
             "writes": result["writes"],
+            "allowlistEnforced": result["allowlistEnforced"],
             "associationLabels": result["associationLabels"],
             "plan": result["plans"][0],
         }

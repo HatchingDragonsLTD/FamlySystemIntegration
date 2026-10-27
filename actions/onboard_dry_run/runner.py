@@ -35,6 +35,7 @@ from actions.onboard_dry_run.famly_reads import (
     normalise_email,
 )
 from core.client import GraphQLError, GraphQLHTTPError
+from actions.onboard.config import allowlist_enforced
 from core import hubspot as hubspot_config
 from core.hubspot import HubSpotClient, HubSpotError
 
@@ -599,6 +600,7 @@ def run(
     result = {
         "mode": "dry_run",
         "writes": 0,
+        "allowlistEnforced": allowlist_enforced(),
         "associationLabels": labels_report,
         "plans": plans,
         "summary": summarise(plans),

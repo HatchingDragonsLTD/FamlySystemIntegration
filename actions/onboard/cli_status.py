@@ -2,7 +2,7 @@
 
 import argparse
 
-from . import store
+from . import config, store
 
 NAME = "onboard-status"
 HELP = "Show the onboarding jobs for a deal: counts and codes only"
@@ -17,6 +17,7 @@ def handle(args: argparse.Namespace):
     latest = store.latest_for_deal(deal_id)
     return {
         "dealId": deal_id,
+        "allowlistEnforced": config.allowlist_enforced(),
         "jobsByStatus": store.status_counts_for_deal(deal_id),
         "latest": None if latest is None else {
             "jobId": latest.id,

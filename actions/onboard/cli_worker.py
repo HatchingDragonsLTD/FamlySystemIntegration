@@ -9,7 +9,7 @@ import argparse
 
 from core.logging_setup import configure_logging
 
-from . import worker
+from . import config, worker
 
 NAME = "onboard-worker"
 HELP = "Run the onboarding worker: build queued deals' child and contacts in Famly (see README)"
@@ -28,6 +28,7 @@ def add_args(parser: argparse.ArgumentParser) -> None:
 
 def handle(args: argparse.Namespace):
     configure_logging()
+    config.log_allowlist_state()
     if args.once:
         recovered = worker.recover()
         return {"recovered": recovered, **worker.run_once()}

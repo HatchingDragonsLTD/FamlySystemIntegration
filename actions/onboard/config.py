@@ -6,9 +6,13 @@
               Famly or HubSpot writes; the job ends `dry_done`.
         live  writes happen, but ONLY for deals in ONBOARD_ALLOWED_DEAL_IDS.
     ONBOARD_ALLOWED_DEAL_IDS  comma-separated deal ids. Empty means NONE.
-    ONBOARD_TEST_DEAL_IDS     comma-separated; a subset of the allowlist. Only a
-                              deal in BOTH lists creates its child with
-                              isTestChild true. The flag is never set otherwise.
+    ONBOARD_ENFORCE_ALLOWLIST enforced unless the value is exactly "off" (any case); unset,
+                              empty or any other value keeps it enforced. Off: the allowlist
+                              no longer restricts which deals are enqueued or written.
+                              Mode, stage checks and Gate A are unchanged.
+    ONBOARD_TEST_DEAL_IDS     comma-separated. A deal on it creates its child with
+                              isTestChild true, whether the allowlist is enforced or not.
+                              The flag is never set otherwise.
     ONBOARD_BILL_PAYER        off | on   (default off). On: the plan shows the bill payer
                               decision and, in live mode after Gate A, the worker creates or
                               attaches the bill payer. Off: behaviour is unchanged.
@@ -54,7 +58,19 @@ def test_deal_ids() -> frozenset[str]:
     return _ids("ONBOARD_TEST_DEAL_IDS")
 
 
+def allowlist_enforced() -> bool:
+    """True unless ONBOARD_ENFORCE_ALLOWLIST is exactly `off`. Fails closed."""
+    return os.environ.get("ONBOARD_ENFORCE_ALLOWLIST", "").strip().lower() != "off"
+
+
+def log_allowlist_state() -> None:
+    """One startup line with the parsed state (never the ids)."""
+    logger.info("onboard allowlist enforced=%s", allowlist_enforced())
+
+
 def is_allowed(deal_id: str) -> bool:
+    if not allowlist_enforced():
+        return True
     return str(deal_id).strip() in allowed_deal_ids()
 
 
@@ -67,7 +83,7 @@ def allowed_for_job(job, mode: str) -> bool:
     and the deal is not on ONBOARD_TEST_DEAL_IDS. The gate stays an explicit list of ids:
     the ids in the file the operator passed. Gate A is separate and always applies."""
     deal_id = str(job.deal_id).strip()
-    if is_allowed(deal_id):
+    if is_allowed(deal_id):  # also true for every deal when the allowlist is off
         return True
     return (
         mode == MODE_LIVE
@@ -79,10 +95,11 @@ def allowed_for_job(job, mode: str) -> bool:
 
 
 def is_test_deal(deal_id: str) -> bool:
-    """True only for a deal that is in BOTH lists (a test id outside the
-    allowlist is not allowed to write at all, so it is not a test deal either)."""
+    """True for a deal on the test list. With the allowlist enforced it must also be on the
+    allowlist (a test id outside it is not allowed to write at all, so it is not a test deal
+    either); with the allowlist off the test list alone decides."""
     deal_id = str(deal_id).strip()
-    return deal_id in test_deal_ids() and deal_id in allowed_deal_ids()
+    return deal_id in test_deal_ids() and is_allowed(deal_id)
 
 
 def portal_id() -> str:

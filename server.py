@@ -66,6 +66,8 @@ load_dotenv()
 # is how this tells gunicorn from a test or a plain import.
 if logging.getLogger("gunicorn.error").handlers:
     configure_logging(force=True)
+    from actions.onboard import config as _onboard_config
+    _onboard_config.log_allowlist_state()
 
 app = Flask(__name__)
 
