@@ -198,18 +198,24 @@ class SegmentTests(unittest.TestCase):
 
 
 class ClampAndDropTests(unittest.TestCase):
-    def test_funding_straddling_start_is_clamped_without_a_warning(self):
-        segments, warnings = build_segments(
-            "2026-01-05", "2026-06-30", funding=("2025-06-01", "2026-02-28")
-        )
-        self.assertEqual(
-            segments,
-            [
-                seg("2026-01-05", "2026-02-28", funded=True),
-                seg("2026-03-01", "2026-06-30"),
-            ],
-        )
-        self.assertEqual(warnings, [])
+    def test_funding_straddling_start_is_clamped_without_a_warning_cases(self):
+        """Folded cases: funding_straddling_start_is_clamped_without_a_warning; funding_ending_on_start_is_kept."""
+        for _i, (_p0, _p1, _p2, _p3) in enumerate([
+            ("2025-06-01", "2026-02-28", "2026-02-28", "2026-03-01"),
+            ("2025-09-01", "2026-01-05", "2026-01-05", "2026-01-06"),
+        ]):
+            with self.subTest(case=_i):
+                segments, warnings = build_segments(
+                    "2026-01-05", "2026-06-30", funding=(_p0, _p1)
+                )
+                self.assertEqual(
+                    segments,
+                    [
+                        seg("2026-01-05", _p2, funded=True),
+                        seg(_p3, "2026-06-30"),
+                    ],
+                )
+                self.assertEqual(warnings, [])
 
     def test_funding_straddling_leave_is_clamped_without_a_warning(self):
         segments, warnings = build_segments(
@@ -239,19 +245,6 @@ class ClampAndDropTests(unittest.TestCase):
         )
         self.assertEqual(segments, [seg("2026-01-05", "2026-06-30")])
         self.assertEqual(len(warnings), 1)
-
-    def test_funding_ending_on_start_is_kept(self):
-        segments, warnings = build_segments(
-            "2026-01-05", "2026-06-30", funding=("2025-09-01", "2026-01-05")
-        )
-        self.assertEqual(
-            segments,
-            [
-                seg("2026-01-05", "2026-01-05", funded=True),
-                seg("2026-01-06", "2026-06-30"),
-            ],
-        )
-        self.assertEqual(warnings, [])
 
     def test_advanced_wholly_after_leave_is_dropped_with_a_warning(self):
         segments, warnings = build_segments(

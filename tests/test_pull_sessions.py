@@ -85,29 +85,19 @@ class PullSessionsTestCase(unittest.TestCase):
 class ParseTitleTests(unittest.TestCase):
     """The prefix table, and the non-funded (no prefix) case."""
 
-    def test_f_prefix_is_with_meals_and_activities(self):
-        parsed = pull_sessions.parse_title("(F) Morning")
-        self.assertTrue(parsed.funded)
-        self.assertEqual(parsed.variant, "with_meals_and_activities")
-        self.assertEqual(parsed.slot, "morning")
-
-    def test_fnm_prefix_is_no_meals(self):
-        parsed = pull_sessions.parse_title("(FNM) Afternoon")
-        self.assertTrue(parsed.funded)
-        self.assertEqual(parsed.variant, "no_meals")
-        self.assertEqual(parsed.slot, "afternoon")
-
-    def test_fna_prefix_is_no_activities(self):
-        parsed = pull_sessions.parse_title("(FNA) Full Day")
-        self.assertTrue(parsed.funded)
-        self.assertEqual(parsed.variant, "no_activities")
-        self.assertEqual(parsed.slot, "full_day")
-
-    def test_fne_prefix_is_neither(self):
-        parsed = pull_sessions.parse_title("(FNE) Morning")
-        self.assertTrue(parsed.funded)
-        self.assertEqual(parsed.variant, "neither")
-        self.assertEqual(parsed.slot, "morning")
+    def test_f_prefix_is_with_meals_and_activities_cases(self):
+        """Folded cases: f_prefix_is_with_meals_and_activities; fnm_prefix_is_no_meals; fna_prefix_is_no_activities; fne_prefix_is_neither."""
+        for _i, (_p0, _p1, _p2) in enumerate([
+            ("(F) Morning", "with_meals_and_activities", "morning"),
+            ("(FNM) Afternoon", "no_meals", "afternoon"),
+            ("(FNA) Full Day", "no_activities", "full_day"),
+            ("(FNE) Morning", "neither", "morning"),
+        ]):
+            with self.subTest(case=_i):
+                parsed = pull_sessions.parse_title(_p0)
+                self.assertTrue(parsed.funded)
+                self.assertEqual(parsed.variant, _p1)
+                self.assertEqual(parsed.slot, _p2)
 
     def test_no_prefix_is_non_funded(self):
         parsed = pull_sessions.parse_title("Full Day")
@@ -122,17 +112,17 @@ class ParseTitleTests(unittest.TestCase):
         parsed = pull_sessions.parse_title("(F) Full Day")
         self.assertEqual(parsed.slot, session_catalogue.normalise_slot("Full Day"))
 
-    def test_an_unrecognised_prefix_raises(self):
-        with self.assertRaises(pull_sessions.TitleParseError) as ctx:
-            pull_sessions.parse_title("(FX) Morning")
-        self.assertIn("unrecognised prefix", str(ctx.exception))
-        self.assertIn("(FX)", str(ctx.exception))
-
-    def test_a_recognised_prefix_with_unmappable_text_raises(self):
-        with self.assertRaises(pull_sessions.TitleParseError) as ctx:
-            pull_sessions.parse_title("(F) Brunch")
-        self.assertIn("Brunch", str(ctx.exception))
-        self.assertIn("known slot", str(ctx.exception))
+    def test_an_unrecognised_prefix_raises_cases(self):
+        """Folded cases: an_unrecognised_prefix_raises; a_recognised_prefix_with_unmappable_text_raises."""
+        for _i, (_p0, _p1, _p2) in enumerate([
+            ("(FX) Morning", "unrecognised prefix", "(FX)"),
+            ("(F) Brunch", "Brunch", "known slot"),
+        ]):
+            with self.subTest(case=_i):
+                with self.assertRaises(pull_sessions.TitleParseError) as ctx:
+                    pull_sessions.parse_title(_p0)
+                self.assertIn(_p1, str(ctx.exception))
+                self.assertIn(_p2, str(ctx.exception))
 
     def test_no_prefix_with_unmappable_text_raises(self):
         with self.assertRaises(pull_sessions.TitleParseError):

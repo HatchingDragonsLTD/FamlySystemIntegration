@@ -238,19 +238,18 @@ class ProductBookingTests(unittest.TestCase):
         self.assertEqual(bookings_of(payload), [])
         self.assertEqual(errors_of(payload), [])
 
-    def test_a_blank_addon_quantity_books_nothing(self):
-        payload = flat_payload(addon_quantity="")
+    def test_a_blank_addon_quantity_books_nothing_cases(self):
+        """Folded cases: a_blank_addon_quantity_books_nothing; quantity_zero_books_nothing_without_erroring."""
+        for _i, (_p0,) in enumerate([
+            ("",),
+            ("0",),
+        ]):
+            with self.subTest(case=_i):
+                payload = flat_payload(addon_quantity=_p0)
 
-        self.assertEqual(bookings_of(payload), [])
-        self.assertEqual(errors_of(payload), [])
+                self.assertEqual(bookings_of(payload), [])
+                self.assertEqual(errors_of(payload), [])
 
-    def test_quantity_zero_books_nothing_without_erroring(self):
-        payload = flat_payload(
-            addon_quantity="0"
-        )
-
-        self.assertEqual(bookings_of(payload), [])
-        self.assertEqual(errors_of(payload), [])
 
 
 class HubspotProductIdsAreIgnoredTests(unittest.TestCase):
@@ -334,10 +333,16 @@ class HalfDayAddonTests(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertEqual(days, [("MONDAY", FULL), ("WEDNESDAY", HALF)])
 
-    def test_two_days_books_the_full_pair_on_the_first_two_days(self):
-        days, errors = self.plan("2")
-        self.assertEqual(errors, [])
-        self.assertEqual(days, [("MONDAY", FULL), ("WEDNESDAY", FULL)])
+    def test_two_days_books_the_full_pair_on_the_first_two_days_cases(self):
+        """Folded cases: two_days_books_the_full_pair_on_the_first_two_days; a_non_half_fraction_floors_with_no_half_day."""
+        for _i, (_p0,) in enumerate([
+            ("2",),
+            ("2.3",),
+        ]):
+            with self.subTest(case=_i):
+                days, errors = self.plan(_p0)
+                self.assertEqual(errors, [])
+                self.assertEqual(days, [("MONDAY", FULL), ("WEDNESDAY", FULL)])
 
     def test_two_and_a_half_is_two_full_days_then_a_half_day(self):
         days, errors = self.plan("2.5")
@@ -347,19 +352,18 @@ class HalfDayAddonTests(unittest.TestCase):
             days, [("MONDAY", FULL), ("WEDNESDAY", FULL), ("THURSDAY", HALF)]
         )
 
-    def test_three_days_books_three_full_days(self):
-        days, errors = self.plan("3")
-        self.assertEqual(errors, [])
-        self.assertEqual(
-            days, [("MONDAY", FULL), ("WEDNESDAY", FULL), ("THURSDAY", FULL)]
-        )
-
-    def test_three_and_a_half_is_capped_to_three_full_days_with_no_half(self):
-        days, errors = self.plan("3.5")
-        self.assertEqual(errors, [])
-        self.assertEqual(
-            days, [("MONDAY", FULL), ("WEDNESDAY", FULL), ("THURSDAY", FULL)]
-        )
+    def test_three_days_books_three_full_days_cases(self):
+        """Folded cases: three_days_books_three_full_days; three_and_a_half_is_capped_to_three_full_days_with_no_half."""
+        for _i, (_p0,) in enumerate([
+            ("3",),
+            ("3.5",),
+        ]):
+            with self.subTest(case=_i):
+                days, errors = self.plan(_p0)
+                self.assertEqual(errors, [])
+                self.assertEqual(
+                    days, [("MONDAY", FULL), ("WEDNESDAY", FULL), ("THURSDAY", FULL)]
+                )
 
     def test_anything_above_three_is_capped_to_three_full_days(self):
         for quantity in ("4", "4.5", "5"):
@@ -370,12 +374,6 @@ class HalfDayAddonTests(unittest.TestCase):
                 [("MONDAY", FULL), ("TUESDAY", FULL), ("WEDNESDAY", FULL)],
                 quantity,
             )
-
-    def test_a_non_half_fraction_floors_with_no_half_day(self):
-        # Only a trailing .5 means a half day; 2.3 is two full days.
-        days, errors = self.plan("2.3")
-        self.assertEqual(errors, [])
-        self.assertEqual(days, [("MONDAY", FULL), ("WEDNESDAY", FULL)])
 
     def test_quantity_fits_exactly_when_full_plus_half_equals_the_booked_days(self):
         days, errors = self.plan("1.5", ["MONDAY", "FRIDAY"])
@@ -551,21 +549,19 @@ class ProductHardErrorTests(unittest.TestCase):
         # Not trimmed to the two available days -- nothing at all.
         self.assertEqual(bookings, [])
 
-    def test_a_non_numeric_quantity_is_an_error(self):
-        errors = errors_of(
-            flat_payload(
-                addon_quantity="three"
-            )
-        )
-        self.assertIn("not a number", errors[0])
-
-    def test_a_negative_quantity_is_an_error(self):
-        errors = errors_of(
-            flat_payload(
-                addon_quantity="-1"
-            )
-        )
-        self.assertIn("cannot be negative", errors[0])
+    def test_a_non_numeric_quantity_is_an_error_cases(self):
+        """Folded cases: a_non_numeric_quantity_is_an_error; a_negative_quantity_is_an_error."""
+        for _i, (_p0, _p1) in enumerate([
+            ("three", "not a number"),
+            ("-1", "cannot be negative"),
+        ]):
+            with self.subTest(case=_i):
+                errors = errors_of(
+                    flat_payload(
+                        addon_quantity=_p0
+                    )
+                )
+                self.assertIn(_p1, errors[0])
 
     def test_these_are_hard_errors_not_advisory_warnings(self):
         nested = flatten.flatten_to_nested(

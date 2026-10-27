@@ -229,11 +229,14 @@ class PhoneNormaliserTests(unittest.TestCase):
             "0044 (0)7700 900123": "+447700900123",
         })
 
-    def test_the_0044_prefix_passes(self):
-        self.check({"0044 7700 900123": "+447700900123", "00447700900123": "+447700900123"})
-
-    def test_uk_landlines_pass(self):
-        self.check({"020 7946 0000": "+442079460000", "(020) 7946 0000": "+442079460000"})
+    def test_the_0044_prefix_passes_cases(self):
+        """Folded cases: the_0044_prefix_passes; uk_landlines_pass."""
+        for _i, (_p0, _p1, _p2, _p3) in enumerate([
+            ("0044 7700 900123", "00447700900123", "+447700900123", "+447700900123"),
+            ("020 7946 0000", "(020) 7946 0000", "+442079460000", "+442079460000"),
+        ]):
+            with self.subTest(case=_i):
+                self.check({_p0: _p2, _p1: _p3})
 
     def test_extensions_two_numbers_and_text_are_rejected(self):
         self.check({

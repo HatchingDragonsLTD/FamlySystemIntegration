@@ -378,35 +378,26 @@ class GeneralizedDiscountSlotTests(unittest.TestCase):
         self.assertIn("percent", problems[0])
         self.assertIn("fixed", problems[0])
 
-    def test_a_percent_amount_above_one_is_excluded_and_warned_about(self):
-        discounts, problems = flatten.build_discounts(
-            flat_payload(
-                discount_1_name="Oops",
-                discount_1_amount="1.5",
-                discount_1_flag="percent",
-            )
-        )
+    def test_a_percent_amount_above_one_is_excluded_and_warned_about_cases(self):
+        """Folded cases: a_percent_amount_above_one_is_excluded_and_warned_about; a_fixed_amount_above_5000_is_excluded_and_warned_about."""
+        for _i, (_p0, _p1, _p2, _p3) in enumerate([
+            ("Oops", "1.5", "percent", "1.5"),
+            ("Too Much", "5000.01", "fixed", "5000.01"),
+        ]):
+            with self.subTest(case=_i):
+                discounts, problems = flatten.build_discounts(
+                    flat_payload(
+                        discount_1_name=_p0,
+                        discount_1_amount=_p1,
+                        discount_1_flag=_p2,
+                    )
+                )
 
-        self.assertEqual(discounts, [])
-        self.assertEqual(len(problems), 1)
-        self.assertIn("Discount 1", problems[0])
-        self.assertIn("out of range", problems[0])
-        self.assertIn("1.5", problems[0])
-
-    def test_a_fixed_amount_above_5000_is_excluded_and_warned_about(self):
-        discounts, problems = flatten.build_discounts(
-            flat_payload(
-                discount_1_name="Too Much",
-                discount_1_amount="5000.01",
-                discount_1_flag="fixed",
-            )
-        )
-
-        self.assertEqual(discounts, [])
-        self.assertEqual(len(problems), 1)
-        self.assertIn("Discount 1", problems[0])
-        self.assertIn("out of range", problems[0])
-        self.assertIn("5000.01", problems[0])
+                self.assertEqual(discounts, [])
+                self.assertEqual(len(problems), 1)
+                self.assertIn("Discount 1", problems[0])
+                self.assertIn("out of range", problems[0])
+                self.assertIn(_p3, problems[0])
 
     def test_a_fixed_amount_of_exactly_5000_is_allowed(self):
         discounts, problems = flatten.build_discounts(

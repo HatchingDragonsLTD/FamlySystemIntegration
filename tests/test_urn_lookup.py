@@ -91,15 +91,16 @@ class UrnLookupTestCase(unittest.TestCase):
 # Matching: exact, normalized, zero, and multiple matches.
 # --------------------------------------------------------------------------- #
 class FindMatchesTests(UrnLookupTestCase):
-    def test_an_exact_match_is_found(self):
-        roster = [runner.ChildRow(id="c-1", external_id="urn:deal:123", full_name="Ada")]
-        matches = runner.find_matches("urn:deal:123", roster)
-        self.assertEqual([m.id for m in matches], ["c-1"])
-
-    def test_mismatched_case_and_whitespace_still_match(self):
-        roster = [runner.ChildRow(id="c-1", external_id="  URN:Deal:123  ", full_name="Ada")]
-        matches = runner.find_matches(" urn:deal:123 ", roster)
-        self.assertEqual([m.id for m in matches], ["c-1"])
+    def test_an_exact_match_is_found_cases(self):
+        """Folded cases: an_exact_match_is_found; mismatched_case_and_whitespace_still_match."""
+        for _i, (_p0, _p1) in enumerate([
+            ("urn:deal:123", "urn:deal:123"),
+            ("  URN:Deal:123  ", " urn:deal:123 "),
+        ]):
+            with self.subTest(case=_i):
+                roster = [runner.ChildRow(id="c-1", external_id=_p0, full_name="Ada")]
+                matches = runner.find_matches(_p1, roster)
+                self.assertEqual([m.id for m in matches], ["c-1"])
 
     def test_zero_matches_returns_an_empty_list(self):
         roster = [runner.ChildRow(id="c-1", external_id="urn:deal:999", full_name="Ada")]
@@ -387,17 +388,17 @@ class TimeRangeTests(UrnLookupTestCase):
         )
         return runner.fetch_roster(client=client), client
 
-    def test_a_child_who_has_left_is_in_the_roster(self):
-        rows, _ = self.roster()
-        matches = runner.find_matches("urn:past", rows)
+    def test_a_child_who_has_cases(self):
+        """Folded cases: a_child_who_has_left_is_in_the_roster; a_child_who_has_not_started_is_in_the_roster."""
+        for _i, (_p0, _p1) in enumerate([
+            ("urn:past", "c-past"),
+            ("urn:future", "c-future"),
+        ]):
+            with self.subTest(case=_i):
+                rows, _ = self.roster()
+                matches = runner.find_matches(_p0, rows)
 
-        self.assertEqual([m.id for m in matches], ["c-past"])
-
-    def test_a_child_who_has_not_started_is_in_the_roster(self):
-        rows, _ = self.roster()
-        matches = runner.find_matches("urn:future", rows)
-
-        self.assertEqual([m.id for m in matches], ["c-future"])
+                self.assertEqual([m.id for m in matches], [_p1])
 
     def test_a_current_child_is_still_found(self):
         rows, _ = self.roster()

@@ -47,13 +47,15 @@ class RoundTargetTests(unittest.TestCase):
                 self.assertEqual(round_target(estimate), D(target))
                 self.assertEqual(adjustment_for(estimate), D(adjustment))
 
-    def test_the_window_boundary_snaps(self):
-        self.assertEqual(round_target(1501.00), D("1500.00"))
-        self.assertEqual(adjustment_for(1501.00), D("-1.00"))
-
-    def test_just_outside_the_window_goes_to_a_whole_pound(self):
-        self.assertEqual(round_target(1501.01), D("1501.00"))
-        self.assertEqual(adjustment_for(1501.01), D("-0.01"))
+    def test_the_window_boundary_snaps_cases(self):
+        """Folded cases: the_window_boundary_snaps; just_outside_the_window_goes_to_a_whole_pound."""
+        for _i, (_p0, _p1, _p2, _p3) in enumerate([
+            (1501.00, "1500.00", 1501.00, "-1.00"),
+            (1501.01, "1501.00", 1501.01, "-0.01"),
+        ]):
+            with self.subTest(case=_i):
+                self.assertEqual(round_target(_p0), D(_p1))
+                self.assertEqual(adjustment_for(_p2), D(_p3))
 
     def test_halves_round_up(self):
         self.assertEqual(round_target(1003.50), D("1004.00"))

@@ -783,27 +783,23 @@ class InvalidInputTests(ChainTestCase):
             "advanced_discount",
         )
 
-    def test_5_is_rejected_because_percent_amounts_are_fractions(self):
-        self.assert_refused_without_famly(
-            payload(
-                has_advanced_fee="true",
-                advanced_start="2026-10-01",
-                advanced_end="2026-10-31",
-                advanced_discount="5",
-            ),
-            "percent amounts are fractions, 5% is 0.05",
-        )
-
-    def test_40_is_rejected_because_percent_amounts_are_fractions(self):
-        self.assert_refused_without_famly(
-            payload(
-                has_advanced_fee="true",
-                advanced_start="2026-10-01",
-                advanced_end="2026-10-31",
-                advanced_discount="40",
-            ),
-            "percent amounts are fractions, 5% is 0.05",
-        )
+    def test_5_is_rejected_because_percent_amounts_are_fractions_cases(self):
+        """Folded cases: 5_is_rejected_because_percent_amounts_are_fractions; 40_is_rejected_because_percent_amounts_are_fractions; an_out_of_range_advanced_discount_is_a_hard_error_not_a_dropped_discount."""
+        for _i, (_p0, _p1) in enumerate([
+            ("percent amounts are fractions, 5% is 0.05", "5"),
+            ("percent amounts are fractions, 5% is 0.05", "40"),
+            ("percent amounts are fractions", "6000"),
+        ]):
+            with self.subTest(case=_i):
+                self.assert_refused_without_famly(
+                    payload(
+                        has_advanced_fee="true",
+                        advanced_start="2026-10-01",
+                        advanced_end="2026-10-31",
+                        advanced_discount=_p1,
+                    ),
+                    _p0,
+                )
 
     def test_the_error_is_reported_once_however_many_plans_are_advanced(self):
         data, status = self.start(
@@ -818,17 +814,6 @@ class InvalidInputTests(ChainTestCase):
         self.assertEqual(status, 422)
         self.assertEqual(len([e for e in data["errors"] if "fractions" in e]), 1)
         self.assertFalse(any("Advanced Fee Discount invalid" in e for e in data["errors"]))
-
-    def test_an_out_of_range_advanced_discount_is_a_hard_error_not_a_dropped_discount(self):
-        self.assert_refused_without_famly(
-            payload(
-                has_advanced_fee="true",
-                advanced_start="2026-10-01",
-                advanced_end="2026-10-31",
-                advanced_discount="6000",
-            ),
-            "percent amounts are fractions",
-        )
 
     def test_the_limits_of_the_percent_range(self):
         for amount, accepted in (

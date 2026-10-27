@@ -97,13 +97,15 @@ def _epoch_ms(iso_date: str) -> int:
 # Unit: from_dict reads it, validate() checks it, to_plan_body emits it.
 # --------------------------------------------------------------------------- #
 class FromDictTests(unittest.TestCase):
-    def test_reads_the_camel_case_to_field(self):
-        plan_input = input_schema.from_dict({"to": "2026-12-19"})
-        self.assertEqual(plan_input.to_date, "2026-12-19")
-
-    def test_reads_the_snake_case_to_date_field(self):
-        plan_input = input_schema.from_dict({"to_date": "2026-12-19"})
-        self.assertEqual(plan_input.to_date, "2026-12-19")
+    def test_reads_the_camel_case_to_field_cases(self):
+        """Folded cases: reads_the_camel_case_to_field; reads_the_snake_case_to_date_field."""
+        for _i, (_p0,) in enumerate([
+            ("to",),
+            ("to_date",),
+        ]):
+            with self.subTest(case=_i):
+                plan_input = input_schema.from_dict({_p0: "2026-12-19"})
+                self.assertEqual(plan_input.to_date, "2026-12-19")
 
     def test_absent_to_is_none(self):
         plan_input = input_schema.from_dict({"from": "2026-09-01"})
@@ -303,15 +305,19 @@ class ExclusiveEndConversionTests(unittest.TestCase):
     def test_hubspot_epoch_milliseconds_are_converted_then_advanced(self):
         self.assertEqual(flatten.exclusive_end(_epoch_ms("2026-12-31")), "2027-01-01")
 
-    def test_a_datetime_string_uses_its_date_part(self):
-        self.assertEqual(flatten.exclusive_end("2026-12-31T00:00:00Z"), "2027-01-01")
+    def test_a_datetime_string_uses_its_date_part_cases(self):
+        """Folded cases: a_datetime_string_uses_its_date_part; the_last_representable_day_does_not_raise."""
+        for _i, (_p0, _p1) in enumerate([
+            ("2027-01-01", "2026-12-31T00:00:00Z"),
+            ("9999-12-31", "9999-12-31"),
+        ]):
+            with self.subTest(case=_i):
+                self.assertEqual(flatten.exclusive_end(_p1), _p0)
 
     def test_something_that_is_not_a_date_passes_through_for_validate_to_report(self):
         self.assertEqual(flatten.exclusive_end("notarealdate"), "notarealdate")
         self.assertEqual(flatten.exclusive_end("2026-13-45"), "2026-13-45")
 
-    def test_the_last_representable_day_does_not_raise(self):
-        self.assertEqual(flatten.exclusive_end("9999-12-31"), "9999-12-31")
 
 
 class ExclusiveEndEndToEndTests(unittest.TestCase):

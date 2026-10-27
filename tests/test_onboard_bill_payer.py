@@ -798,13 +798,15 @@ class GateACountTests(BPCase):
             plan["billPayer"] = {"status": bill_payer}
         return notifier.gate_text(plan, "h" * 64, "live")
 
-    def test_create(self):
-        self.assertIn("Famly writes planned: 1 child, 2 contact(s), 1 bill payer",
-                      self.text("child_would_create", ["would_create"] * 2, "would_create"))
-
-    def test_attach_counts_one_write(self):
-        self.assertIn("Famly writes planned: 1 child, 2 contact(s), 1 bill payer",
-                      self.text("child_would_create", ["would_create"] * 2, "would_attach"))
+    def test_create_cases(self):
+        """Folded cases: create; attach_counts_one_write."""
+        for _i, (_p0,) in enumerate([
+            ("would_create",),
+            ("would_attach",),
+        ]):
+            with self.subTest(case=_i):
+                self.assertIn("Famly writes planned: 1 child, 2 contact(s), 1 bill payer",
+                              self.text("child_would_create", ["would_create"] * 2, _p0))
 
     def test_flagged_and_present_count_zero(self):
         for status in ("flagged", "present"):

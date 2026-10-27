@@ -50,20 +50,17 @@ class SessionDisplayNameTests(unittest.TestCase):
                 raw,
             )
 
-    def test_funded_with_meals_and_activities_has_no_suffix(self):
-        self.check("(F) ", "Funded {slot}")
-
-    def test_funded_no_meals(self):
-        self.check("(FNM) ", "Funded {slot} (No Meals)")
-
-    def test_funded_no_activities(self):
-        self.check("(FNA) ", "Funded {slot} (No Activities)")
-
-    def test_funded_neither_is_no_extras(self):
-        self.check("(FNE) ", "Funded {slot} (No Extras)")
-
-    def test_non_funded_gets_just_the_slot_label(self):
-        self.check("", "{slot}")
+    def test_funded_with_meals_and_activities_has_no_suffix_cases(self):
+        """Folded cases: funded_with_meals_and_activities_has_no_suffix; funded_no_meals; funded_no_activities; funded_neither_is_no_extras; non_funded_gets_just_the_slot_label."""
+        for _i, (_p0, _p1) in enumerate([
+            ("(F) ", "Funded {slot}"),
+            ("(FNM) ", "Funded {slot} (No Meals)"),
+            ("(FNA) ", "Funded {slot} (No Activities)"),
+            ("(FNE) ", "Funded {slot} (No Extras)"),
+            ("", "{slot}"),
+        ]):
+            with self.subTest(case=_i):
+                self.check(_p0, _p1)
 
     def test_the_exact_names_called_out_by_the_spec(self):
         for raw, expected in (
@@ -112,29 +109,19 @@ class SessionDisplayNameTests(unittest.TestCase):
 # Products
 # --------------------------------------------------------------------------- #
 class ProductDisplayNameTests(unittest.TestCase):
-    def test_funded_prefix(self):
-        self.assertEqual(
-            display_names.product_display_name("(F) Meals & Snacks"), "Funded Meals & Snacks"
-        )
-
-    def test_half_day_prefix(self):
-        self.assertEqual(
-            display_names.product_display_name("(1/2) Meals & Snacks"),
-            "Half Day Meals & Snacks",
-        )
-
-    def test_half_day_funded_prefix(self):
-        self.assertEqual(
-            display_names.product_display_name("(1/2,F) Educational Activities & Extras"),
-            "Half Day Funded Educational Activities & Extras",
-        )
-
-    def test_the_funded_prefix_alone_does_not_swallow_the_half_day_funded_one(self):
-        # "(1/2,F) " starts with neither "(F) " nor "(1/2) ".
-        self.assertEqual(
-            display_names.product_display_name("(1/2,F) Meals & Snacks"),
-            "Half Day Funded Meals & Snacks",
-        )
+    def test_funded_prefix_cases(self):
+        """Folded cases: funded_prefix; half_day_prefix; half_day_funded_prefix; the_funded_prefix_alone_does_not_swallow_the_half_day_funded_one; the_prefix_is_replaced_once."""
+        for _i, (_p0, _p1) in enumerate([
+            ("Funded Meals & Snacks", "(F) Meals & Snacks"),
+            ("Half Day Meals & Snacks", "(1/2) Meals & Snacks"),
+            ("Half Day Funded Educational Activities & Extras", "(1/2,F) Educational Activities & Extras"),
+            ("Half Day Funded Meals & Snacks", "(1/2,F) Meals & Snacks"),
+            ("Funded (F) Meals", "(F) (F) Meals"),
+        ]):
+            with self.subTest(case=_i):
+                self.assertEqual(
+                    display_names.product_display_name(_p1), _p0
+                )
 
     def test_plain_titles_are_unchanged(self):
         for raw in ("Meals & Snacks", "Educational Activities & Extras", "Trip"):
@@ -149,11 +136,6 @@ class ProductDisplayNameTests(unittest.TestCase):
             " (F) Meals & Snacks",  # leading space
         ):
             self.assertEqual(display_names.product_display_name(raw), raw, raw)
-
-    def test_the_prefix_is_replaced_once(self):
-        self.assertEqual(
-            display_names.product_display_name("(F) (F) Meals"), "Funded (F) Meals"
-        )
 
     def test_a_non_string_title_is_empty_not_an_error(self):
         for raw in (None, 7):

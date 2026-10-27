@@ -124,11 +124,17 @@ class HardErrorTests(RulesTestCase):
             "HDWEST", "15", False,
         )
 
-    def test_a_missing_entitlement_names_the_exact_path(self):
-        self.assert_error(
-            "funding_rules: no fundedWeeklyHours for HDCW > 45 > all_year_round",
-            "HDCW", "45", False,
-        )
+    def test_a_missing_entitlement_names_the_exact_path_cases(self):
+        """Folded cases: a_missing_entitlement_names_the_exact_path; an_unknown_institution."""
+        for _i, (_p0, _p1, _p2) in enumerate([
+            ("funding_rules: no fundedWeeklyHours for HDCW > 45 > all_year_round", "HDCW", "45"),
+            ("funding_rules: no institution HDXYZ", "hdxyz", "30"),
+        ]):
+            with self.subTest(case=_i):
+                self.assert_error(
+                    _p0,
+                    _p1, _p2, False,
+                )
 
     def test_a_missing_schedule_names_the_exact_path(self):
         rules = json.loads(json.dumps(RULES))
@@ -149,9 +155,6 @@ class HardErrorTests(RulesTestCase):
             "funding_rules: no fundedWeeklyHours for HDCITY > 30 > all_year_round",
             "HDCITY", "30", False,
         )
-
-    def test_an_unknown_institution(self):
-        self.assert_error("funding_rules: no institution HDXYZ", "hdxyz", "30", False)
 
     def test_a_missing_cap(self):
         rules = json.loads(json.dumps(RULES))

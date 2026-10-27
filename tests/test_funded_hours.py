@@ -431,8 +431,14 @@ class AppliedMinutesTests(unittest.TestCase):
     def funding(self, **parts):
         return SimpleNamespace(**{"hours": None, "minutes": None, "seconds": None, **parts})
 
-    def test_hours_and_minutes_are_components_of_one_duration(self):
-        self.assertEqual(funded_hours.applied_minutes(self.funding(hours=27, minutes=30)), 1650)
+    def test_hours_and_minutes_are_components_of_one_duration_cases(self):
+        """Folded cases: hours_and_minutes_are_components_of_one_duration; a_minutes_figure_of_sixty_or_more_is_read_as_the_total."""
+        for _i, (_p0,) in enumerate([
+            (30,),
+            (1650,),
+        ]):
+            with self.subTest(case=_i):
+                self.assertEqual(funded_hours.applied_minutes(self.funding(hours=27, minutes=_p0)), 1650)
 
     def test_seconds_are_added(self):
         self.assertEqual(funded_hours.applied_minutes(self.funding(hours=1, minutes=1, seconds=30)), Decimal("61.5"))
@@ -443,9 +449,6 @@ class AppliedMinutesTests(unittest.TestCase):
 
     def test_minutes_alone(self):
         self.assertEqual(funded_hours.applied_minutes(self.funding(minutes=45)), 45)
-
-    def test_a_minutes_figure_of_sixty_or_more_is_read_as_the_total(self):
-        self.assertEqual(funded_hours.applied_minutes(self.funding(hours=27, minutes=1650)), 1650)
 
     def test_nothing_reported_is_none_and_zero_is_zero(self):
         self.assertIsNone(funded_hours.applied_minutes(None))
