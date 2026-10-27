@@ -33,6 +33,7 @@ from actions.plan_write import approval, preview_store, runner
 from actions.read_child_plans import runner as read_child_plans
 from core.rest_client import RestHTTPError
 from integrations import child_lookup, slack
+from tests import fast_sqlite  # noqa: F401  (SQLite without fsync: see the module)
 
 logging.disable(logging.CRITICAL)
 

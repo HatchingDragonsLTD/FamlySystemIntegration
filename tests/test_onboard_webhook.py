@@ -20,6 +20,7 @@ from unittest import mock
 import server
 from actions.onboard import cli_enqueue, store, web
 from tests.test_onboard_phase2 import DEAL, PII, Phase2Case
+from tests import fast_sqlite  # noqa: F401  (SQLite without fsync: see the module)
 
 SECRET = "s3cret-value-for-tests"
 

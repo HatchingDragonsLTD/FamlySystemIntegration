@@ -20,6 +20,7 @@ from unittest import mock
 from actions.pull_roster import runner as pull_roster
 from actions.pull_roster import store
 from core.client import GraphQLError, GraphQLHTTPError
+from tests import fast_sqlite  # noqa: F401  (SQLite without fsync: see the module)
 
 logging.disable(logging.CRITICAL)
 

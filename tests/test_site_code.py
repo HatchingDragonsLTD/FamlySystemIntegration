@@ -23,6 +23,7 @@ from unittest import mock
 from actions.plan_write import hubspot_flatten as flatten
 from actions.plan_write import hubspot_intake, input_schema, preview_store, runner
 from integrations import catalogue, slack
+from tests import fast_sqlite  # noqa: F401  (SQLite without fsync: see the module)
 
 logging.disable(logging.CRITICAL)
 

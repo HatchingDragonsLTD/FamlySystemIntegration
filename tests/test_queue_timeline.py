@@ -34,6 +34,7 @@ from actions.queue_timeline import jobs, worker
 from actions.queue_timeline import web as queue_web
 from core.rest_client import RestHTTPError
 from integrations import child_lookup, slack
+from tests import fast_sqlite  # noqa: F401  (SQLite without fsync: see the module)
 
 logging.disable(logging.CRITICAL)
 

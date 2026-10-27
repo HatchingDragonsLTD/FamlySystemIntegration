@@ -18,6 +18,7 @@ from actions.read_child_plans.runner import Plan
 from core.hubspot import HubSpotError
 from core.rest_client import RestHTTPError
 from tests.test_commit_approval import CHILD_ID, PLAN_BODY, PREVIEW_ID, FakeResult, StoreTestCase
+from tests import fast_sqlite  # noqa: F401  (SQLite without fsync: see the module)
 
 logging.disable(logging.CRITICAL)
 BOOL = {"type": "bool", "fieldType": "booleancheckbox", "options": []}

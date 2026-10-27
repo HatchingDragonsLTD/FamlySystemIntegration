@@ -20,6 +20,7 @@ from actions.additional_plan import web as additional_plan_web
 from actions.plan_write import approval, preview_store, runner
 from actions.read_child_plans.runner import ChildPlansResult, Plan
 from integrations import slack
+from tests import fast_sqlite  # noqa: F401  (SQLite without fsync: see the module)
 
 logging.disable(logging.CRITICAL)
 

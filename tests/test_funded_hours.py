@@ -34,6 +34,7 @@ from actions.plan_write import web as plan_write_web
 from actions.queue_timeline import jobs, worker
 from actions.queue_timeline import web as queue_web
 from integrations import slack
+from tests import fast_sqlite  # noqa: F401  (SQLite without fsync: see the module)
 
 logging.disable(logging.CRITICAL)
 

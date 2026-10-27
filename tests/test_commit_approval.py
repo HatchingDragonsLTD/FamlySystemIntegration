@@ -22,6 +22,7 @@ from unittest import mock
 
 from actions.plan_write import approval, preview_store
 from actions.read_child_plans.runner import ChildPlansResult, Plan
+from tests import fast_sqlite  # noqa: F401  (SQLite without fsync: see the module)
 
 logging.disable(logging.CRITICAL)
 

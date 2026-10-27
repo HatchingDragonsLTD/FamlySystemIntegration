@@ -26,6 +26,7 @@ from actions.additional_plan import web as additional_plan_web
 from actions.create_timeline import chains
 from actions.plan_write import approval, auto_round, preview_store, web as plan_write_web
 from core.rest_client import RestHTTPError
+from tests import fast_sqlite  # noqa: F401  (SQLite without fsync: see the module)
 
 logging.disable(logging.CRITICAL)
 

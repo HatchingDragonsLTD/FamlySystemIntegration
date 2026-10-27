@@ -29,6 +29,7 @@ except ImportError:  # `python -m unittest discover -s tests`
 from actions.delete_plans import delete_digest, digest, runner
 from actions.plan_write import preview_store
 from integrations import slack
+from tests import fast_sqlite  # noqa: F401  (SQLite without fsync: see the module)
 
 logging.disable(logging.CRITICAL)
 

@@ -26,6 +26,7 @@ from actions.probe_bill_payers import runner as probe_runner
 from core.client import GraphQLError, GraphQLHTTPError
 from tests.test_onboard_phase2 import DEAL, PII, SITE_ID, FakeFamly, FakeRest, Phase2Case
 from tests.test_probe_bill_payers_write import schema as write_schema
+from tests import fast_sqlite  # noqa: F401  (SQLite without fsync: see the module)
 
 CHILD = "child-1"          # the first child the phase 2 fake creates
 SENSITIVE = ("socialSecurityNumber", "accountNumber", "sortCode")

@@ -8,6 +8,7 @@ from actions.onboard import store
 from actions.onboard_dry_run.famly_reads import FamlyReads
 from actions.onboard_dry_run.runner import DryRun
 from tests.test_onboard_phase2 import DEAL, GROUP_ID, SITE_ID, Phase2Case
+from tests import fast_sqlite  # noqa: F401  (SQLite without fsync: see the module)
 
 NAME_DEPENDENT = ("child_name_incomplete", "child_possible_duplicate")
 NAME_WARNINGS = ("duplicate_check_skipped", "child_name_unavailable_for_duplicate_check")

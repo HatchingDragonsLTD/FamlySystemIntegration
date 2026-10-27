@@ -38,6 +38,7 @@ from core.hubspot import HubSpotDealWriter, HubSpotError
 from core.rest_client import RestHTTPError
 from integrations import slack
 from tests.test_onboard_dry_run import FakeHubSpot, make_deal
+from tests import fast_sqlite  # noqa: F401  (SQLite without fsync: see the module)
 
 DEAL = "1001"
 SITE_ID = "site-west"
