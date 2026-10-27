@@ -55,5 +55,3 @@ env/
 var/delete_plans_allowlist.txt
 var/plan-backups/
 
-# probe-invoice-recipient: the raw error response and request of a failed write (test values only).
-probe_invoice_recipient_error.json

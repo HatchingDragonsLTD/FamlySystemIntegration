@@ -1,9 +1,0 @@
-# ONE-OFF PROBE WRITE 3 of 3. The full `contacts` update, the only one that carries
-# externalSystemsReferences ("When provided, replaces all of the contact's references").
-mutation ProbeRefUpdateContact($contacts: [ContactUpdate!]) {
-  contacts {
-    update(contacts: $contacts) {
-      id
-    }
-  }
-}

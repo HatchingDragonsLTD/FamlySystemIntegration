@@ -1,8 +1,0 @@
-# ONE-OFF PROBE WRITE 1. One test contact on the test child, with NO reference.
-mutation ProbeIRCreateContact($contacts: [ContactInput!]!) {
-  contacts {
-    create(contacts: $contacts) {
-      id
-    }
-  }
-}

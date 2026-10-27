@@ -1,8 +1,0 @@
-# ONE-OFF PROBE WRITE 1 of 3 (probe-contact-reference). ContactsMutation.create, selecting only `id`.
-mutation ProbeRefCreate($contacts: [ContactInput!]!) {
-  contacts {
-    create(contacts: $contacts) {
-      id
-    }
-  }
-}
