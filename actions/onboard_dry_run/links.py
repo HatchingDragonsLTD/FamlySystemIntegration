@@ -139,6 +139,25 @@ class DealContact:
     # The raw allow-listed contact properties, IN MEMORY ONLY: used to build a
     # Famly contact. repr=False so it can never leak into a log line by accident.
     props: dict = field(default_factory=dict, repr=False)
+    # Every email address of the contact: the primary plus each additional one, canonical (trimmed,
+    # lower-cased, googlemail = gmail), de-duplicated. IN MEMORY ONLY, repr=False. `email` stays the
+    # primary: a Famly contact is created with that one only. Filled from `props` when not given.
+    emails: frozenset = field(default_factory=frozenset, repr=False)
+
+    def __post_init__(self):
+        if not self.emails:
+            self.emails = email_set(self.email, (self.props or {}).get("hs_additional_emails"))
+
+
+def email_set(primary, additional) -> frozenset:
+    """The canonical set of a contact's addresses: the primary and the semicolon-separated additional
+    ones (HubSpot's `hs_additional_emails`). Blank entries are dropped."""
+    from actions.onboard_dry_run.famly_reads import normalise_email
+
+    found = {normalise_email(primary)}
+    found |= {normalise_email(part) for part in str(additional or "").split(";")}
+    found.discard("")
+    return frozenset(found)
 
 
 # Phone order: first one present wins. (source code, HubSpot property, Famly type)

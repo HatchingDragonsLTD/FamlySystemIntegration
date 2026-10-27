@@ -853,7 +853,8 @@ def _create_contacts(
                 here = []                                   # a new child: nothing to find
             else:
                 # The live check: the HubSpot reference on this child first, then email.
-                here = famly.locate_contact(child_id, hubspot_id, target).ids
+                # The contact's primary and additional addresses, after the reference.
+                here = famly.locate_contact(child_id, hubspot_id, contact.emails or target).ids
 
             planned = entry.get("status")             # what the APPROVED plan said about this contact
             if len(here) == 1 and planned == "would_create":

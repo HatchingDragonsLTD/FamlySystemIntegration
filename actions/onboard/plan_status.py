@@ -55,8 +55,10 @@ def _contact_line(entry: dict, position: int = 1, total: int = 1, child_found: b
             return messages.state("contact_relation_will_add", **fields)
         if entry.get("relation") == "unreadable":
             return messages.state("contact_relation_unreadable", **fields)
+        by = entry.get("matchedBy")
         return messages.state(
-            "contact_present_reference" if entry.get("matchedBy") == "reference" else "contact_present_email",
+            "contact_present_reference" if by == "reference"
+            else "contact_present_additional_email" if by == "additional_email" else "contact_present_email",
             **fields)
     if status == "child_unresolved":
         return messages.state("contact_not_checked", **fields)

@@ -280,7 +280,8 @@ def decide(contacts, payers: list[Payer] | None, child_id: str | None = None) ->
     if payers is None:
         return Decision(FLAGGED, SCAN_FAILED)
 
-    matches = [p for p in payers if p.email == email]
+    emails = set(getattr(contact, "emails", None) or ()) | {email}      # primary plus additional addresses
+    matches = [p for p in payers if p.email in emails]
     if len(matches) >= 2:
         return Decision(FLAGGED, AMBIGUOUS, matches=len(matches))
     matched = matches[0] if matches else None

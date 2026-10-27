@@ -816,10 +816,10 @@ class HubSpotClientTests(unittest.TestCase):
         sent = [params["properties"].split(",") for _, params, _ in session.requests]
         self.assertEqual(sent[0], list(hubspot.DEAL_PROPERTIES))
         self.assertEqual(sent[1], list(hubspot.CONTACT_PROPERTIES))
-        for needed in ("email", "firstname", "lastname", "mobilephone", "phone",
+        for needed in ("email", "hs_additional_emails", "firstname", "lastname", "mobilephone", "phone",
                        "address", "city", "zip", "state", "country"):
             self.assertIn(needed, sent[1])
-        self.assertEqual(len(sent[1]), 11)  # those ten plus the WhatsApp property
+        self.assertEqual(len(sent[1]), 12)  # those eleven plus the WhatsApp property
         self.assertEqual(sent[2], list(hubspot.QUOTE_PROPERTIES))
         for props in sent:
             self.assertNotIn("all", [p.lower() for p in props])

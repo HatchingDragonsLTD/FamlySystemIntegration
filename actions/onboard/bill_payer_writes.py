@@ -245,12 +245,17 @@ class StageResult:
     sent: bool = False                          # a mutation was sent
 
 
-def _verified(payers, email_key: str, child_id: str, expect_id: str | None) -> str | None:
+def _email_in(key, value: str) -> bool:
+    """`key` is one canonical address or a set of them (primary plus additional addresses)."""
+    return value in key if isinstance(key, (set, frozenset)) else value == key
+
+
+def _verified(payers, email_key, child_id: str, expect_id: str | None) -> str | None:
     """The payer id if EXACTLY ONE live payer has the canonical email and lists the child
     at 1.0 (and is `expect_id`, when given); else None."""
     if payers is None:
         return None
-    matches = [p for p in payers if p.email == email_key]
+    matches = [p for p in payers if _email_in(email_key, p.email)]
     if len(matches) != 1:
         return None
     payer = matches[0]
@@ -299,7 +304,8 @@ def run_stage(*, public, scan, contacts, approved: dict, site_id: str, child_id:
         return StageResult(scan_mod.CREATE_UNCONFIRMED)
 
     bill_payer_contact = next(c for c in contacts if c.is_bill_payer)
-    email_key = scan_mod.normalise_email(bill_payer_contact.email)
+    email_key = (set(getattr(bill_payer_contact, "emails", None) or ())
+                 | {scan_mod.normalise_email(bill_payer_contact.email)}) - {""}
     try:
         plan = load_plan(public)
     except NotConfigured as exc:
@@ -329,7 +335,7 @@ def run_stage(*, public, scan, contacts, approved: dict, site_id: str, child_id:
             payers = scan()
             if payers is None:
                 raise RuntimeError("scan_failed")         # could not read, never "not found"
-            same = [p.id for p in payers if p.email == email_key]
+            same = [p.id for p in payers if _email_in(email_key, p.email)]
             if len(same) > 1:
                 return same                               # not lag: stop at once
             found_id = _verified(payers, email_key, child_id, expect_id)

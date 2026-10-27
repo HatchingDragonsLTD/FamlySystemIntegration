@@ -53,6 +53,8 @@ UNMATCHED_ON_EXISTING_CHILD = "contact_unmatched_on_existing_child"
 NO_EMAIL = "no_email"
 AMBIGUOUS_ON_CHILD = "ambiguous_on_child"
 CHILD_UNRESOLVED = "child_unresolved"
+# One Famly contact on the child matches two different deal contacts: a hold (code and ids only).
+FAMLY_CONTACT_MATCHES_TWO = "famly_contact_matches_two_deal_contacts"
 
 # How a contact would be matched (`matchedBy`): by its HubSpot reference, by email, or not at all.
 MATCH_CREATE = "create"
@@ -498,6 +500,19 @@ class DryRun:
             else:
                 entry["status"] = CHILD_UNRESOLVED
             out.append(entry)
+        # One Famly contact must not stand for two different deal parents (they share an address): a
+        # hold, with no create and no RELATION write for either.
+        by_famly: dict = {}
+        for index in present_ids:
+            by_famly.setdefault(out[index]["famlyContactId"], []).append(index)
+        for famly_id, indexes in sorted(by_famly.items()):
+            if len(indexes) > 1:
+                for index in indexes:
+                    out[index]["status"] = FAMLY_CONTACT_MATCHES_TWO
+                    out[index].pop("matchedBy", None)
+                holds.append({"reason": FAMLY_CONTACT_MATCHES_TWO, "contactIds": [famly_id],
+                              "hubspotContactIds": sorted(out[i]["hubspotContactId"] for i in indexes)})
+        present_ids = [i for i in present_ids if out[i]["status"] == PRESENT]
         if present_ids:
             self._relations(child_id, out, present_ids, warnings)
         if child["status"] == CHILD_FOUND and any(e.get("status") == WOULD_CREATE for e in out):
@@ -540,13 +555,19 @@ class DryRun:
         the parent, their ids are kept as `candidateIds` (ids only: evidence for the approver, never
         a match), and the plan carries `childOtherContacts` so Gate A can warn about duplicates.
         """
-        target = normalise_email(contact.email)
+        primary = normalise_email(contact.email)
+        emails = set(contact.emails) | {primary}
+        emails.discard("")
         matched_by = "reference"
         here = sorted(dict.fromkeys(by_reference or []), key=links.id_sort_key)
         if not here:
             matched_by = "email"
-            here = sorted(dict.fromkeys(cid for cid, mail in on_child if mail == target),
+            here = sorted(dict.fromkeys(cid for cid, mail in on_child if mail in emails),
                           key=links.id_sort_key)
+            # Matched only through an ADDITIONAL address of the HubSpot contact: still a match (the
+            # Famly contact's email is never changed), but said so in the plan.
+            if here and not any(mail == primary for cid, mail in on_child if cid in here):
+                matched_by = "additional_email"
         if len(here) == 1:
             entry.update(status=PRESENT, famlyContactId=here[0], matchedBy=matched_by)
         elif len(here) > 1:
@@ -560,11 +581,9 @@ class DryRun:
             )
         else:
             entry.update(status=WOULD_CREATE, matchedBy=MATCH_CREATE)
-            wanted = local_part(contact.email)
+            wanted = {local_part(e) for e in emails} - {""}
             candidates = sorted(
-                dict.fromkeys(
-                    cid for cid, mail in on_child if wanted and local_part(mail) == wanted
-                ),
+                dict.fromkeys(cid for cid, mail in on_child if local_part(mail) in wanted),
                 key=links.id_sort_key,
             )
             if candidates:

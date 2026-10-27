@@ -86,6 +86,9 @@ DEAL_PROPERTIES = DEAL_PROPERTIES + tuple(
 WHATSAPP_PROPERTY = os.environ.get("HUBSPOT_WHATSAPP_PROPERTY", "hs_whatsapp_phone_number")
 CONTACT_PROPERTIES = (
     "email",
+    # The contact's other email addresses, semicolon separated: a parent's Famly email may be one of
+    # these. Matching only; never logged or printed.
+    "hs_additional_emails",
     "firstname",
     "lastname",
     "mobilephone",

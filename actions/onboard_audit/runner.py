@@ -357,19 +357,25 @@ def contact_codes(deal_contacts, child: FamlyChild, index: "Index | None" = None
     `child_has_contacts_but_email_not_matched`, and (cheap, from the same pull)
     `email_matches_a_contact_on_a_different_child_of_the_same_family`."""
     codes: list[str] = []
-    on_child = {c.email: c for c in child.contacts if c.email}
     for contact in deal_contacts:
-        email = normalise_email(contact.email)
-        if not email:
+        primary = normalise_email(contact.email)
+        emails = set(contact.emails) | {primary}              # the primary and the additional addresses
+        emails.discard("")
+        if not emails:
             codes.append("contact_no_email")
             if contact.is_bill_payer:
                 codes.append("bill_payer_contact_missing")
             continue
-        found = on_child.get(email)
+        # the primary address first (as before), then any additional address of the HubSpot contact
+        found = next((c for c in child.contacts if c.email and c.email == primary), None)
+        if found is None:
+            found = next((c for c in child.contacts if c.email and c.email in emails), None)
+            if found is not None:
+                codes.append("contact_matched_via_additional_email")    # info: rescued by a secondary address
         if found is None:
             codes.append("contact_missing")
             codes.append("child_has_contacts_but_email_not_matched" if child.contacts else "child_has_no_contacts")
-            if index is not None and (index.contact_children.get(email, set()) - {child.id}):
+            if index is not None and any(index.contact_children.get(e, set()) - {child.id} for e in emails):
                 codes.append("email_matches_a_contact_on_a_different_child_of_the_same_family")
             if contact.is_bill_payer:
                 codes.append("bill_payer_contact_missing")
@@ -391,8 +397,8 @@ def payer_codes(deal_contacts, payers, child_id: str) -> list[str]:
     if matched is None:
         # the planner's matched payer is only set when exactly one has the contact's email
         contact = next((c for c in deal_contacts if c.is_bill_payer), None)
-        email = normalise_email(contact.email) if contact is not None else ""
-        same_email = [p for p in live if email and p.email == email]
+        emails = (set(contact.emails) | {normalise_email(contact.email)}) - {""} if contact is not None else set()
+        same_email = [p for p in live if p.email in emails]
         matched = same_email[0] if len(same_email) == 1 else None
 
     def share(payer):

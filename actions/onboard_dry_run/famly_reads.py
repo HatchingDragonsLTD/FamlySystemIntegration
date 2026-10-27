@@ -228,13 +228,15 @@ class FamlyReads:
             if isinstance(row, dict) and child_id in [str(c) for c in row.get("childIds") or []]
         )
 
-    def locate_contact(self, child_id: str, hubspot_contact_id: str, target_email: str) -> Located:
+    def locate_contact(self, child_id: str, hubspot_contact_id: str, emails) -> Located:
         """The contact on the child for a HubSpot contact: first by its HUBSPOT reference (found
-        even if the parent's email changed in Famly), then by canonical email on the child."""
+        even if the parent's email changed in Famly), then by canonical email on the child. `emails`
+        is one canonical address or a set of them (the contact's primary and additional addresses)."""
         by_reference = self.contact_ids_by_reference(child_id, hubspot_contact_id)
         if by_reference:
             return Located(by_reference, BY_REFERENCE)
-        ids = _distinct(cid for cid, mail in self.child_contacts(child_id) if mail == target_email)
+        wanted = {emails} if isinstance(emails, str) else set(emails)
+        ids = _distinct(cid for cid, mail in self.child_contacts(child_id) if mail in wanted)
         return Located(ids, BY_EMAIL if ids else None)
 
     def child_contact_relations(self, child_id: str) -> dict[str, bool]:
