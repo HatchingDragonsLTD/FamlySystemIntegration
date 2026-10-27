@@ -173,7 +173,8 @@ class DryRun:
             plan["scope"] = derive.SCOPE_CHILD_ONLY
             plan["contacts"] = []
             plan["contactsStatus"] = derive.SKIPPED_STAGE
-            plan["billPayer"] = {"status": derive.SKIPPED_STAGE}
+            plan["billPayer"] = {"status": derive.SKIPPED_STAGE,
+                                 "recipient": bill_payers.RECIPIENT_SKIPPED}
             context["contacts"] = []
         else:
             plan["contacts"] = self._contacts(deal_id, plan["child"], plan, context)
@@ -262,6 +263,12 @@ class DryRun:
         plan["billPayer"] = decision.as_plan()
         if decision.flag:
             plan["warnings"].append(decision.flag)
+        entry = next((c for c in plan.get("contacts") or [] if c.get("isBillPayer")), None)
+        recipient = bill_payers.recipient_state(decision, payers, entry)
+        if recipient:
+            plan["billPayer"]["recipient"] = recipient
+            if recipient == bill_payers.RECIPIENT_CONTACT_NOT_FOUND:
+                plan["warnings"].append("bill_payer_contact_not_found")
 
     # -- derivations ---------------------------------------------------- #
     def _stage(self, deal: dict) -> dict:

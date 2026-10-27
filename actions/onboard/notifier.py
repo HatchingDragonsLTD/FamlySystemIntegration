@@ -77,6 +77,7 @@ def gate_text(
         f"Famly writes planned: {child_writes} child, {writes['contact']} contact(s)"
         + (f", {writes['bill_payer']} bill payer" if isinstance(bp_section, dict) else "")
         + (f", {writes['relation']} contact relation(s)" if writes["relation"] else "")
+        + (f", {writes['recipient']} bill payer contact link(s)" if writes["recipient"] else "")
     )
     shown = messages.classify(plan.get("warnings") or [])
     sentences = shown[messages.NOT_DONE] + shown[messages.CHECK]

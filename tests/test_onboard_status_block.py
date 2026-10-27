@@ -87,7 +87,7 @@ class RenderTests(unittest.TestCase):
         settled = plan_of(FOUND, [contact("c1", "present", True, matchedBy="email", relation="present")],
                           {"status": "present"})
         self.assertEqual(plan_status.planned_writes(settled),
-                         {"child": 0, "contact": 0, "relation": 0, "bill_payer": 0})
+                         {"child": 0, "contact": 0, "relation": 0, "bill_payer": 0, "recipient": 0})
         self.assertEqual(self.lines(settled)[-1], messages.state("nothing_to_write"))
         flagged = plan_of(FOUND, [contact("c1", "no_email")])
         flagged["holds"] = [{"reason": "contact_no_email"}]

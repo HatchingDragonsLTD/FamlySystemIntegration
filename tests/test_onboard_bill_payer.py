@@ -52,6 +52,9 @@ class BPFamly(FakeFamly):
         self.after_scan = {}              # scan number -> callable run after that scan answers
         self.scan_error = None            # scan number -> exception (or None)
         self.stored_multiplier = None     # what is really stored (a read-back mismatch)
+        self.recipient_writes = []        # the addInvoiceRecipients pairs sent
+        self.recipient_mode = "ok"        # ok | error_after_landing | error_not_landing
+        self.recipient_lag_scans = 0      # scans before an added recipient shows
         self._bp_n = 1
 
     def execute(self, query_path, variables, operation_name):
@@ -61,6 +64,8 @@ class BPFamly(FakeFamly):
             return {"data": {"__schema": write_schema()}}
         if operation_name in (bpw.CREATE_OP, bpw.ADD_CHILDREN_OP):
             return self._write(query_path, variables, operation_name)
+        if operation_name == bpw.ADD_RECIPIENT_OP:
+            return self._add_recipient(variables)
         return super().execute(query_path, variables, operation_name)
 
     def node(self, payer):
@@ -69,6 +74,9 @@ class BPFamly(FakeFamly):
                 "children": [{"childId": c, "share": {"multiplier": m}}
                              for c, m in payer["children"].items()
                              if self.scans > payer.get("children_visible_after", 0)],
+                "invoiceRecipients": [{"relationId": c, "contactId": c}
+                                      for c, visible_at in payer.get("recipients", {}).items()
+                                      if self.scans > visible_at],
                 **payer.get("details", {})}
 
     def _scan(self, variables):
@@ -124,13 +132,35 @@ class BPFamly(FakeFamly):
             {"billPayerId": e["billPayerId"], "childId": e["childId"],
              "share": {"multiplier": e["share"]["multiplier"]}} for e in entries]}}}
 
+    def _add_recipient(self, variables):
+        pair = variables["invoiceRecipients"][0]
+        self.recipient_writes.append(pair)
+        payer = next(p for p in self.payers if p["id"] == pair["billPayerId"])
+        recipients = payer.setdefault("recipients", {})
+        if pair["relationId"] in recipients:                  # shown yet or not, it is there
+            body = json.dumps({"data": None, "errors": [{
+                "message": "The invoice recipient has already been added to the bill payer",
+                "errorCode": 1675864914,
+                "extensions": {"payload": {"existingEntries": [
+                    {"relationId": pair["relationId"], "billPayerId": pair["billPayerId"]}]}}}]})
+            raise GraphQLHTTPError("bad", 400, body)
+        if self.recipient_mode == "error_not_landing":
+            raise GraphQLHTTPError("boom", 500, "")
+        recipients[pair["relationId"]] = self.scans + self.recipient_lag_scans
+        if self.recipient_mode == "error_after_landing":
+            raise GraphQLHTTPError("boom", 500, "")
+        return {"data": {"billPayers": {"addInvoiceRecipients": [
+            {"relationId": pair["relationId"], "contactId": pair["relationId"],
+             "billPayerId": pair["billPayerId"]}]}}}
+
     def ops(self):
         return [w[0] for w in self.bp_writes]
 
 
-def payer(email, children=None, deleted=False, details=None, pid=None):
+def payer(email, children=None, deleted=False, details=None, pid=None, recipients=None):
     return {"id": pid or f"existing-{abs(hash(email + str(children))) % 1000}", "email": email,
-            "deleted": deleted, "children": dict(children or {}), "details": details or {}}
+            "deleted": deleted, "children": dict(children or {}), "details": details or {},
+            "recipients": {c: 0 for c in recipients or []}}
 
 
 def deal_contact(email="ada@x.org", bill_payer=True, named=True, props=None):
@@ -294,10 +324,12 @@ class PlanTests(BPCase):
 
     def test_the_plan_carries_the_decision_the_matched_id_and_the_count(self):
         self.assertEqual(self.plan()["billPayer"],
-                         {"status": "would_create", "flag": None, "billPayerId": None, "matches": 0})
+                         {"status": "would_create", "flag": None, "billPayerId": None, "matches": 0,
+                          "recipient": "will_add"})
         self.famly.payers.append(payer(self.email, pid="the-one"))
         self.assertEqual(self.plan()["billPayer"],
-                         {"status": "would_attach", "flag": None, "billPayerId": "the-one", "matches": 1})
+                         {"status": "would_attach", "flag": None, "billPayerId": "the-one", "matches": 1,
+                          "recipient": "will_add"})
 
     def test_the_hash_covers_the_decision_and_changes_when_it_does(self):
         create = dry_runner.plan_hash(self.plan())
@@ -814,8 +846,11 @@ class UnconfirmedPayerGuardTests(BPCase):
         self.run_through()
         self.famly.payers[0]["visible_at"] = 0               # the scan has caught up
         self.enqueue()
-        result = self.run_worker()                           # nothing to write: no Gate A
-        self.assertEqual(self.creates(), 1)
+        result = self.run_worker()                           # the payer is there but not linked to its contact
+        self.assertEqual(result["status"], store.AWAITING_APPROVAL)    # a repair: one link to approve
+        self.approve()
+        result = self.run_worker()
+        self.assertEqual(self.creates(), 1)                  # still no second create
         self.assertEqual(result["status"], store.DONE)
         self.assertIn("bill_payer_present", self.final_notice())
 

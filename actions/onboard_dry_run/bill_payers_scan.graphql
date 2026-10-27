@@ -16,6 +16,10 @@ query OnboardBillPayers($siteIds: [SiteId!]!, $next: BillPayerCursor, $includeDe
             multiplier
           }
         }
+        invoiceRecipients {
+          relationId
+          contactId
+        }
         # DETAILS
       }
       next

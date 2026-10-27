@@ -81,6 +81,7 @@ class Payer:
     email: str                                   # canonical; memory only
     children: dict = field(default_factory=dict)  # child id -> multiplier (None if unreadable)
     details: dict = field(default_factory=dict, repr=False)   # memory only
+    recipients: frozenset = frozenset()           # contact ids linked as invoice recipients (ids only)
 
 
 def _detail_selection() -> str:
@@ -126,7 +127,7 @@ def scan_site(client, site_id: str, clock=time.monotonic) -> list[Payer]:
         os.unlink(handle.name)
 
 
-_BASE = {"billPayerId", "email", "deletedAt", "children"}
+_BASE = {"billPayerId", "email", "deletedAt", "children", "invoiceRecipients"}
 
 
 def _payer(node: Any) -> Payer | None:
@@ -142,10 +143,15 @@ def _payer(node: Any) -> Payer | None:
             except (TypeError, ValueError):
                 multiplier = None
             children[str(item["childId"])] = multiplier
+    recipients = set()
+    for item in node.get("invoiceRecipients") or []:
+        if isinstance(item, dict):
+            recipients |= {str(item[k]) for k in ("contactId", "relationId") if item.get(k)}
     return Payer(
         id=str(node["billPayerId"]),
         email=normalise_email(node.get("email")),
         children=children,
+        recipients=frozenset(recipients),
         details={k: v for k, v in node.items() if k not in _BASE},
     )
 
@@ -235,6 +241,29 @@ class Decision:
         if self.differs:
             plan["differs"] = list(self.differs)        # outside the hash: see runner.hashed_plan
         return plan
+
+
+# The bill payer contact as an invoice recipient (`billPayer.recipient` in the plan).
+RECIPIENT_WILL_ADD, RECIPIENT_LINKED = "will_add", "already_linked"
+RECIPIENT_CONTACT_NOT_FOUND, RECIPIENT_SKIPPED = "contact_not_found", "skipped"
+
+
+def recipient_state(decision: "Decision", payers, contact_entry: dict | None) -> str | None:
+    """Whether the deal's bill payer contact is (or will be) an invoice recipient of the payer.
+    None when the payer decision is flagged (nothing to link). `contact_entry` is the plan's entry
+    for the bill payer contact: present or would_create is a contact that exists or will; anything
+    else is `contact_not_found` (a flag for a person)."""
+    if decision.status not in (WOULD_CREATE, WOULD_ATTACH, STATUS_PRESENT):
+        return None
+    status = (contact_entry or {}).get("status")
+    if status not in ("present", "would_create"):
+        return RECIPIENT_CONTACT_NOT_FOUND
+    if status == "would_create":
+        return RECIPIENT_WILL_ADD
+    payer = next((p for p in payers or [] if p.id == decision.bill_payer_id), None)
+    if payer is not None and contact_entry.get("famlyContactId") in payer.recipients:
+        return RECIPIENT_LINKED
+    return RECIPIENT_WILL_ADD
 
 
 def decide(contacts, payers: list[Payer] | None, child_id: str | None = None) -> Decision:

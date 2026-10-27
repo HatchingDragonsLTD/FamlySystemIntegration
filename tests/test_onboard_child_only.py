@@ -48,7 +48,7 @@ class PlanTests(ChildOnlyCase):
         plan = self.plan()
         self.assertEqual(plan["status"], "ready")
         self.assertEqual(plan["contactsStatus"], "skipped_stage")
-        self.assertEqual(plan["billPayer"], {"status": "skipped_stage"})
+        self.assertEqual(plan["billPayer"], {"status": "skipped_stage", "recipient": "skipped"})
         self.assertEqual(plan["contacts"], [])
         self.assertEqual(plan["scope"], "child_only")
         self.assert_no_contact_or_payer_calls()

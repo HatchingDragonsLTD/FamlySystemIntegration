@@ -74,6 +74,10 @@ _STATIC: dict[str, tuple[str, str]] = {
     "relation_unconfirmed": (CHECK, "A parent's relation was sent to Famly but could not be confirmed afterwards. Check the parent's relation in Famly."),
     "relation_unreadable": (CHECK, "The relation of a parent already on the child could not be read, so it was not changed. Check it in Famly."),
     "relation_added": (INFO, ""),
+    "bill_payer_recipient_linked": (INFO, ""),
+    "bill_payer_recipient_present": (INFO, ""),
+    "bill_payer_recipient_unconfirmed": (CHECK, "The bill payer's contact was sent to Famly as an invoice recipient but could not be confirmed afterwards, so the parent may not see invoices. Check the bill payer's contacts in Famly."),
+    "bill_payer_contact_not_found": (CHECK, "The bill payer's contact is not on the child in Famly, so it was not linked to the bill payer and the parent will not see invoices. Link it in Famly by hand."),
     "contact_error": (NOT_DONE, "A parent could not be added because of an unexpected error. Add them in Famly by hand."),
     "worker_error": (NOT_DONE, "An unexpected error stopped the job. Check Famly for the deal ID before running again."),
     "interrupted": (NOT_DONE, "The job was interrupted part-way. Check Famly for the deal ID before running again."),
@@ -259,6 +263,9 @@ _STATE: dict[str, str] = {
     "bill_payer_would_attach": "Bill payer: an existing bill payer will be linked to the child.",
     "bill_payer_present": "Bill payer: already linked to the child.",
     "bill_payer_flagged": "Bill payer: needs a person. {why}",
+    "bill_payer_recipient_will_add": "Bill payer: contact will be linked so the parent sees invoices.",
+    "bill_payer_recipient_linked": "Bill payer: contact already linked, so the parent sees invoices.",
+    "bill_payer_recipient_contact_not_found": "Bill payer: the bill payer's contact is not in Famly, so it cannot be linked. A person needs to check.",
     "bill_payer_differs": "Bill payer: the existing bill payer's details differ from HubSpot in: {fields}.",
     "scope_child_only": "Held back by the deal's stage ({stage}): only the child is onboarded, so no contacts or bill payer are written.",
     "nothing_to_write": "Nothing to write: everything is already in Famly.",
@@ -273,3 +280,7 @@ def state(code: str, **fields) -> str:
 
 def state_codes() -> frozenset:
     return frozenset(_STATE)
+
+
+def recipient_summary() -> str:
+    return "Bill payer contact linked so the parent sees invoices."

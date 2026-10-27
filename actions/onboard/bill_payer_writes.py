@@ -4,6 +4,8 @@ child and contacts steps). The decision logic is in actions/onboard_dry_run/bill
 What this stage may send, and NOTHING else:
   * `billPayers.create`: one payer with the child attached inline at multiplier 1.0.
   * `billPayers.addChildren`: the one new child, at multiplier 1.0, onto the matched payer.
+  * `billPayers.addInvoiceRecipients` (`link_recipient`): the deal's bill payer contact as an invoice
+    recipient of the payer (see below).
 There is no delete, archive, update or deleteChildren anywhere in it, and
 `assert_stage_mutation` refuses any document that has one. Existing shares are never edited.
 
@@ -51,6 +53,19 @@ CREATE_OP = "OnboardBillPayerCreate"
 ADD_CHILDREN_OP = "OnboardBillPayerAddChildren"
 MULTIPLIER = 1.0
 SETTLE_WAIT_SECONDS = 10
+
+HERE = Path(__file__).parent
+ADD_RECIPIENT_QUERY = HERE / "add_invoice_recipient.graphql"
+ADD_RECIPIENT_OP = "OnboardAddInvoiceRecipient"
+# Famly refuses a repeat add with HTTP 400, errorCode 1675864914, "The invoice recipient has already
+# been added to the bill payer", and lists the pair in extensions.payload.existingEntries.
+ALREADY_ADDED_ERROR_CODE = "1675864914"
+ALREADY_ADDED_MESSAGE = "already been added"
+
+RECIPIENT_LINKED = "bill_payer_recipient_linked"        # the add was accepted (or settled by a read)
+RECIPIENT_PRESENT = "bill_payer_recipient_present"      # already linked (a read, or the "already added" 400)
+RECIPIENT_UNCONFIRMED = "bill_payer_recipient_unconfirmed"
+CONTACT_NOT_FOUND = "bill_payer_contact_not_found"
 
 
 class NotConfigured(Exception):
@@ -337,3 +352,101 @@ def run_stage(*, public, scan, contacts, approved: dict, site_id: str, child_id:
         return StageResult(success_code, found, extra, decision.differs, sent=True)
     code = scan_mod.WRITE_REJECTED if sent.rejected_hint else scan_mod.OUTCOME_UNKNOWN
     return StageResult(code, None, extra, sent=True)
+
+
+# --------------------------------------------------------------------------- #
+# The invoice recipient link
+# --------------------------------------------------------------------------- #
+def assert_recipient_mutation(text: str) -> None:
+    """Exactly one mutation, calling only `addInvoiceRecipients`: nothing that creates, updates,
+    deletes or archives."""
+    code = "\n".join(l for l in text.splitlines() if not l.lstrip().startswith("#")).lower()
+    calls = re.findall(r"\b(\w+)\s*\(\s*\w+\s*:\s*\$", code)
+    if code.count("mutation") != 1 or calls != ["addinvoicerecipients"]:
+        raise AssertionError("not a single addInvoiceRecipients mutation")
+    for forbidden in ("delete", "archive", "update", "create", "socialsecuritynumber"):
+        if forbidden in code:
+            raise AssertionError(f"the recipient document contains {forbidden!r}")
+
+
+def _find(node, key: str):
+    """Every value stored under `key`, anywhere in a nested response."""
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if k == key:
+                yield v
+            yield from _find(v, key)
+    elif isinstance(node, list):
+        for item in node:
+            yield from _find(item, key)
+
+
+def _names_pair(entry, contact_id: str, payer_id: str) -> bool:
+    return (isinstance(entry, dict) and str(entry.get("billPayerId")) == str(payer_id)
+            and str(contact_id) in {str(entry.get("relationId")), str(entry.get("contactId"))})
+
+
+def already_added(body, contact_id: str, payer_id: str) -> bool:
+    """The "already added" refusal, CONFIRMED: Famly's error code or message, and the pair itself in
+    `existingEntries`. Without the pair it is not confirmed (the caller settles by a read)."""
+    body = _body_dict(body)
+    if body is None:
+        return False
+    coded = any(str(v) == ALREADY_ADDED_ERROR_CODE for v in _find(body, "errorCode"))
+    worded = any(isinstance(m, str) and ALREADY_ADDED_MESSAGE in m for m in _find(body, "message"))
+    if not (coded or worded):
+        return False
+    return any(_names_pair(e, contact_id, payer_id)
+               for entries in _find(body, "existingEntries") for e in (entries or []))
+
+
+@dataclass
+class LinkResult:
+    code: str
+    sent: bool = False
+
+
+def link_recipient(*, public, contact_id: str, payer_id: str, read, lookup=_single_read) -> LinkResult:
+    """Make `contact_id` an invoice recipient of `payer_id`. `read()` returns the contact ids that are
+    recipients of the payer (a fresh read; it raises when it cannot read).
+
+    A fresh read first: already a recipient = nothing is sent. Then ONE `addInvoiceRecipients`, never
+    retried. An accepted add (the response names the pair) and the confirmed "already added" 400 are
+    successes. Anything else (another error, a timeout, a partial response) is UNKNOWN and is settled by
+    reading the payer's recipients with the caller's bounded waits: visible = linked; still not visible =
+    `bill_payer_recipient_unconfirmed`, a flag for a person. Never resent."""
+    text = ADD_RECIPIENT_QUERY.read_text(encoding="utf-8")
+    assert_recipient_mutation(text)
+    try:
+        if contact_id in read():
+            return LinkResult(RECIPIENT_PRESENT)
+    except Exception:  # noqa: BLE001 - an unreadable first look: the add itself is safe to send
+        pass
+
+    variables = {"invoiceRecipients": [{"relationId": contact_id, "billPayerId": payer_id}]}
+    outcome = None                                  # "linked" | "present" | None (unknown)
+    try:
+        body = public.execute(query_path=ADD_RECIPIENT_QUERY, variables=variables,
+                              operation_name=ADD_RECIPIENT_OP)
+        rows = (((body or {}).get("data") or {}).get("billPayers") or {}).get("addInvoiceRecipients")
+        rows = rows if isinstance(rows, list) else [rows] if isinstance(rows, dict) else []
+        if any(_names_pair(r, contact_id, payer_id) for r in rows):
+            outcome = "linked"
+    except GraphQLHTTPError as exc:
+        if already_added(exc.body, contact_id, payer_id):
+            outcome = "present"
+    except GraphQLError as exc:
+        if already_added(exc.body, contact_id, payer_id):
+            outcome = "present"
+    except (requests.RequestException, TimeoutError, ConnectionError):
+        pass
+    if outcome == "linked":
+        return LinkResult(RECIPIENT_LINKED, sent=True)
+    if outcome == "present":
+        return LinkResult(RECIPIENT_PRESENT, sent=True)
+
+    try:
+        ids, _readable = lookup(lambda: [contact_id] if contact_id in read() else [])
+    except Exception:  # noqa: BLE001 - an unreadable settle is "not confirmed"
+        ids = []
+    return LinkResult(RECIPIENT_LINKED if contact_id in ids else RECIPIENT_UNCONFIRMED, sent=True)

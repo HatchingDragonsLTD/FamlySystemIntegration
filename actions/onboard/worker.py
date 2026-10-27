@@ -406,6 +406,10 @@ def _write_phase(job, deps, plan, context, digest) -> dict:
     if config.bill_payer_enabled() and plan.get("billPayer"):
         bill_payer = _bill_payer_stage(job, deps, plan, context, child)
         store.update(job.id, outcomes=outcomes_stored + [f"billpayer:{bill_payer.code}"])
+    # The payer's contact as an invoice recipient (the link that lets the parent see invoices).
+    link_entries, link_flags, link_added = _recipient_stage(job, deps, plan, context, bill_payer)
+    if link_entries:
+        store.update(job.id, outcomes=outcomes_stored + [f"billpayer:{bill_payer.code}"] + link_entries)
     bill_payer_failed = bill_payer is not None and bill_payer.code not in bill_payer_scan.SUCCESS_CODES
     bill_payer_codes = [] if bill_payer is None else [bill_payer.code, *bill_payer.extra]
     bill_payer_footer = [f"differs:{','.join(bill_payer.differs)}"] if bill_payer and bill_payer.differs else []
@@ -413,11 +417,11 @@ def _write_phase(job, deps, plan, context, digest) -> dict:
     bad_codes = sorted({o.split(":", 1)[1] for o in outcomes if o.split(":", 1)[1] not in OK_OUTCOMES})
     if bill_payer_failed:
         bad_codes.append(bill_payer.code)
-    gaps = list(plan["warnings"]) + contact_warnings + flags + relation_flags
+    gaps = list(plan["warnings"]) + contact_warnings + flags + relation_flags + link_flags
     if bill_payer is not None and bill_payer.differs:
         gaps.append(bill_payer_scan.DIFFERS)
     contact_codes = [o.split(":", 1)[1] for o in outcomes]
-    summary = _summary_line(child.created, contact_codes, bill_payer, relations_added)
+    summary = _summary_line(child.created, contact_codes, bill_payer, relations_added, link_added)
     if all_ok and not bill_payer_failed:
         # `bill_payer_linked` only if HubSpot's dropdown already offers it.
         status = hubspot_sync.STATUS_CONTACTS_LINKED
@@ -439,7 +443,8 @@ def _write_phase(job, deps, plan, context, digest) -> dict:
         failures.append(bill_payer.code)
     if syncer.critical_failed:
         failures.append("hubspot_writeback_failed")
-    codes = (bad_codes + [f for f in failures if f != "contact_outcomes"] + flags + relation_flags
+    codes = (bad_codes + [f for f in failures if f != "contact_outcomes"] + flags + relation_flags + link_flags
+             + ([bill_payer_writes.RECIPIENT_LINKED] if link_added else [])
              + (["relation_added"] if relations_added else []) + syncer.reports + list(plan["warnings"]) + contact_warnings + bill_payer_codes
              + (["urn_allocated"] if urn_written else [])
              # Informational footer code: a parent was added to a child that already existed.
@@ -543,8 +548,46 @@ def _bill_payer_stage(job, deps, plan, context, child: "ChildResult"):
     return result
 
 
+def _recipient_stage(job, deps, plan, context, bill_payer) -> tuple[list[str], list[str], bool]:
+    """Link the deal's bill payer contact as an invoice recipient of the payer the stage created or
+    matched, when the APPROVED plan says `will_add`. Returns (stored outcome entries
+    `billpayerlink:<code>`, flag codes, whether a link was added). A flag never stops the job and an
+    unknown outcome is settled by reads, never by sending again."""
+    section = plan.get("billPayer") or {}
+    if (section.get("recipient") != "will_add" or bill_payer is None
+            or bill_payer.code not in bill_payer_scan.SUCCESS_CODES or not bill_payer.bill_payer_id):
+        return [], [], False
+    payer_id = bill_payer.bill_payer_id
+    contact = next((c for c in context.get("contacts") or [] if c.is_bill_payer), None)
+    contact_id = (context.get("contact_ids") or {}).get(contact.hubspot_id) if contact else None
+    if not contact_id:
+        return ["billpayerlink:" + bill_payer_writes.CONTACT_NOT_FOUND], [bill_payer_writes.CONTACT_NOT_FOUND], False
+    site_id = plan["siteId"]
+
+    def read() -> list:
+        payers = deps.famly().bill_payers(site_id)
+        if payers is None:
+            raise RuntimeError("scan_failed")
+        match = next((p for p in payers if p.id == payer_id), None)
+        if match is None:
+            raise RuntimeError("payer_not_listed")
+        return sorted(match.recipients)
+
+    try:
+        result = bill_payer_writes.link_recipient(
+            public=deps.public, contact_id=contact_id, payer_id=payer_id, read=read,
+            lookup=lambda fn: _lookup_with_settle(job, deps, fn, expect=contact_id,
+                                                  label="recipient_readback"))
+    except Exception as exc:  # noqa: BLE001 - this stage must never stop the job
+        logger.error("onboard: recipient link hit %s", type(exc).__name__)
+        result = bill_payer_writes.LinkResult(bill_payer_writes.RECIPIENT_UNCONFIRMED, sent=True)
+    logger.info("onboard: bill payer recipient job=%s code=%s sent=%s", job.id, result.code, result.sent)
+    flags = [] if result.code != bill_payer_writes.RECIPIENT_UNCONFIRMED else [result.code]
+    return ["billpayerlink:" + result.code], flags, result.code == bill_payer_writes.RECIPIENT_LINKED
+
+
 def _summary_line(child_created: bool, contact_codes: list[str], bill_payer=None,
-                  relations_added: int = 0) -> str:
+                  relations_added: int = 0, recipient_linked: bool = False) -> str:
     """One plain sentence: what was done. Counts only."""
     created = contact_codes.count(CREATED)
     present = contact_codes.count(PRESENT)
@@ -559,6 +602,8 @@ def _summary_line(child_created: bool, contact_codes: list[str], bill_payer=None
                  bill_payer_scan.ATTACHED: " Child linked to the existing bill payer.",
                  bill_payer_scan.PRESENT: " Child already linked to the bill payer."}.get(
             bill_payer.code, "")
+    if recipient_linked:
+        line += " " + messages.recipient_summary()
     return line
 
 
@@ -784,6 +829,7 @@ def _create_contacts(
     creates_sent = 0
 
     present_contacts: dict[str, str] = context.setdefault("present_contacts", {})
+    contact_ids: dict[str, str] = context.setdefault("contact_ids", {})   # present OR created here
     # The APPROVED plan is about one child. If the live child is not that child (the plan would have
     # created one but it exists now, or a different child was found), nothing is added to it.
     planned_child = plan["child"]
@@ -815,6 +861,7 @@ def _create_contacts(
             elif len(here) == 1:
                 code = PRESENT
                 present_contacts[hubspot_id] = here[0]
+                contact_ids[hubspot_id] = here[0]
             elif len(here) > 1:
                 code = "ambiguous_on_child"
             elif planned == "present":
@@ -825,7 +872,7 @@ def _create_contacts(
                 code = CONTACT_UNCONFIRMED
             else:
                 code, contact_warnings, sent = _create_one(
-                    job, deps, famly, contact, child_id, target, slot)
+                    job, deps, famly, contact, child_id, target, slot, contact_ids)
                 warnings.extend(contact_warnings)
                 creates_sent += sent
         except Exception as exc:  # noqa: BLE001 - one contact must never stop the rest
@@ -905,8 +952,11 @@ def _log_phone_reason(job, slot, props) -> None:
                    job.id, job.deal_id, slot, prop, reason)
 
 
-def _create_one(job, deps, famly, contact, child_id, target, slot) -> tuple[str, list[str], int]:
-    """Create one contact. Returns (outcome code, warning codes, create requests sent)."""
+def _create_one(job, deps, famly, contact, child_id, target, slot,
+                contact_ids: dict | None = None) -> tuple[str, list[str], int]:
+    """Create one contact. Returns (outcome code, warning codes, create requests sent). A contact
+    that is read back exactly once has its Famly id recorded in `contact_ids` (the bill payer stage
+    links it as an invoice recipient)."""
     try:
         payload, contact_warnings = inputs.build_contact_input(contact, child_id)
     except inputs.InputIncomplete as exc:
@@ -937,6 +987,8 @@ def _create_one(job, deps, famly, contact, child_id, target, slot) -> tuple[str,
         label="contact_readback")
     if len(rows) != 1:
         return "readback_failed", contact_warnings, 1
+    if contact_ids is not None:
+        contact_ids[contact.hubspot_id] = rows[0]
     return CREATED, contact_warnings, 1
 
 

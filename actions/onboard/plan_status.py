@@ -23,6 +23,8 @@ def planned_writes(plan: dict) -> dict:
         "relation": sum(1 for c in plan.get("contacts") or [] if c.get("relation") == "would_add"),
         "bill_payer": 1 if isinstance(bill_payer, dict)
         and bill_payer.get("status") in ("would_create", "would_attach") else 0,
+        # The bill payer's contact as an invoice recipient: one write, whatever the payer decision.
+        "recipient": 1 if isinstance(bill_payer, dict) and bill_payer.get("recipient") == "will_add" else 0,
     }
 
 
@@ -73,6 +75,10 @@ def _bill_payer_lines(section: dict) -> list[str]:
         lines = [messages.state("bill_payer_flagged", why=found[1] if found else messages.UNKNOWN_SENTENCE)]
     if section.get("differs"):
         lines.append(messages.state("bill_payer_differs", fields=", ".join(section["differs"])))
+    recipient = {"will_add": "bill_payer_recipient_will_add", "already_linked": "bill_payer_recipient_linked",
+                 "contact_not_found": "bill_payer_recipient_contact_not_found"}.get(section.get("recipient"))
+    if recipient:
+        lines.append(messages.state(recipient))
     return lines
 
 
@@ -87,6 +93,8 @@ def _all_settled(plan: dict) -> bool:
            for c in plan.get("contacts") or []):
         return False
     section = plan.get("billPayer")
+    if isinstance(section, dict) and section.get("recipient") == "contact_not_found":
+        return False
     return not isinstance(section, dict) or section.get("status") in (
         "would_create", "would_attach", "present", "skipped_stage")
 

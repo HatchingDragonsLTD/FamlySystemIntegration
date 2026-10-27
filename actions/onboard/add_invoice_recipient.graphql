@@ -1,0 +1,12 @@
+# THE RECIPIENT LINK the bill payer stage sends: the deal's bill payer contact as an invoice
+# recipient of the payer (relationId = the contact id; proven live by probe-invoice-recipient). One
+# pair per call, never batched, never retried. Only the three ids are selected.
+mutation OnboardAddInvoiceRecipient($invoiceRecipients: [InvoiceRecipientInput!]!) {
+  billPayers {
+    addInvoiceRecipients(invoiceRecipients: $invoiceRecipients) {
+      relationId
+      contactId
+      billPayerId
+    }
+  }
+}
