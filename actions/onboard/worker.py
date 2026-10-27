@@ -271,6 +271,7 @@ def famly_writes_planned(plan: dict) -> bool:
     return (
         plan["child"]["status"] == "child_would_create"
         or any(c["status"] == "would_create" for c in plan["contacts"])
+        or any(c.get("relation") == "would_add" for c in plan["contacts"])
         or (plan.get("billPayer") or {}).get("status") in (
             bill_payer_scan.WOULD_CREATE, bill_payer_scan.WOULD_ATTACH)
     )
@@ -397,6 +398,11 @@ def _write_phase(job, deps, plan, context, digest) -> dict:
     store.set_status(job.id, store.CREATING_CONTACTS)
     outcomes, contact_warnings, all_ok = _create_contacts(job, deps, plan, context, child, own_child)
     store.update(job.id, outcomes=outcomes)
+    # RELATION = Parent on a present contact that has none; flags only, never a stop.
+    relation_entries, relation_flags, relations_added = _add_relations(job, deps, plan, context, child)
+    outcomes_stored = outcomes + relation_entries
+    if relation_entries:
+        store.update(job.id, outcomes=outcomes_stored)
 
     # THE BILL PAYER STAGE (ONBOARD_BILL_PAYER=on): after the child and contacts, never
     # blocking either, never rolling either back. A flag ends the job needs_review; a
@@ -404,7 +410,7 @@ def _write_phase(job, deps, plan, context, digest) -> dict:
     bill_payer = None
     if config.bill_payer_enabled() and plan.get("billPayer"):
         bill_payer = _bill_payer_stage(job, deps, plan, context, child)
-        store.update(job.id, outcomes=outcomes + [f"billpayer:{bill_payer.code}"])
+        store.update(job.id, outcomes=outcomes_stored + [f"billpayer:{bill_payer.code}"])
     bill_payer_failed = bill_payer is not None and bill_payer.code not in bill_payer_scan.SUCCESS_CODES
     bill_payer_codes = [] if bill_payer is None else [bill_payer.code, *bill_payer.extra]
     bill_payer_footer = [f"differs:{','.join(bill_payer.differs)}"] if bill_payer and bill_payer.differs else []
@@ -412,11 +418,11 @@ def _write_phase(job, deps, plan, context, digest) -> dict:
     bad_codes = sorted({o.split(":", 1)[1] for o in outcomes if o.split(":", 1)[1] not in OK_OUTCOMES})
     if bill_payer_failed:
         bad_codes.append(bill_payer.code)
-    gaps = list(plan["warnings"]) + contact_warnings + flags
+    gaps = list(plan["warnings"]) + contact_warnings + flags + relation_flags
     if bill_payer is not None and bill_payer.differs:
         gaps.append(bill_payer_scan.DIFFERS)
     contact_codes = [o.split(":", 1)[1] for o in outcomes]
-    summary = _summary_line(child.created, contact_codes, bill_payer)
+    summary = _summary_line(child.created, contact_codes, bill_payer, relations_added)
     if all_ok and not bill_payer_failed:
         # `bill_payer_linked` only if HubSpot's dropdown already offers it.
         status = hubspot_sync.STATUS_CONTACTS_LINKED
@@ -438,8 +444,8 @@ def _write_phase(job, deps, plan, context, digest) -> dict:
         failures.append(bill_payer.code)
     if syncer.critical_failed:
         failures.append("hubspot_writeback_failed")
-    codes = (bad_codes + [f for f in failures if f != "contact_outcomes"] + flags
-             + syncer.reports + list(plan["warnings"]) + contact_warnings + bill_payer_codes
+    codes = (bad_codes + [f for f in failures if f != "contact_outcomes"] + flags + relation_flags
+             + (["relation_added"] if relations_added else []) + syncer.reports + list(plan["warnings"]) + contact_warnings + bill_payer_codes
              + (["urn_allocated"] if urn_written else [])
              + ["created" if child.created else "child_existed"])
     if failures:
@@ -540,7 +546,8 @@ def _bill_payer_stage(job, deps, plan, context, child: "ChildResult"):
     return result
 
 
-def _summary_line(child_created: bool, contact_codes: list[str], bill_payer=None) -> str:
+def _summary_line(child_created: bool, contact_codes: list[str], bill_payer=None,
+                  relations_added: int = 0) -> str:
     """One plain sentence: what was done. Counts only."""
     created = contact_codes.count(CREATED)
     present = contact_codes.count(PRESENT)
@@ -548,6 +555,8 @@ def _summary_line(child_created: bool, contact_codes: list[str], bill_payer=None
     line = ("Child created in Famly. " if child_created else "Child was already in Famly. ")
     line += f"{created} contact(s) created, {present} already present"
     line += f", {missed} not added." if missed else "."
+    if relations_added:
+        line += " " + messages.relation_summary(relations_added)
     if bill_payer is not None:
         line += {bill_payer_scan.CREATED: " Bill payer created.",
                  bill_payer_scan.ATTACHED: " Child linked to the existing bill payer.",
@@ -777,8 +786,7 @@ def _create_contacts(
     all_ok = True
     creates_sent = 0
 
-    def matches(rows, target):
-        return list(dict.fromkeys(cid for cid, mail in rows if mail == target))
+    present_contacts: dict[str, str] = context.setdefault("present_contacts", {})
 
     for slot, entry in enumerate(entries):
         hubspot_id = entry["hubspotContactId"]
@@ -790,10 +798,12 @@ def _create_contacts(
             if child.clean_create and creates_sent == 0:
                 here = []                                   # a new child: nothing to find
             else:
-                here = matches(famly.child_contacts(child_id), target)   # the live check
+                # The live check: the HubSpot reference on this child first, then email.
+                here = famly.locate_contact(child_id, hubspot_id, target).ids
 
             if len(here) == 1:
                 code = PRESENT
+                present_contacts[hubspot_id] = here[0]
             elif len(here) > 1:
                 code = "ambiguous_on_child"
             elif not own_child:
@@ -806,7 +816,7 @@ def _create_contacts(
                 code = CONTACT_UNCONFIRMED
             else:
                 code, contact_warnings, sent = _create_one(
-                    job, deps, famly, contact, child_id, target, matches, slot)
+                    job, deps, famly, contact, child_id, target, slot)
                 warnings.extend(contact_warnings)
                 creates_sent += sent
         except Exception as exc:  # noqa: BLE001 - one contact must never stop the rest
@@ -820,6 +830,64 @@ def _create_contacts(
     return outcomes, warnings, all_ok
 
 
+def _add_relations(job, deps, plan, context, child: ChildResult) -> tuple[list[str], list[str], int]:
+    """RELATION = Parent on each contact that is PRESENT on the child and has no RELATION record.
+
+    Only for a contact the approved plan marked `would_add` AND that a fresh read still shows
+    without a RELATION record: an existing value of any kind is never overwritten. One update
+    per contact through the single-field `records` argument (it merges), sent once, never
+    retried. A request that did not answer cleanly is settled by reading the contact's records
+    (contacts.list on the child). Any failure is a FLAG for a person, never a stop.
+
+    Returns (stored outcome entries `relation:<hubspot id>:<code>`, flag codes, relations added)."""
+    present = context.get("present_contacts") or {}
+    planned = {e["hubspotContactId"] for e in plan["contacts"] if e.get("relation") == "would_add"}
+    wanted = {hid: fid for hid, fid in present.items() if hid in planned}
+    if not wanted:
+        return [], [], 0
+    famly = deps.famly()
+    try:
+        before = famly.child_contact_relations(child.child_id)
+    except Exception as exc:  # noqa: BLE001 - a flag check must never stop a job
+        logger.warning("onboard: relation read failed job=%s error=%s", job.id, type(exc).__name__)
+        return [], ["relation_unreadable"], 0
+
+    entries: list[str] = []
+    flags: list[str] = []
+    added = 0
+    for hid, fid in wanted.items():
+        has = before.get(fid)
+        if has is None:
+            entries.append(f"relation:{hid}:relation_unreadable")
+            flags.append("relation_unreadable")
+            continue
+        if has:
+            continue                                   # someone set it since the plan: leave it
+        rejected = False
+        try:
+            famly_writes.add_contact_relation(deps.public, fid, "Parent")
+        except famly_writes.CreateRejected:
+            rejected = True
+        except Exception as exc:  # noqa: BLE001 - an unknown outcome is settled by a read below
+            logger.warning("onboard: relation update outcome unknown job=%s error=%s",
+                           job.id, type(exc).__name__)
+        seen, readable = _lookup_with_settle(
+            job, deps,
+            lambda fid=fid: [fid] if famly.child_contact_relations(child.child_id).get(fid) else [],
+            expect=fid, label="relation_readback")
+        if fid in seen:
+            code = "relation_added"
+            added += 1
+        elif rejected and readable:
+            code = "relation_not_added"
+        else:
+            code = "relation_unconfirmed"
+        entries.append(f"relation:{hid}:{code}")
+        if code != "relation_added":
+            flags.append(code)
+    return entries, flags, added
+
+
 def _log_phone_reason(job, slot, props) -> None:
     """Why a phone was not normalised: the fixed reason code, the parent SLOT (an index,
     or `bill_payer`) and the HubSpot property name. Never the number or any part of it."""
@@ -828,7 +896,7 @@ def _log_phone_reason(job, slot, props) -> None:
                    job.id, job.deal_id, slot, prop, reason)
 
 
-def _create_one(job, deps, famly, contact, child_id, target, matches, slot) -> tuple[str, list[str], int]:
+def _create_one(job, deps, famly, contact, child_id, target, slot) -> tuple[str, list[str], int]:
     """Create one contact. Returns (outcome code, warning codes, create requests sent)."""
     try:
         payload, contact_warnings = inputs.build_contact_input(contact, child_id)
@@ -843,9 +911,11 @@ def _create_one(job, deps, famly, contact, child_id, target, matches, slot) -> t
         # An error status or `errors` does not mean it did not run: look with the
         # existing present-check. Found exactly once = it was created; nothing found =
         # only now is a rejection reported. Never sent again.
-        # Reads only, with the search-lag retries; an unreadable lookup is never "found 0".
+        # Reads only (the reference lookup, then the child's contacts by email), with the
+        # search-lag retries; an unreadable lookup is never "found 0".
         rows, readable = _lookup_with_settle(
-            job, deps, lambda: matches(famly.child_contacts(child_id), target), label="contact_settle")
+            job, deps, lambda: famly.locate_contact(child_id, contact.hubspot_id, target).ids,
+            label="contact_settle")
         found = len(rows)
         if found != 1:
             if found == 0 and readable and isinstance(exc, famly_writes.CreateRejected):
@@ -854,7 +924,8 @@ def _create_one(job, deps, famly, contact, child_id, target, matches, slot) -> t
 
     # Read-back: exactly once on the child, with the expected email.
     rows, _readable = _lookup_with_settle(
-        job, deps, lambda: matches(famly.child_contacts(child_id), target), label="contact_readback")
+        job, deps, lambda: famly.locate_contact(child_id, contact.hubspot_id, target).ids,
+        label="contact_readback")
     if len(rows) != 1:
         return "readback_failed", contact_warnings, 1
     return CREATED, contact_warnings, 1

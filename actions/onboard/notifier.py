@@ -88,9 +88,11 @@ def gate_text(
     bp_section = plan.get("billPayer")
     bill_payer_writes = 1 if isinstance(bp_section, dict) and bp_section.get("status") in (
         "would_create", "would_attach") else 0
+    relation_writes = sum(1 for c in contacts if c.get("relation") == "would_add")
     lines.append(
         f"Famly writes planned: {child_writes} child, {creating} contact(s)"
         + (f", {bill_payer_writes} bill payer" if isinstance(bp_section, dict) else "")
+        + (f", {relation_writes} contact relation(s)" if relation_writes else "")
     )
     lines.append(
         f"Child: {child_state} · Contacts: {len(contacts)} ({creating} to create, "

@@ -1,0 +1,15 @@
+# READ-ONLY. ContactQueries.listByExternalSystemReference(foreignId, system): the contacts that
+# carry a reference (case-insensitive; every site; past and future children; several may share
+# one foreignId, e.g. siblings; not paginated). Selects ids only: the contact ids and the ids of
+# the children they belong to, so the caller keeps just the ones on its own child.
+query OnboardContactByReference($foreignId: String!, $system: String!) {
+  contacts {
+    listByExternalSystemReference(foreignId: $foreignId, system: $system) {
+      result {
+        id
+        childIds
+      }
+      next
+    }
+  }
+}

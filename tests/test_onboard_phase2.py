@@ -148,6 +148,14 @@ class FakeFamly:
         self.contact_list_script = None   # (n, rows) -> rows; n counts contact lists since the last contact create
         self.contact_lists_since_create = 0
         self.after_first = {}     # operation -> callable run after its FIRST call
+        self.contact_refs = {}    # contact id -> (child ids, [(system, foreignId)]); visible like the contact
+        self.relations = {}       # contact id -> has a RELATION record (a seeded contact defaults to True)
+        self.relation_updates = []        # (contact id, records) per update request
+        self.relation_effect = None       # called with the variables BEFORE an update lands; may raise
+        self.relation_land_then_raise = None   # an exception to raise AFTER an update landed
+        self.relation_lands = True        # False: an accepted update changes nothing
+        self.contact_ref_error = None     # raised by every by-reference lookup
+        self.contact_ref_blind = False    # the by-reference lookup lags: it finds nothing
         self._n = 0
 
     def _new_id(self, prefix):
@@ -157,7 +165,9 @@ class FakeFamly:
     def execute(self, query_path, variables, operation_name):
         lines = Path(query_path).read_text(encoding="utf-8").splitlines()
         text = "\n".join(l for l in lines if not l.lstrip().startswith("#")).lower()
-        if "delete" in text or "update(" in text:
+        if "delete" in text or ("update(" in text and not (
+                operation_name == famly_writes.UPDATE_RELATION_OP
+                and "update(records:" in text and "update(contacts" not in text)):
             raise AssertionError(f"forbidden Famly operation: {operation_name}")
         self.calls.append(operation_name)
 
@@ -186,6 +196,11 @@ class FakeFamly:
             contact_id = self._new_id("contact")
             if not self.hide_created_contacts:
                 self.contacts[payload["childIds"][0]].append((contact_id, payload["email"]))
+                self.contact_refs[contact_id] = (
+                    list(payload["childIds"]),
+                    [(r["system"].upper(), r["foreignId"]) for r in payload.get("externalSystemsReferences", [])])
+                self.relations[contact_id] = any(
+                    r.get("key") == "RELATION" for r in payload.get("records", []))
             if self.contact_land_then_raise:
                 error = self.contact_land_then_raise(payload)
                 if error:
@@ -209,6 +224,35 @@ class FakeFamly:
             if hook:
                 hook()      # the world changes AFTER this answer was given
             return response
+
+        if operation_name == famly_writes.UPDATE_RELATION_OP:
+            record = variables["records"][0]
+            self.relation_updates.append((record["contactId"], variables["records"]))
+            if self.relation_effect:
+                self.relation_effect(variables)
+            if self.relation_lands:
+                self.relations[record["contactId"]] = True
+            if self.relation_land_then_raise:
+                raise self.relation_land_then_raise
+            return {"data": {"contacts": {"update": [{"id": record["contactId"]}]}}}
+
+        if operation_name == "OnboardContactByReference":
+            if self.contact_ref_error:
+                raise self.contact_ref_error
+            if self.contact_ref_blind:
+                return {"data": {"contacts": {"listByExternalSystemReference": {"result": [], "next": None}}}}
+            wanted = (variables["system"].strip().upper(), variables["foreignId"])
+            return {"data": {"contacts": {"listByExternalSystemReference": {
+                "result": [{"id": cid, "childIds": kids}
+                           for cid, (kids, refs) in self.contact_refs.items() if wanted in refs],
+                "next": None}}}}
+
+        if operation_name == "OnboardChildContactRelations":
+            rows = self.contacts.get(variables["childIds"][0], [])
+            return {"data": {"contacts": {"list": {
+                "result": [{"id": i, "records": [{"key": "RELATION", "value": "Parent"}]
+                            if self.relations.get(i, True) else []} for i, _e in rows],
+                "next": None}}}}
 
         if operation_name == "OnboardChildContacts":
             rows = self.contacts.get(variables["childIds"][0], [])
@@ -2139,6 +2183,10 @@ class SearchLagTests(Phase2Case):
 class ContactLagTests(Phase2Case):
     """The contact read-back and settle read again while Famly's contacts.list lags."""
 
+    def setUp(self):
+        super().setUp()
+        self.famly.contact_ref_blind = True      # these tests are about the child's list lagging
+
     def hide_first_contact(self, until):
         first = []
 
@@ -2332,6 +2380,10 @@ class UnconfirmedContactGuardTests(Phase2Case):
     again while the child's list does not show them."""
 
     ADA = "ada.l@example.org"
+
+    def setUp(self):
+        super().setUp()
+        self.famly.contact_ref_blind = True      # these tests are about the child's list lagging
 
     def hide(self, emails):
         self.hidden = set(emails)

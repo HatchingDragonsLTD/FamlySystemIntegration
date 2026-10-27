@@ -1,0 +1,12 @@
+# THE ONE CONTACT UPDATE the pipeline sends (RELATION = Parent on a contact that has none). The
+# schema's single-field `records` argument ("Update just the record field"): it touches no other
+# field of the contact, and it MERGES per key (proven by probe-contact-reference: TITLE and
+# OCCUPATION survived adding RELATION). One contact per call, never batched, never retried. Only
+# `id` is selected.
+mutation OnboardContactRelationUpdate($records: [ContactUpdateRecord!]) {
+  contacts {
+    update(records: $records) {
+      id
+    }
+  }
+}

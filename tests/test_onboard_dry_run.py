@@ -109,6 +109,9 @@ class FakeFamlyClient:
     def __init__(self):
         self.ext_refs = {}  # deal id -> [child ids]
         self.child_contacts = {}  # child id -> [(contact id, email)]
+        self.contact_refs = {}  # HubSpot contact id -> [(famly contact id, [child ids])]
+        self.no_relation = set()  # famly contact ids with no RELATION record
+        self.relations_error = None
         self.scan = []  # [{"id": child id, "contacts": [node, ...]}]
         self.urn_children = []  # [(child id, externalId)]
         self.site_children = []  # [(child id, birthday, full name)]
@@ -131,6 +134,19 @@ class FakeFamlyClient:
             rows = self.child_contacts.get(variables["childIds"][0], [])
             return {"data": {"contacts": {"list": {
                 "result": [{"id": i, "email": e} for i, e in rows], "next": None}}}}
+        if operation_name == "OnboardContactByReference":
+            return {"data": {"contacts": {"listByExternalSystemReference": {
+                "result": [{"id": i, "childIds": kids}
+                           for i, kids in self.contact_refs.get(variables["foreignId"], [])],
+                "next": None}}}}
+        if operation_name == "OnboardChildContactRelations":
+            if self.relations_error is not None:
+                raise self.relations_error
+            rows = self.child_contacts.get(variables["childIds"][0], [])
+            return {"data": {"contacts": {"list": {
+                "result": [{"id": i, "records": [] if i in self.no_relation
+                            else [{"key": "RELATION", "value": "Parent"}]} for i, _e in rows],
+                "next": None}}}}
         if operation_name == "OnboardContactsScan":
             return {"data": {"children": {"listBySiteIds": {"result": self.scan, "next": None}}}}
         if operation_name == "OnboardSiteChildren":

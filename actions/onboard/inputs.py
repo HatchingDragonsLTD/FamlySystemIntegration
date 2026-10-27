@@ -135,6 +135,10 @@ def build_contact_input(contact, child_id: str) -> tuple[dict, list[str]]:
         "childIds": [child_id],
         "roles": [],
         "emergencyContact": bool(contact.is_bill_payer),
+        # The HubSpot contact record id, so the contact is found again even if the parent's
+        # email changes in Famly. Siblings share one id (one HubSpot contact, several Famly
+        # contacts): the lookup is always filtered to the child.
+        "externalSystemsReferences": [{"foreignId": str(contact.hubspot_id), "system": "HUBSPOT"}],
     }
 
     street, zip_code, city = (_clean(props.get(k)) for k in ("address", "zip", "city"))

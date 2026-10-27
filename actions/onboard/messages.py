@@ -67,6 +67,10 @@ _STATIC: dict[str, tuple[str, str]] = {
     "urn_sequence_exhausted": (NOT_DONE, "The site has used all its child URN numbers. Ask an admin."),
     "urn_allocated": (INFO, ""),
     "urn_readback_mismatch": (CHECK, "The new child URN could not be confirmed on the Famly child. Check the child's URN in Famly."),
+    "relation_not_added": (CHECK, "Famly refused to set a parent's relation to Parent on a contact already on the child. Set it in Famly by hand."),
+    "relation_unconfirmed": (CHECK, "A parent's relation was sent to Famly but could not be confirmed afterwards. Check the parent's relation in Famly."),
+    "relation_unreadable": (CHECK, "The relation of a parent already on the child could not be read, so it was not changed. Check it in Famly."),
+    "relation_added": (INFO, ""),
     "contact_error": (NOT_DONE, "A parent could not be added because of an unexpected error. Add them in Famly by hand."),
     "worker_error": (NOT_DONE, "An unexpected error stopped the job. Check Famly for the deal ID before running again."),
     "interrupted": (NOT_DONE, "The job was interrupted part-way. Check Famly for the deal ID before running again."),
@@ -216,3 +220,7 @@ CHILD_ONLY_EXISTED = "Child was already in Famly. No contacts or bill payer, bec
 
 def child_only_summary(created: bool, stage: str | None) -> str:
     return (CHILD_ONLY_CREATED if created else CHILD_ONLY_EXISTED).format(stage=stage or "a child-only stage")
+
+
+def relation_summary(count: int) -> str:
+    return f"{count} existing contact(s) set to Parent."

@@ -1,0 +1,16 @@
+# READ-ONLY. A child's contacts with ONLY the RELATION record (the key and whether it has a
+# value is all the caller keeps; the value itself is never printed or stored).
+query OnboardChildContactRelations($childIds: [ChildId!]!, $next: ContactCursor) {
+  contacts {
+    list(childIds: $childIds, nextToken: $next) {
+      result {
+        id
+        records(keys: [RELATION]) {
+          key
+          value
+        }
+      }
+      next
+    }
+  }
+}

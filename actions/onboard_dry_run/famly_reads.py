@@ -25,10 +25,14 @@ HERE = Path(__file__).parent
 CHILD_BY_EXT_REF_QUERY = HERE / "child_by_ext_ref.graphql"
 CHILD_CONTACTS_QUERY = HERE / "child_contacts.graphql"
 SITE_CHILDREN_QUERY = HERE / "site_children.graphql"
+CONTACT_BY_REFERENCE_QUERY = HERE / "contact_by_reference.graphql"
+CHILD_CONTACT_RELATIONS_QUERY = HERE / "child_contact_relations.graphql"
 
 CHILD_BY_EXT_REF_OP = "OnboardChildByExternalRef"
 CHILD_CONTACTS_OP = "OnboardChildContacts"
 SITE_CHILDREN_OP = "OnboardSiteChildren"
+CONTACT_BY_REFERENCE_OP = "OnboardContactByReference"
+CHILD_CONTACT_RELATIONS_OP = "OnboardChildContactRelations"
 
 HUBSPOT_SYSTEM = "HUBSPOT"
 
@@ -52,6 +56,19 @@ def local_part(value: Any) -> str:
     email = normalise_email(value)
     local, at, _ = email.rpartition("@")
     return local if at else ""
+
+
+# How a contact on a child was found.
+BY_REFERENCE, BY_EMAIL = "reference", "email"
+
+
+@dataclass(frozen=True)
+class Located:
+    """The contacts on one child that a HubSpot contact maps to: their ids and how they were found
+    (`reference` or `email`; None when nothing was found)."""
+
+    ids: list
+    via: str | None = None
 
 
 @dataclass(frozen=True)
@@ -190,6 +207,56 @@ class FamlyReads:
             for row in listing.get("result") or []:
                 if isinstance(row, dict) and row.get("id"):
                     out.append((str(row["id"]), normalise_email(row.get("email"))))
+            cursor = listing.get("next") or None
+            if not cursor:
+                break
+        return out
+
+    def contact_ids_by_reference(self, child_id: str, hubspot_contact_id: str) -> list[str]:
+        """Contact ids on THIS child that carry HUBSPOT = `hubspot_contact_id`. The lookup spans
+        every site and child (siblings share one id), so the result is filtered to the child.
+        A read that fails raises: it is never "no match"."""
+        body = self._public().execute(
+            query_path=CONTACT_BY_REFERENCE_QUERY,
+            variables={"foreignId": str(hubspot_contact_id), "system": HUBSPOT_SYSTEM},
+            operation_name=CONTACT_BY_REFERENCE_OP,
+        )
+        listing = _dig(body, "data", "contacts", "listByExternalSystemReference")
+        rows = listing.get("result") if isinstance(listing, dict) else None
+        return _distinct(
+            row.get("id") for row in rows or []
+            if isinstance(row, dict) and child_id in [str(c) for c in row.get("childIds") or []]
+        )
+
+    def locate_contact(self, child_id: str, hubspot_contact_id: str, target_email: str) -> Located:
+        """The contact on the child for a HubSpot contact: first by its HUBSPOT reference (found
+        even if the parent's email changed in Famly), then by canonical email on the child."""
+        by_reference = self.contact_ids_by_reference(child_id, hubspot_contact_id)
+        if by_reference:
+            return Located(by_reference, BY_REFERENCE)
+        ids = _distinct(cid for cid, mail in self.child_contacts(child_id) if mail == target_email)
+        return Located(ids, BY_EMAIL if ids else None)
+
+    def child_contact_relations(self, child_id: str) -> dict[str, bool]:
+        """contact id -> whether the contact has a RELATION record, for each contact on the child.
+        Only the presence is kept: the value is never returned."""
+        out: dict[str, bool] = {}
+        cursor: str | None = None
+        while True:
+            body = self._public().execute(
+                query_path=CHILD_CONTACT_RELATIONS_QUERY,
+                variables={"childIds": [child_id], "next": cursor},
+                operation_name=CHILD_CONTACT_RELATIONS_OP,
+            )
+            listing = _dig(body, "data", "contacts", "list")
+            if not isinstance(listing, dict):
+                break
+            for row in listing.get("result") or []:
+                if isinstance(row, dict) and row.get("id"):
+                    out[str(row["id"])] = any(
+                        isinstance(r, dict) and r.get("key") == "RELATION"
+                        for r in row.get("records") or []
+                    )
             cursor = listing.get("next") or None
             if not cursor:
                 break

@@ -54,6 +54,13 @@ NO_EMAIL = "no_email"
 AMBIGUOUS_ON_CHILD = "ambiguous_on_child"
 CHILD_UNRESOLVED = "child_unresolved"
 
+# How a contact would be matched (`matchedBy`): by its HubSpot reference, by email, or not at all.
+MATCH_CREATE = "create"
+
+# A present contact's RELATION record: it has one, it has none (RELATION = Parent would be added),
+# or the read failed.
+RELATION_PRESENT, RELATION_WOULD_ADD, RELATION_UNREADABLE = "present", "would_add", "unreadable"
+
 # Hold reasons owned by this module (derive.py owns the rest).
 DEAL_NOT_FOUND = "deal_not_found"
 CHILD_AMBIGUOUS_HOLD = "child_ambiguous"
@@ -442,6 +449,7 @@ class DryRun:
 
         child_id = child.get("famlyChildId")
         on_child = self._famly.child_contacts(child_id) if child_id else []
+        present_ids: list[int] = []          # indexes in `out` of contacts found on the child
 
         out = []
         for contact in deal_contacts:
@@ -469,19 +477,43 @@ class DryRun:
                 self._existing_child_contact(
                     contact, on_child, entry, holds,
                     own_child=child.get("origin") == "created_by_pipeline",
+                    by_reference=self._famly.contact_ids_by_reference(child_id, contact.hubspot_id),
                 )
+                if entry["status"] == PRESENT:
+                    present_ids.append(len(out))
             elif child["status"] == CHILD_WOULD_CREATE:
                 self._new_child_contact(contact, entry)
             else:
                 entry["status"] = CHILD_UNRESOLVED
             out.append(entry)
+        if present_ids:
+            self._relations(child_id, out, present_ids, warnings)
         return out
 
+    def _relations(self, child_id: str, entries: list, indexes: list, warnings: list) -> None:
+        """For each contact found on the child: does it already have a RELATION record (any
+        value)? `would_add` = it has none, so RELATION = Parent would be added (one write per
+        contact). A read that fails leaves `unreadable`: a flag for a person, never a hold."""
+        try:
+            relations = self._famly.child_contact_relations(child_id)
+        except (GraphQLError, GraphQLHTTPError):
+            relations = None
+        for index in indexes:
+            entry = entries[index]
+            has = None if relations is None else relations.get(entry["famlyContactId"])
+            entry["relation"] = (RELATION_UNREADABLE if has is None
+                                 else RELATION_PRESENT if has else RELATION_WOULD_ADD)
+            if has is None:
+                warnings.append("relation_unreadable")
+
     def _existing_child_contact(
-        self, contact, on_child, entry: dict, holds: list, own_child: bool = False
+        self, contact, on_child, entry: dict, holds: list, own_child: bool = False,
+        by_reference: list | None = None,
     ) -> None:
-        """The child exists. A parent already on it (canonical email: trimmed,
-        lower-cased, googlemail.com = gmail.com) is `present`.
+        """The child exists. A parent already on it is `present`: first a contact on THIS child
+        carrying the HubSpot contact id as a reference (`matchedBy` = reference; found even if
+        the parent's email changed in Famly), else one with the same canonical email (trimmed,
+        lower-cased, googlemail.com = gmail.com; `matchedBy` = email).
 
         One that is not:
           * on a child that ALREADY EXISTED when the job started: a HOLD,
@@ -494,10 +526,14 @@ class DryRun:
             completes the contacts that are missing.
         """
         target = normalise_email(contact.email)
-        here = sorted(dict.fromkeys(cid for cid, mail in on_child if mail == target),
-                      key=links.id_sort_key)
+        matched_by = "reference"
+        here = sorted(dict.fromkeys(by_reference or []), key=links.id_sort_key)
+        if not here:
+            matched_by = "email"
+            here = sorted(dict.fromkeys(cid for cid, mail in on_child if mail == target),
+                          key=links.id_sort_key)
         if len(here) == 1:
-            entry.update(status=PRESENT, famlyContactId=here[0])
+            entry.update(status=PRESENT, famlyContactId=here[0], matchedBy=matched_by)
         elif len(here) > 1:
             entry.update(status=AMBIGUOUS_ON_CHILD, candidateIds=here)
             holds.append(
@@ -508,7 +544,7 @@ class DryRun:
                 }
             )
         elif own_child:
-            entry["status"] = WOULD_CREATE
+            entry.update(status=WOULD_CREATE, matchedBy=MATCH_CREATE)
         else:
             wanted = local_part(contact.email)
             candidates = sorted(
@@ -528,7 +564,7 @@ class DryRun:
 
     def _new_child_contact(self, contact, entry: dict) -> None:
         """The child does not exist yet, so every contact is created."""
-        entry["status"] = WOULD_CREATE
+        entry.update(status=WOULD_CREATE, matchedBy=MATCH_CREATE)
 
 
 def _hubspot_child_names(deal: dict) -> list[str]:
