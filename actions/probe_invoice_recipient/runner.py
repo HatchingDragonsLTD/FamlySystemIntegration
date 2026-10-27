@@ -20,10 +20,11 @@ cannot be deleted without deleteChildren first).
 THE STEPS (5 writes in all)
   1. create a contact on the test child, with no reference (or, with --contact-id, reuse an
      AAProbe test contact after a read shows it is on that child: no write, step 1 is skipped);
-  2. create a bill payer on the test child at share 0.0 (nothing bills). The document and the
+  2. create a bill payer on the test child at --share 0.0 or 1.0 (default 1.0, the pipeline's own
+     share; on a TEST child nothing bills and invoicing is off). The document and the
      variables are built from the LIVE SCHEMA by the same builders the pipeline uses
      (`bill_payer_writes.load_plan`, `create_document`, `write_probe.build_share`); only fixed test
-     values go in (name AAProbe IR, an example.com email, the test child, share 0.0). No HubSpot
+     values go in (name AAProbe IR, an example.com email, the test child, the chosen share). No HubSpot
      contact, phone or address. If it fails, one read counts the child's bill payers;
   3. addInvoiceRecipients with the contact as relationId; read the payer's recipients back;
   4. the same addInvoiceRecipients again; read back (deduplicated or duplicated? an error is
@@ -77,7 +78,9 @@ OPS = {SITE_CHILDREN_DOC: "ProbeIRSiteChildren", READ_PAYERS_DOC: "ProbeIRPayers
 MAX_WRITES = 5
 READ_WAITS = (0, 2, 4, 8)           # a read that does not show the row yet is read again (reads only)
 SYSTEM = "HUBSPOT"
-SHARE = 0.0
+SHARES = (0.0, 1.0)
+DEFAULT_SHARE = 1.0
+ERROR_FILE = "probe_invoice_recipient_error.json"
 CODE_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
 
 
@@ -111,7 +114,7 @@ def check_documents() -> None:
 
 VALIDATION_RE = re.compile(
     r"variable|field|argument|unknown type|cannot query|expected|required|not defined|validation|"
-    r"of type|input|enum", re.I)
+    r"of type|input|enum|must|cannot|invalid|positive|greater|less|minimum|maximum|multiplier|share", re.I)
 
 
 def _string_values(value) -> list[str]:
@@ -234,7 +237,8 @@ class Result:
 
 def run_probe(child_id: str, confirm: bool, rest, gql, out: Callable[[str], None] = print,
               sleep: Callable[[float], None] = time.sleep, template: dict | None = None,
-              contact_id: str | None = None) -> Result:
+              contact_id: str | None = None, share: float = DEFAULT_SHARE,
+              error_file: Path | str | None = None) -> Result:
     """Run the probe. Raises ProbeRefused (nothing written) if a guard fails."""
     if not confirm:
         raise ProbeRefused("refusing without --confirm; nothing was written")
@@ -243,10 +247,15 @@ def run_probe(child_id: str, confirm: bool, rest, gql, out: Callable[[str], None
     child_id = child_id.strip()
     check_documents()
     verify_test_child(rest, child_id)
+    if share not in SHARES:
+        raise ProbeRefused("--share must be 0.0 or 1.0; nothing was written")
+    error_path = Path(error_file or ERROR_FILE)
+    error_entries: list = []
     if contact_id is not None and not UUID_RE.match(str(contact_id).strip().lower()):
         raise ProbeRefused("--contact-id is not a UUID; nothing was written")
     template = template if template is not None else captured_update_template()
-    out(f"CAP: 1 contact, 1 bill payer, {MAX_WRITES} write requests; each write once, never retried")
+    out(f"CAP: 1 contact, 1 bill payer, {MAX_WRITES} write requests; each write once, never retried; "
+        f"bill payer share {share}")
     out(f"step 5 uses: {'the captured request in docs' if template else 'the schema shape'}")
 
     result = Result()
@@ -292,8 +301,29 @@ def run_probe(child_id: str, confirm: bool, rest, gql, out: Callable[[str], None
         try:
             return gql.execute(query_path=doc, variables=variables,
                                operation_name=operation or OPS[doc]), None
-        except (GraphQLError, GraphQLHTTPError) as exc:
+        except GraphQLHTTPError as exc:
+            record_http_error(exc, doc, variables, operation or OPS[doc])
             return None, error_info(exc, variables)
+        except GraphQLError as exc:
+            return None, error_info(exc, variables)
+
+    def record_http_error(exc, doc: Path, variables: dict, operation: str) -> None:
+        """A non-2xx response: write the RAW body and the exact request (document text and variables:
+        fixed test values only) to a local file, overwritten each run and never committed. No headers,
+        no token. Prints only the path, the body length and the body's top-level JSON keys."""
+        body = exc.body if isinstance(exc.body, str) else json.dumps(exc.body)
+        try:
+            parsed = json.loads(body)
+            keys = sorted(parsed) if isinstance(parsed, dict) else f"json {type(parsed).__name__}"
+        except ValueError:
+            keys = "not json"
+        error_entries.append({
+            "operation": operation, "status": getattr(exc, "status_code", None),
+            "request": {"document": doc.read_text(encoding="utf-8"), "variables": variables},
+            "body": body})
+        error_path.write_text(json.dumps({"errors": error_entries}, indent=2), encoding="utf-8")
+        out(f"HTTP {getattr(exc, 'status_code', None)} on {operation}: full response and request written to "
+            f"{error_path.resolve()} (body length {len(body)}, top-level keys {keys})")
 
     def count_child_payers() -> int | None:
         """ONE read of the site's live bill payers: how many list this child (None if unreadable)."""
@@ -369,14 +399,14 @@ def run_probe(child_id: str, confirm: bool, rest, gql, out: Callable[[str], None
             result.stopped = "no contact id came back; nothing else was sent (a contact may exist: check Famly)"
             return _finish(result, out)
 
-    # ---- 2. a bill payer at share 0.0 -------------------------------------- #
+    # ---- 2. a bill payer at the chosen share -------------------------------- #
     w = payer_plan.write
     payload = {w.site_field: site_id, w.name_field: "AAProbe IR"}
     if w.email_field:
         payload[w.email_field] = f"probe-ir-payer-{stamp}@example.com"
     entry = {w.child_id_field: child_id}
     if w.share_field:
-        entry[w.share_field] = write_probe.build_share(w, SHARE)
+        entry[w.share_field] = write_probe.build_share(w, share)
     payload[w.children_field] = [entry]
     payer_variables = {"input": [payload] if "[" in w.create_arg_type else payload}
     handle = tempfile.NamedTemporaryFile("w", suffix=".graphql", delete=False, encoding="utf-8")

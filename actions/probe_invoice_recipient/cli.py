@@ -20,6 +20,9 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--contact-id", metavar="ID", default=None,
                         help="Reuse this AAProbe test contact (it must be on the test child) instead of "
                              "creating one: step 1 is skipped and is not a write")
+    parser.add_argument("--share", choices=("0.0", "1.0"), default="1.0",
+                        help="The test bill payer's share of the test child: 0.0 or 1.0 (default 1.0, the "
+                             "pipeline's own share; nothing bills on a test child)")
     parser.add_argument("--confirm", action="store_true",
                         help=f"Required. Creates 1 test contact and 1 test bill payer "
                              f"({runner.MAX_WRITES} write requests at most)")
@@ -28,7 +31,7 @@ def add_args(parser: argparse.ArgumentParser) -> None:
 def handle(args: argparse.Namespace):
     try:
         result = runner.run_probe(args.child_id, args.confirm, RestClient(), _public_client(),
-                                  contact_id=args.contact_id)
+                                  contact_id=args.contact_id, share=float(args.share))
     except runner.ProbeRefused as exc:
         print(str(exc), file=sys.stderr)
         raise SystemExit(3) from None

@@ -1,8 +1,11 @@
 """probe-invoice-recipient: guards, caps, one send per write, the dedupe and error reporting, the
 captured-request template, and an output with no values. Fakes only; nothing talks to Famly."""
 
+import argparse
+import contextlib
 import io
 import json
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -116,11 +119,16 @@ class ProbeCase(unittest.TestCase):
         sites.start()
         self.addCleanup(sites.stop)
         self.lines = []
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.error_file = Path(tmp.name) / "probe_invoice_recipient_error.json"
 
-    def run_probe(self, gql=None, rest=None, confirm=True, child=CHILD, template=None, contact_id=None):
+    def run_probe(self, gql=None, rest=None, confirm=True, child=CHILD, template=None, contact_id=None,
+                  **kwargs):
         gql = gql or FakeGql()
         result = runner.run_probe(child, confirm, rest or FakeRest(), gql, out=self.lines.append,
-                                  sleep=lambda s: None, template=template or None, contact_id=contact_id)
+                                  sleep=lambda s: None, template=template or None, contact_id=contact_id,
+                                  error_file=self.error_file, **kwargs)
         return result, gql
 
 
@@ -151,6 +159,14 @@ class SanitiserTests(unittest.TestCase):
         self.assertEqual(text, "Variable $input of type [BillPayerInput!]! was invalid")
         long = runner.sanitise_message(["Field 'foo' is not defined " + "x" * 400], {})
         self.assertEqual(len(long), 200)
+
+    def test_the_loosened_filter_keeps_must_be_greater_than_zero(self):
+        self.assertEqual(runner.sanitise_message(["Share must be greater than zero"], {}),
+                         "Share must be greater than zero")
+        for text in ("multiplier is invalid", "value cannot be negative", "minimum is 1", "maximum exceeded"):
+            self.assertIsNotNone(runner.sanitise_message([text], {}), text)
+        self.assertIsNone(runner.sanitise_message(["Share must be greater than zero for a@b.co"], {}))
+        self.assertIsNone(runner.sanitise_message(["Share must be greater than 12345678"], {}))
 
     def test_anything_with_an_email_long_digits_or_a_variable_value_is_dropped(self):
         self.assertIsNone(runner.sanitise_message(["Variable field ada.l@example.org is invalid"], {}))
@@ -183,7 +199,7 @@ class FlowTests(ProbeCase):
         self.assertEqual((result.contact_id, result.payer_id), ("contact-1", "payer-1"))
         self.assertEqual(len(gql.update_inputs[0]["externalSystemsReferences"]), 1)
 
-    def test_step_2_uses_the_schema_derived_document_and_variables_at_share_zero(self):
+    def test_step_2_uses_the_schema_derived_document_and_variables_at_the_default_share(self):
         result, gql = self.run_probe()
         text, variables = gql.payer_calls[0]
         self.assertIn(f"mutation {bpw.CREATE_OP}", text)
@@ -197,9 +213,51 @@ class FlowTests(ProbeCase):
             self.assertNotIn(absent, entry)
         child = entry["children"][0]
         self.assertEqual(child["childId"], CHILD)
-        self.assertEqual(child["share"], {"multiplier": 0.0})        # nothing bills
+        self.assertEqual(child["share"], {"multiplier": 1.0})        # the pipeline's own share
         self.assertIs(type(child["share"]["multiplier"]), float)
         self.assertEqual(result.writes, 5)
+
+    def test_the_chosen_share_reaches_the_payer_input_and_only_0_or_1_is_allowed(self):
+        _r, gql = self.run_probe(share=0.0)
+        self.assertEqual(gql.payer_calls[0][1]["input"][0]["children"][0]["share"], {"multiplier": 0.0})
+        _r, gql = self.run_probe(share=1.0)
+        self.assertEqual(gql.payer_calls[0][1]["input"][0]["children"][0]["share"], {"multiplier": 1.0})
+        gql = FakeGql()
+        for bad in (0.5, 2.0, -1.0, None):
+            with self.assertRaises(runner.ProbeRefused):
+                self.run_probe(gql, share=bad)
+        self.assertEqual(gql.writes, [])
+        from actions.probe_invoice_recipient import cli
+        parser = argparse.ArgumentParser()
+        cli.add_args(parser)
+        self.assertEqual(parser.parse_args(["--child-id", "x"]).share, "1.0")          # the default
+        self.assertEqual(parser.parse_args(["--child-id", "x", "--share", "0.0"]).share, "0.0")
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            parser.parse_args(["--child-id", "x", "--share", "0.5"])
+
+    def test_a_400_writes_the_raw_body_and_the_request_to_a_file_and_prints_only_its_shape(self):
+        body = json.dumps({"errors": [{"message": "Share must be greater than zero",
+                                       "extensions": {"code": "X"}}], "data": None})
+        self.run_probe(FakeGql(payer_error=GraphQLHTTPError("x", 400, body)))
+        saved = json.loads(self.error_file.read_text(encoding="utf-8"))
+        entry = saved["errors"][0]
+        self.assertEqual(sorted(entry), ["body", "operation", "request", "status"])    # no headers
+        self.assertEqual((entry["status"], entry["operation"]), (400, bpw.CREATE_OP))
+        self.assertEqual(entry["body"], body)                                         # raw, unfiltered
+        self.assertIn("mutation", entry["request"]["document"])
+        self.assertEqual(entry["request"]["variables"]["input"][0]["name"], "AAProbe IR")
+        raw = self.error_file.read_text(encoding="utf-8").casefold()
+        for word in ("authorization", "bearer", "token", "header"):
+            self.assertNotIn(word, raw)
+        shown = "\n".join(self.lines)
+        self.assertIn(str(self.error_file.resolve()), shown)
+        self.assertIn(f"body length {len(body)}", shown)
+        self.assertIn("top-level keys ['data', 'errors']", shown)
+        self.assertNotIn("greater than zero", shown.replace("message='Share must be greater than zero'", ""))
+
+    def test_a_successful_run_writes_no_error_file(self):
+        self.run_probe()
+        self.assertFalse(self.error_file.exists())
 
     def test_the_payer_document_is_never_built_if_the_schema_cannot_support_it(self):
         gql = FakeGql()
