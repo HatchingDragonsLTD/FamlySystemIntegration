@@ -30,6 +30,7 @@ from actions.probe_child_create import cli as probe_child_create
 from actions.probe_child_create import cli_delete as probe_child_delete
 from actions.probe_contact_create import cli as probe_contact_create
 from actions.probe_contact_reference import cli as probe_contact_reference
+from actions.probe_invoice_recipient import cli as probe_invoice_recipient
 from actions.queue_timeline import (
     queue_cancel,
     queue_list,
@@ -74,6 +75,7 @@ ACTIONS = [
     onboard_audit,
     probe_contact_create,
     probe_contact_reference,
+    probe_invoice_recipient,
     probe_bill_payers,
     probe_child_create,
     probe_child_delete,

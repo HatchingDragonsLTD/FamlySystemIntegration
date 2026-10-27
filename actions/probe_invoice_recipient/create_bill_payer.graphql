@@ -1,0 +1,8 @@
+# ONE-OFF PROBE WRITE 2. One test bill payer on the test child, share 0.0 so nothing bills.
+mutation ProbeIRCreatePayer($billPayers: [BillPayerInput!]!) {
+  billPayers {
+    create(billPayers: $billPayers) {
+      billPayerId
+    }
+  }
+}

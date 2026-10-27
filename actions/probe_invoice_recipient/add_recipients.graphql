@@ -1,0 +1,10 @@
+# ONE-OFF PROBE WRITES 3 and 4 (the same request twice). Only the three ids are selected.
+mutation ProbeIRAddRecipients($invoiceRecipients: [InvoiceRecipientInput!]!) {
+  billPayers {
+    addInvoiceRecipients(invoiceRecipients: $invoiceRecipients) {
+      relationId
+      contactId
+      billPayerId
+    }
+  }
+}

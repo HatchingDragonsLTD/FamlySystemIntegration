@@ -1,0 +1,9 @@
+# ONE-OFF PROBE WRITE 5. The full `contacts` update (the only one that carries
+# externalSystemsReferences), on a contact that has no reference yet.
+mutation ProbeIRUpdateContact($contacts: [ContactUpdate!]) {
+  contacts {
+    update(contacts: $contacts) {
+      id
+    }
+  }
+}

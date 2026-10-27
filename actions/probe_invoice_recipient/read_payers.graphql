@@ -1,0 +1,17 @@
+# READ-ONLY. One site's live bill payers with their invoice recipients (ids only). includeDeleted is
+# always passed explicitly. No sensitive field is selected.
+query ProbeIRPayers($siteIds: [SiteId!]!, $next: BillPayerCursor, $includeDeleted: Boolean!) {
+  billPayers {
+    listBySiteIds(siteIds: $siteIds, nextToken: $next, includeDeleted: $includeDeleted) {
+      result {
+        billPayerId
+        invoiceRecipients {
+          relationId
+          contactId
+          billPayerId
+        }
+      }
+      next
+    }
+  }
+}

@@ -1,0 +1,11 @@
+# READ-ONLY. One site's children (ids only), to find which site a test child belongs to.
+query ProbeIRSiteChildren($siteIds: [SiteId!]!, $next: ChildCursor, $timeRange: NonEmptyLocalDateRangeInput) {
+  children {
+    listBySiteIds(siteIds: $siteIds, nextToken: $next, timeRange: $timeRange) {
+      result {
+        id
+      }
+      next
+    }
+  }
+}
