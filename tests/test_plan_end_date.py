@@ -107,13 +107,16 @@ class FromDictTests(unittest.TestCase):
                 plan_input = input_schema.from_dict({_p0: "2026-12-19"})
                 self.assertEqual(plan_input.to_date, "2026-12-19")
 
-    def test_absent_to_is_none(self):
-        plan_input = input_schema.from_dict({"from": "2026-09-01"})
-        self.assertIsNone(plan_input.to_date)
+    def test_absent_to_is_none_cases(self):
+        """Folded cases: absent_to_is_none; explicit_null_to_is_none."""
+        for _i, (_p0, _p1) in enumerate([
+            ("from", "2026-09-01"),
+            ("to", None),
+        ]):
+            with self.subTest(case=_i):
+                plan_input = input_schema.from_dict({_p0: _p1})
+                self.assertIsNone(plan_input.to_date)
 
-    def test_explicit_null_to_is_none(self):
-        plan_input = input_schema.from_dict({"to": None})
-        self.assertIsNone(plan_input.to_date)
 
 
 class ValidateToDateTests(unittest.TestCase):
@@ -138,15 +141,15 @@ class ValidateToDateTests(unittest.TestCase):
             ],
         )
 
-    def test_a_valid_to_date_is_not_an_error(self):
-        errors = input_schema.validate(self._plan_input(to_date="2026-12-19"))
-        self.assertEqual([e for e in errors if e.startswith("to:")], [])
-
-    def test_a_missing_to_date_is_open_ended_not_an_error(self):
-        # This is the normal, expected case -- every prior real capture sends
-        # "to": null, and it must never be flagged as missing data.
-        errors = input_schema.validate(self._plan_input(to_date=None))
-        self.assertEqual([e for e in errors if e.startswith("to:")], [])
+    def test_a_valid_to_date_is_not_an_error_cases(self):
+        """Folded cases: a_valid_to_date_is_not_an_error; a_missing_to_date_is_open_ended_not_an_error."""
+        for _i, (_p0,) in enumerate([
+            ("2026-12-19",),
+            (None,),
+        ]):
+            with self.subTest(case=_i):
+                errors = input_schema.validate(self._plan_input(to_date=_p0))
+                self.assertEqual([e for e in errors if e.startswith("to:")], [])
 
     def test_a_malformed_to_date_is_an_error(self):
         errors = input_schema.validate(self._plan_input(to_date="not-a-date"))

@@ -300,25 +300,26 @@ class ErrorTests(unittest.TestCase):
         with self.assertRaisesRegex(TimelineError, "leave"):
             build_segments("2026-06-30", "2026-06-29")
 
-    def test_funding_ending_before_it_starts(self):
-        with self.assertRaisesRegex(TimelineError, "funding.*before"):
-            build_segments("2026-01-05", "2026-12-18", funding=("2026-06-30", "2026-06-01"))
+    def test_funding_ending_before_it_starts_cases(self):
+        """Folded cases: funding_ending_before_it_starts; funding_with_only_a_from_date; funding_with_only_a_to_date."""
+        for _i, (_p0, _p1, _p2) in enumerate([
+            ("funding.*before", "2026-06-30", "2026-06-01"),
+            ("funding.*only one date", "2026-06-01", None),
+            ("funding.*only one date", None, "2026-06-01"),
+        ]):
+            with self.subTest(case=_i):
+                with self.assertRaisesRegex(TimelineError, _p0):
+                    build_segments("2026-01-05", "2026-12-18", funding=(_p1, _p2))
 
-    def test_advanced_ending_before_it_starts(self):
-        with self.assertRaisesRegex(TimelineError, "advanced.*before"):
-            build_segments("2026-01-05", "2026-12-18", advanced=("2026-06-30", "2026-06-01"))
-
-    def test_funding_with_only_a_from_date(self):
-        with self.assertRaisesRegex(TimelineError, "funding.*only one date"):
-            build_segments("2026-01-05", "2026-12-18", funding=("2026-06-01", None))
-
-    def test_funding_with_only_a_to_date(self):
-        with self.assertRaisesRegex(TimelineError, "funding.*only one date"):
-            build_segments("2026-01-05", "2026-12-18", funding=(None, "2026-06-01"))
-
-    def test_advanced_with_only_one_date(self):
-        with self.assertRaisesRegex(TimelineError, "advanced.*only one date"):
-            build_segments("2026-01-05", "2026-12-18", advanced=("2026-06-01", None))
+    def test_advanced_ending_before_it_starts_cases(self):
+        """Folded cases: advanced_ending_before_it_starts; advanced_with_only_one_date."""
+        for _i, (_p0, _p1, _p2) in enumerate([
+            ("advanced.*before", "2026-06-30", "2026-06-01"),
+            ("advanced.*only one date", "2026-06-01", None),
+        ]):
+            with self.subTest(case=_i):
+                with self.assertRaisesRegex(TimelineError, _p0):
+                    build_segments("2026-01-05", "2026-12-18", advanced=(_p1, _p2))
 
     def test_a_period_that_is_outside_the_placement_is_still_validated(self):
         # A bad period must not be hidden because it would have been dropped.

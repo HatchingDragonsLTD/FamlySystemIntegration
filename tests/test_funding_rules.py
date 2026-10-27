@@ -104,13 +104,16 @@ class ResolveTests(RulesTestCase):
             resolve_funding("  hdcw ", "30", False), resolve_funding("HDCW", "30", False)
         )
 
-    def test_a_whole_number_entitlement_is_read_as_its_string(self):
-        self.assertEqual(resolve_funding("HDCW", 30, False)["fundingHours"], 24.58823529)
-        self.assertEqual(resolve_funding("HDCW", " 15 ", True)["fundingHours"], 16.5)
+    def test_a_whole_number_entitlement_is_read_as_its_string_cases(self):
+        """Folded cases: a_whole_number_entitlement_is_read_as_its_string; term_only_is_decided_by_truthiness_like_the_rest_of_the_code."""
+        for _i, (_p0, _p1, _p2, _p3, _p4, _p5) in enumerate([
+            (24.58823529, 30, False, 16.5, " 15 ", True),
+            (33, "30", 1, 24.58823529, "30", 0),
+        ]):
+            with self.subTest(case=_i):
+                self.assertEqual(resolve_funding("HDCW", _p1, _p2)["fundingHours"], _p0)
+                self.assertEqual(resolve_funding("HDCW", _p4, _p5)["fundingHours"], _p3)
 
-    def test_term_only_is_decided_by_truthiness_like_the_rest_of_the_code(self):
-        self.assertEqual(resolve_funding("HDCW", "30", 1)["fundingHours"], 33)
-        self.assertEqual(resolve_funding("HDCW", "30", 0)["fundingHours"], 24.58823529)
 
 
 class HardErrorTests(RulesTestCase):
