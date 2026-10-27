@@ -28,5 +28,6 @@ def handle(args: argparse.Namespace):
             "attempts": latest.attempts,
             "outcomes": latest.outcomes,
             "planHash": (latest.plan_hash or "")[:16] or None,
+            "reopened": latest.reopen,
         },
     }

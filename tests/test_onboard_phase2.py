@@ -1411,7 +1411,7 @@ class GuaranteeTests(Phase2Case):
                                    "child_id", "attempts", "last_error_code", "approval_ref",
                                    "child_create_sent", "outcomes", "claimed_at", "created_at",
                                    "updated_at", "source", "approval_nonce", "reask_count",
-                                   "plan_sections", "bill_payer_id", "file_hash", "new_urn"])
+                                   "plan_sections", "bill_payer_id", "file_hash", "new_urn", "reopen"])
 
     def test_the_famly_writers_are_create_only_and_the_fake_would_catch_anything_else(self):
         for path in (famly_writes.CREATE_CHILD_QUERY, famly_writes.CREATE_CONTACT_QUERY):

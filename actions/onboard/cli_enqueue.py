@@ -29,6 +29,11 @@ def add_args(parser: argparse.ArgumentParser) -> None:
                         help="--file: queue the valid ids even if some failed validation")
     parser.add_argument("--include-review", action="store_true",
                         help="--file: also queue deals whose latest job is needs_review, failed or held")
+    parser.add_argument("--reopen-done", action="store_true",
+                        help="LIVE mode only: also queue a fresh job for a deal whose latest job is done "
+                             "(to repair an existing child). Gate A, the plan hash and every hold apply as "
+                             "usual; a plan with no writes completes with no approval. Works with --deal-id "
+                             "or --file; an active, needs_review, failed or held latest job is not affected")
 
 
 def handle(args: argparse.Namespace):
@@ -36,6 +41,11 @@ def handle(args: argparse.Namespace):
     if mode == config.MODE_OFF:
         print("ONBOARD_MODE is off; nothing was queued. Set ONBOARD_MODE=dry or live.",
               file=sys.stderr)
+        raise SystemExit(3)
+    reopen = bool(getattr(args, "reopen_done", False))
+    if reopen and mode != config.MODE_LIVE:
+        print("--reopen-done needs ONBOARD_MODE=live (a done deal is only reopened for a live run); "
+              "nothing was queued.", file=sys.stderr)
         raise SystemExit(3)
     if args.file:
         return _file(args, mode)
@@ -47,12 +57,13 @@ def handle(args: argparse.Namespace):
         print("--deal-id must be a HubSpot deal id (digits only); nothing was queued.",
               file=sys.stderr)
         raise SystemExit(3)
-    result = store.enqueue(deal_id, mode, new_urn=bool(getattr(args, "new_urn", False)))
+    result = store.enqueue(deal_id, mode, new_urn=bool(getattr(args, "new_urn", False)), reopen=reopen)
     return {
         "outcome": result.outcome,
         "jobId": result.job.id,
         "status": result.job.status,
         "mode": mode,
+        "reopened": 1 if (result.outcome == store.CREATED and result.job.reopen) else 0,
     }
 
 
@@ -74,7 +85,8 @@ def _file(args: argparse.Namespace, mode: str):
     ids, file_hash = batch.read_file(args.file)
     summary = batch.enqueue_file(
         HubSpotClient(), ids, file_hash, mode, limit=args.limit,
-        skip_invalid=args.skip_invalid, include_review=args.include_review)
+        skip_invalid=args.skip_invalid, include_review=args.include_review,
+        reopen_done=bool(getattr(args, "reopen_done", False)))
     if "blocked" in summary:
         print(json.dumps(summary, indent=2))
         raise SystemExit(3)

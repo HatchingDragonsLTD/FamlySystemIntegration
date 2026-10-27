@@ -113,16 +113,18 @@ def validate(hubspot, ids: list[str]) -> tuple[list[str], dict[str, str], Counte
     return valid, invalid, by_stage
 
 
-def classify(deal_id: str, mode: str, include_review: bool) -> tuple[str | None, str | None]:
+def classify(deal_id: str, mode: str, include_review: bool,
+             reopen_done: bool = False) -> tuple[str | None, str | None]:
     """(None, None) if the deal is eligible, else (skip reason, last error code or None),
-    by the deal's LATEST job."""
+    by the deal's LATEST job. `reopen_done` makes a deal whose latest job is DONE eligible (live mode,
+    checked by the caller); an active, needs_review, failed or held latest job is unaffected."""
     latest = store.latest_for_deal(deal_id)
     if mode == config.MODE_LIVE and deal_id in config.test_deal_ids():
         return SKIP_TEST, None
     if latest is None:
         return None, None
     if latest.status == store.DONE:
-        return SKIP_DONE, None
+        return (None, None) if reopen_done else (SKIP_DONE, None)
     if latest.status in store.ACTIVE:
         return SKIP_LIVE, None
     if latest.status == store.DRY_DONE:
@@ -135,13 +137,13 @@ def classify(deal_id: str, mode: str, include_review: bool) -> tuple[str | None,
 
 
 def enqueue_file(hubspot, ids: list[str], file_hash: str, mode: str, *, limit, skip_invalid: bool,
-                 include_review: bool) -> dict:
+                 include_review: bool, reopen_done: bool = False) -> dict:
     """Validate, apply eligibility and queue. Returns the printable summary."""
     valid, invalid, by_stage = validate(hubspot, ids)
     summary = {
         "mode": mode, "note": NOTE, "idsRead": len(ids), "valid": len(valid),
         "invalid": dict(sorted(invalid.items())), "byStage": dict(sorted(by_stage.items())),
-        "queued": 0, "skipped": {}, "needsAPerson": {}, "queuedIds": [],
+        "queued": 0, "reopened": 0, "skipped": {}, "needsAPerson": {}, "queuedIds": [],
     }
     if invalid and not skip_invalid:
         summary["blocked"] = "invalid_ids (nothing queued; fix them or pass --skip-invalid)"
@@ -152,15 +154,17 @@ def enqueue_file(hubspot, ids: list[str], file_hash: str, mode: str, *, limit, s
     for deal_id in valid:
         if limit is not None and summary["queued"] >= limit:
             break
-        reason, code = classify(deal_id, mode, include_review)
+        reason, code = classify(deal_id, mode, include_review, reopen_done)
         if reason:
             skipped[reason] += 1
             if reason == SKIP_NEEDS_PERSON:
                 needs[code] += 1
             continue
-        result = store.enqueue(deal_id, mode, source=SOURCE, file_hash=file_hash)
+        result = store.enqueue(deal_id, mode, source=SOURCE, file_hash=file_hash, reopen=reopen_done)
         if result.outcome == store.CREATED:
             summary["queued"] += 1
+            if result.job.reopen:
+                summary["reopened"] += 1
             summary["queuedIds"].append(deal_id)
         elif result.outcome == store.ALREADY_QUEUED:
             skipped[SKIP_LIVE] += 1

@@ -100,7 +100,8 @@ CREATE TABLE IF NOT EXISTS onboard_jobs (
     plan_sections     TEXT,
     bill_payer_id     TEXT,
     file_hash         TEXT,
-    new_urn           INTEGER NOT NULL DEFAULT 0
+    new_urn           INTEGER NOT NULL DEFAULT 0,
+    reopen            INTEGER NOT NULL DEFAULT 0
 );
 -- Child URN allocations (ONBOARD_URN_GENERATION): one per deal for life, one per number per site.
 CREATE TABLE IF NOT EXISTS onboard_urn_allocations (
@@ -150,6 +151,7 @@ class Job:
     bill_payer_id: str | None = None
     new_urn: bool = False            # `onboard-enqueue --deal-id X --new-urn`: skip the returning-child check, this job only
     file_hash: str | None = None     # source `file`: a hash of the ids file (never its contents)
+    reopen: bool = False             # `onboard-enqueue --reopen-done`: queued although the deal had a done job
 
 
 def store_path() -> Path:
@@ -187,6 +189,7 @@ _ADDED_COLUMNS = (
     ("bill_payer_id", "TEXT"),
     ("file_hash", "TEXT"),
     ("new_urn", "INTEGER NOT NULL DEFAULT 0"),
+    ("reopen", "INTEGER NOT NULL DEFAULT 0"),
 )
 
 
@@ -231,7 +234,7 @@ def _to_job(row: sqlite3.Row) -> Job:
         source=row["source"], approval_nonce=row["approval_nonce"],
         claimed_at=row["claimed_at"], reask_count=row["reask_count"], plan_sections=sections,
         bill_payer_id=row["bill_payer_id"], file_hash=row["file_hash"],
-        new_urn=bool(row["new_urn"]),
+        new_urn=bool(row["new_urn"]), reopen=bool(row["reopen"]),
     )
 
 
@@ -250,10 +253,13 @@ class Enqueued:
 
 
 def enqueue(deal_id: str, mode: str, source: str = "cli", file_hash: str | None = None,
-            new_urn: bool = False) -> Enqueued:
+            new_urn: bool = False, *, reopen: bool = False) -> Enqueued:
     """Enqueue a job for `deal_id`, with ONE atomic INSERT.
 
-    * A deal that already has a `done` job creates no job (`already_done`).
+    * A deal that already has a `done` job creates no job (`already_done`), unless `reopen` is set: then
+      the "has a done job" short-circuit is skipped and the new job records `reopen` = 1. `reopen` is
+      for the CLI and a file enqueue only (`onboard-enqueue --reopen-done`), live mode only; any other
+      source or mode is refused here, so the webhook can never reach it.
     * A deal with an active job returns it (`already_queued`): the unique
       partial index, not a check made first, decides that.
     * Otherwise a new `queued` job. A `needs_review`, `failed`, `held` or
@@ -264,7 +270,10 @@ def enqueue(deal_id: str, mode: str, source: str = "cli", file_hash: str | None 
         raise ValueError(f"unknown job source: {source!r}")
     if (source == "file") != bool(file_hash):
         raise ValueError("a file job needs a file hash, and only a file job has one")
+    if reopen and (source not in ("cli", "file") or mode != "live"):
+        raise ValueError("reopen is for a live CLI or file enqueue only")
     deal_id = str(deal_id).strip()
+    reopened = False
     with _open() as connection:
         done = connection.execute(
             "SELECT * FROM onboard_jobs WHERE deal_id = ? AND status = ? "
@@ -272,16 +281,20 @@ def enqueue(deal_id: str, mode: str, source: str = "cli", file_hash: str | None 
             (deal_id, DONE),
         ).fetchone()
         if done is not None:
-            return Enqueued(ALREADY_DONE, _to_job(done))
+            if not reopen:
+                return Enqueued(ALREADY_DONE, _to_job(done))
+            reopened = True
 
     job_id = str(uuid.uuid4())
     now = _now()
     try:
         with _open() as connection:
             connection.execute(
-                "INSERT INTO onboard_jobs (id, deal_id, status, mode, created_at, updated_at, source, file_hash, new_urn) "
-                "VALUES (?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?, ?, ?, ?)",
-                (job_id, deal_id, QUEUED, mode, now, source, file_hash or None, 1 if new_urn else 0),
+                "INSERT INTO onboard_jobs (id, deal_id, status, mode, created_at, updated_at, source, file_hash, "
+                "new_urn, reopen) "
+                "VALUES (?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?, ?, ?, ?, ?)",
+                (job_id, deal_id, QUEUED, mode, now, source, file_hash or None, 1 if new_urn else 0,
+                 1 if reopened else 0),
             )
     except sqlite3.IntegrityError:
         active = active_for_deal(deal_id)
