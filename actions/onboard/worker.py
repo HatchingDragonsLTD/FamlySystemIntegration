@@ -69,6 +69,7 @@ from actions.onboard import (
     inputs,
     messages,
     notifier as notifier_mod,
+    plan_status,
     phone as phone_mod,
     store,
     summary_check,
@@ -268,13 +269,7 @@ def _this_jobs_child(job) -> str | None:
 def famly_writes_planned(plan: dict) -> bool:
     """Whether the plan would write to Famly at all: a child create and/or any
     contact create. Such a plan needs a Slack approval (Gate A) in live mode."""
-    return (
-        plan["child"]["status"] == "child_would_create"
-        or any(c["status"] == "would_create" for c in plan["contacts"])
-        or any(c.get("relation") == "would_add" for c in plan["contacts"])
-        or (plan.get("billPayer") or {}).get("status") in (
-            bill_payer_scan.WOULD_CREATE, bill_payer_scan.WOULD_ATTACH)
-    )
+    return sum(plan_status.planned_writes(plan).values()) > 0
 
 
 STAGE_NOT_ELIGIBLE = "stage_not_eligible"

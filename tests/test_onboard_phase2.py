@@ -545,8 +545,8 @@ class GateATests(Phase2Case):
         text, job_id, digest = self.notify.gates[0]
         self.assertEqual((job_id, digest), (job.id, job.plan_hash))
         for part in (DEAL, "https://app.hubspot.com/contacts/12345/record/0-3/" + DEAL,
-                     "HDWEST", "Littlewings", "Start date: present", "Contacts: 2",
-                     "Bill payer identified: yes", "Warnings:"):
+                     "HDWEST", "Littlewings", "Start date: present", "Contact c1 (bill payer): will be created.",
+                     "Warnings:"):
             self.assertIn(part, text)
         self.assertEqual(job.approval_ref, "C1:1")
 
@@ -1128,8 +1128,8 @@ class RerunTests(Phase2Case):
         result = self.run_worker()
         # The child is the PIPELINE's (job history), so c2 stays would_create.
         self.assertEqual(result["status"], store.AWAITING_APPROVAL)
-        self.assertIn("created by pipeline", self.notify.gates[-1][0])
-        self.assertIn("1 to create, 1 present", self.notify.gates[-1][0])
+        self.assertIn("created by an earlier onboarding job", self.notify.gates[-1][0])
+        self.assertIn("Contact c2: will be created.", self.notify.gates[-1][0])
         self.approve()
         self.run_worker()
         self.assertEqual(self.job().status, store.DONE)
@@ -1513,7 +1513,7 @@ class ExistingChildRuleTests(Phase2Case):
         # c2 is unmatched but the child is OURS: it stays would_create, so the job
         # asks for approval rather than holding.
         self.assertEqual(result["status"], store.AWAITING_APPROVAL)
-        self.assertIn("Child: created by this job", self.notify.gates[0][0])
+        self.assertIn("Child: already in Famly (created by this job).", self.notify.gates[0][0])
         self.approve(job)
         final = self.run_worker()
         self.assertEqual(final["status"], store.DONE)
@@ -1530,7 +1530,8 @@ class ExistingChildRuleTests(Phase2Case):
         self.assertEqual(self.hub.writes, [])
         text = self.notify.gates[0][0]
         self.assertIn("Famly writes planned: 0 child, 1 contact(s)", text)
-        self.assertIn("1 to create, 1 present", text)
+        self.assertIn("Contact c2: will be created.", text)
+        self.assertIn("already present (matched by", text)
         # The click alone writes nothing either; the worker does, only afterwards.
         self.approve(job)
         self.assertFalse(self.famly.contact_creates)
@@ -1610,7 +1611,7 @@ class OriginFromHistoryTests(Phase2Case):
         self.assertEqual(second.outcome, store.CREATED)
         self.assertEqual(self.run_worker()["status"], store.AWAITING_APPROVAL)
         text = self.notify.gates[-1][0]
-        self.assertIn("Child: created by pipeline", text)         # an EARLIER job made it
+        self.assertIn("Child: already in Famly (created by an earlier onboarding job)", text)         # an EARLIER job made it
         self.assertIn("Famly writes planned: 0 child, 1 contact(s)", text)
         self.assertFalse(self.famly.child_creates[1:])             # nothing written before approval
         self.assertEqual(len(self.famly.contact_creates), 2)       # c1, and the rejected c2
@@ -1636,7 +1637,7 @@ class OriginFromHistoryTests(Phase2Case):
         self.famly.post_create_script = None
         self.enqueue()
         self.assertEqual(self.run_worker()["status"], store.AWAITING_APPROVAL)
-        self.assertIn("created by pipeline", self.notify.gates[-1][0])
+        self.assertIn("created by an earlier onboarding job", self.notify.gates[-1][0])
         self.approve()
         self.run_worker()
         self.assertEqual(self.job().outcomes, ["c1:created", "c2:created"])  # the last-moment rule agrees
@@ -1691,13 +1692,13 @@ class OriginFromHistoryTests(Phase2Case):
         def text(child, this_job=None):
             return notifier_mod.gate_text({**plan, "child": child}, "h" * 16, "live",
                                           this_job_child_id=this_job)
-        self.assertIn("Child: would be created", text({"status": "child_would_create"}))
+        self.assertIn("Child: will be created in Famly.", text({"status": "child_would_create"}))
         self.assertIn("Child: already in Famly",
                       text({"status": "child_found", "famlyChildId": "c", "origin": "existing"}))
         mine = {"status": "child_found", "famlyChildId": "c", "origin": "created_by_pipeline"}
-        self.assertIn("Child: created by this job", text(mine, this_job="c"))
-        self.assertIn("Child: created by pipeline", text(mine, this_job="other"))
-        self.assertIn("Child: created by pipeline", text(mine))
+        self.assertIn("Child: already in Famly (created by this job).", text(mine, this_job="c"))
+        self.assertIn("Child: already in Famly (created by an earlier onboarding job)", text(mine, this_job="other"))
+        self.assertIn("Child: already in Famly (created by an earlier onboarding job)", text(mine))
 
 
 # --------------------------------------------------------------------------- #

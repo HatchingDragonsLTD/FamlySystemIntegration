@@ -35,7 +35,7 @@ from actions.onboard_dry_run.famly_reads import (
     normalise_email,
 )
 from core.client import GraphQLError, GraphQLHTTPError
-from actions.onboard.config import allowlist_enforced
+from actions.onboard.config import allowlist_enforced, is_test_deal
 from core import hubspot as hubspot_config
 from core.hubspot import HubSpotClient, HubSpotError
 
@@ -159,6 +159,8 @@ class DryRun:
                 else "existing"
             )
         if plan["child"]["status"] == CHILD_WOULD_CREATE:
+            if is_test_deal(deal_id):
+                plan["child"]["testChild"] = True       # only ever on a would-create child
             self._check_creatable(deal, plan)
             self._check_possible_duplicate(deal, plan)
         if derive.is_child_only_stage(plan["stage"]["name"]):
@@ -633,12 +635,16 @@ def run(
         labels_report = {"error": {"source": "hubspot", "status": exc.status_code}}
 
     plans = [dry.plan_deal(deal_id) for deal_id in unique]
+    from actions.onboard import plan_status
+
     result = {
         "mode": "dry_run",
         "writes": 0,
         "allowlistEnforced": allowlist_enforced(),
         "associationLabels": labels_report,
         "plans": plans,
+        # One status block per ready or held deal (a plan that errored has nothing to show).
+        "statusBlocks": {p["dealId"]: plan_status.block(p) for p in plans if "child" in p and "error" not in p},
         "summary": summarise(plans),
     }
     logger.info("onboard_dry_run: %s", result["summary"])

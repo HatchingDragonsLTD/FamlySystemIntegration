@@ -337,7 +337,7 @@ class PlanTests(BPCase):
     def test_the_gate_message_shows_the_decision_without_personal_data(self):
         self.run_to_approval()
         text = self.notify.gates[0][0]
-        self.assertIn("Bill payer: would be created in Famly", text)
+        self.assertIn("Bill payer: will be created.", text)
         for value in PII:
             self.assertNotIn(value, text.casefold())
 
@@ -347,7 +347,7 @@ class PlanTests(BPCase):
         self.famly.payers.append(payer(self.email, pid="appeared"))       # the situation changed
         self.assertEqual(self.run_worker()["status"], store.AWAITING_APPROVAL)
         self.assertEqual(len(self.notify.gates), 2)
-        self.assertIn("would be linked", self.notify.gates[1][0])
+        self.assertIn("will be linked to the child", self.notify.gates[1][0])
         self.assertEqual(self.famly.bp_writes, [])
 
 
@@ -603,7 +603,7 @@ class SwitchTests(BPCase):
         self.assertEqual(result["status"], store.DRY_DONE)
         self.assertEqual(self.famly.bp_writes, [])
         self.assertEqual(self.famly.child_creates, [])
-        self.assertTrue(any("Bill payer: would be created in Famly" in n for n in self.notify.notices))
+        self.assertTrue(any("Bill payer: will be created." in n for n in self.notify.notices))
 
     def test_the_flag_off_in_live_mode_performs_no_bill_payer_read_or_write(self):
         os.environ["ONBOARD_BILL_PAYER"] = "off"

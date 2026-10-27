@@ -224,3 +224,46 @@ def child_only_summary(created: bool, stage: str | None) -> str:
 
 def relation_summary(count: int) -> str:
     return f"{count} existing contact(s) set to Parent."
+
+
+# --------------------------------------------------------------------------- #
+# The Gate A / dry-run STATUS BLOCK: what is already done and what would be written.
+# State code -> sentence. `plan_status.block` picks the codes from the plan; the wording lives
+# only here. Placeholders: {id} a HubSpot contact id, {role} "" or " (bill payer)", {stage}, {why},
+# {fields} (the NAMES of bill payer fields that differ, never values).
+# --------------------------------------------------------------------------- #
+_STATE: dict[str, str] = {
+    "child_would_create": "Child: will be created in Famly.",
+    "child_would_create_test": "Child: will be created in Famly, as a test child.",
+    "child_found_reference": "Child: already in Famly (found by the deal reference).",
+    "child_found_urn": "Child: already in Famly (found by the child URN).",
+    "child_found_famly_childid": "Child: already in Famly (found by the child ID recorded on the deal).",
+    "child_created_by_this_job": "Child: already in Famly (created by this job).",
+    "child_created_earlier": "Child: already in Famly (created by an earlier onboarding job).",
+    "child_ambiguous": "Child: more than one child matches, so a person needs to check Famly.",
+    "child_unresolved": "Child: the child ID saved on the deal is not a child in Famly, so a person needs to check.",
+    "contact_would_create": "Contact {id}{role}: will be created.",
+    "contact_present_reference": "Contact {id}{role}: already present (matched by its HubSpot reference).",
+    "contact_present_email": "Contact {id}{role}: already present (matched by email).",
+    "contact_relation_will_add": "Contact {id}{role}: already present; the relation will be set to Parent.",
+    "contact_relation_unreadable": "Contact {id}{role}: already present; its relation could not be read, so it will not be changed.",
+    "contact_flagged": "Contact {id}{role}: needs a person. {why}",
+    "contact_not_checked": "Contact {id}{role}: not checked, because the child could not be resolved.",
+    "bill_payer_would_create": "Bill payer: will be created.",
+    "bill_payer_would_attach": "Bill payer: an existing bill payer will be linked to the child.",
+    "bill_payer_present": "Bill payer: already linked to the child.",
+    "bill_payer_flagged": "Bill payer: needs a person. {why}",
+    "bill_payer_differs": "Bill payer: the existing bill payer's details differ from HubSpot in: {fields}.",
+    "scope_child_only": "Held back by the deal's stage ({stage}): only the child is onboarded, so no contacts or bill payer are written.",
+    "nothing_to_write": "Nothing to write: everything is already in Famly.",
+    "no_writes_planned": "No Famly writes are planned; a person needs to look at the lines above.",
+}
+
+
+def state(code: str, **fields) -> str:
+    """The sentence for a status-block state code (a KeyError for an unknown code is a bug)."""
+    return _STATE[code].format(**fields)
+
+
+def state_codes() -> frozenset:
+    return frozenset(_STATE)

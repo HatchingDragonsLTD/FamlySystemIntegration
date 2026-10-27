@@ -9,7 +9,7 @@ import logging
 
 from integrations import slack
 
-from . import approval, config, messages
+from . import approval, config, messages, plan_status
 
 logger = logging.getLogger(__name__)
 
@@ -26,15 +26,12 @@ def gate_text(
     pipeline` (a child an EARLIER job created)."""
     deal_id = plan["dealId"]
     link = config.deal_link(deal_id)
-    contacts = plan.get("contacts") or []
     child = plan.get("child") or {}
-    creating = sum(1 for c in contacts if c.get("status") == "would_create")
-    present = sum(1 for c in contacts if c.get("status") == "present")
-    bill_payer = any(c.get("isBillPayer") for c in contacts)
     dates = plan.get("dates") or {}
 
     child_only = plan.get("scope") == "child_only"
     lines = []
+    writes = plan_status.planned_writes(plan)
     if child_only:
         lines.append("*[DRY RUN] Onboarding: would create the child in Famly (child only)*"
                      if mode == config.MODE_DRY
@@ -64,49 +61,23 @@ def gate_text(
     elif urn.get("status") == "would_allocate":
         lines.append(f"Child URN: a new URN would be assigned (next number {urn.get('nextNumber'):04d} "
                      f"for site {urn.get('siteCode')}, not reserved yet).")
-    if child.get("status") == "child_would_create":
-        child_state = "would be created"
-    elif child.get("origin") == "created_by_pipeline":
-        mine = this_job_child_id and child.get("famlyChildId") == this_job_child_id
-        child_state = "created by this job" if mine else "created by pipeline"
-    else:
-        child_state = "already in Famly"
-    child_writes = 1 if child.get("status") == "child_would_create" else 0
+    child_writes = writes["child"]
+    lines += plan_status.block(plan, this_job_child_id)
     if child_only:
-        stage_name = (plan.get("stage") or {}).get("name") or "a child-only stage"
-        lines.append(f"Scope: child only, because the deal is in {stage_name}. "
-                     "No contacts or bill payer will be created.")
         lines.append(f"Famly writes planned: {child_writes} child")
-        lines.append(f"Child: {child_state}")
         shown = messages.classify(plan.get("warnings") or [])
         sentences = shown[messages.NOT_DONE] + shown[messages.CHECK]
         lines.append("Warnings: " + (" ".join(sentences) if sentences else "none"))
         lines.append(f"Plan: `{plan_hash[:approval.HASH_PREFIX]}`")
         return "\n".join(lines)
-    # The count equals the writes the worker will make: the bill payer create or attach
-    # is one write; a present or flagged payer is none.
+    # The count equals the writes the worker will make (`plan_status.planned_writes`): the bill
+    # payer create or attach is one write; a present or flagged payer is none.
     bp_section = plan.get("billPayer")
-    bill_payer_writes = 1 if isinstance(bp_section, dict) and bp_section.get("status") in (
-        "would_create", "would_attach") else 0
-    relation_writes = sum(1 for c in contacts if c.get("relation") == "would_add")
     lines.append(
-        f"Famly writes planned: {child_writes} child, {creating} contact(s)"
-        + (f", {bill_payer_writes} bill payer" if isinstance(bp_section, dict) else "")
-        + (f", {relation_writes} contact relation(s)" if relation_writes else "")
+        f"Famly writes planned: {child_writes} child, {writes['contact']} contact(s)"
+        + (f", {writes['bill_payer']} bill payer" if isinstance(bp_section, dict) else "")
+        + (f", {writes['relation']} contact relation(s)" if writes["relation"] else "")
     )
-    lines.append(
-        f"Child: {child_state} · Contacts: {len(contacts)} ({creating} to create, "
-        f"{present} present) · Bill payer identified: {'yes' if bill_payer else 'no'}"
-    )
-    bill_payer = plan.get("billPayer")
-    if isinstance(bill_payer, dict):
-        status = bill_payer.get("status")
-        lines.append("Bill payer: " + {
-            "would_create": "would be created in Famly",
-            "would_attach": "an existing bill payer would be linked to the child",
-            "present": "already linked to the child in Famly",
-        }.get(status, "needs a person (see the warnings)")
-            + (f" · different details: {', '.join(bill_payer['differs'])}" if bill_payer.get("differs") else ""))
     shown = messages.classify(plan.get("warnings") or [])
     sentences = shown[messages.NOT_DONE] + shown[messages.CHECK]
     lines.append("Warnings: " + (" ".join(sentences) if sentences else "none"))
