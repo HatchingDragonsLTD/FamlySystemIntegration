@@ -287,3 +287,39 @@ def state_codes() -> frozenset:
 
 def recipient_summary() -> str:
     return "Bill payer contact linked so the parent sees invoices."
+
+
+# --------------------------------------------------------------------------- #
+# onboard-quality-check Slack wording (counts, codes and deal ids only)
+# --------------------------------------------------------------------------- #
+def quality_failed(code: str) -> str:
+    return f"Onboarding quality check failed (code: {code}). Nothing was recorded; run it again."
+
+
+def quality_baseline(deals: int, issues: int, codes: int) -> str:
+    return (f"Onboarding quality check: baseline recorded. {deals} deal(s) checked, {issues} open issue(s) "
+            f"across {codes} code(s). From now on only new issues are posted.")
+
+
+def _ids_line(refs: list[str], total: int, limit: int) -> str:
+    shown = ", ".join(refs[:limit])
+    return shown + (f" and {total - limit} more" if total > limit else "")
+
+
+def quality_report(new_refs: dict[str, list[str]], open_by_code: dict[str, int], resolved: int,
+                   persisting: int, limit: int, digest_tiers: dict[str, dict[str, int]] | None = None) -> str:
+    """The alert message (new issues with their deal references, at most `limit` per code) and, for the
+    Monday digest, the counts by tier. `new_refs`: code -> deal references of NEW issues."""
+    new_total = sum(len(v) for v in new_refs.values())
+    lines = [f"*Onboarding quality check*: {new_total} new, {resolved} resolved, {persisting} persisting."]
+    for code in sorted(new_refs):
+        refs = new_refs[code]
+        lines.append(f"• {code}: {len(refs)} new ({open_by_code.get(code, len(refs))} open): "
+                     + _ids_line(refs, len(refs), limit))
+    if digest_tiers is not None:
+        lines.append("*Open issues by tier*")
+        for name, label in (("alert", "Alert codes"), ("count", "Counted only")):
+            counts = digest_tiers.get(name) or {}
+            lines.append(f"{label}: {sum(counts.values())} issue(s) in {len(counts)} code(s)")
+            lines += [f"  {code}: {n}" for code, n in sorted(counts.items())]
+    return "\n".join(lines)

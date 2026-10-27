@@ -55,3 +55,6 @@ env/
 var/delete_plans_allowlist.txt
 var/plan-backups/
 
+
+# onboard-quality-check reports (deal ids and codes): local only.
+reports/

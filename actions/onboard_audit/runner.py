@@ -635,17 +635,21 @@ def operations_deals(hubspot, stages: dict[str, tuple[str, str]], stage_names: l
 
 def run(hubspot, gql, rest, *, deal_ids: list[str] | None = None, operations: bool = False,
         stage_names: list[str] | None = None, site_ids: list[str] | None = None,
-        include_left: bool = False) -> tuple[dict, list[Row]]:
-    """The audit. Exactly one of `deal_ids` / `operations`. Returns (summary, rows).
+        include_left: bool = False, deals: list[dict] | None = None) -> tuple[dict, list[Row]]:
+    """The audit. Exactly one of `deal_ids` / `operations` / `deals`. Returns (summary, rows).
+
+    `deals`: deal dicts the caller already read (the operations search rows), audited as given with no
+    further per-deal HubSpot read (onboard-quality-check passes its in-scope subset).
 
     `include_left`: plans of a CHILD-ONLY stage (Left Nursery) are neither read nor compared
     unless it is set (plan_missing for them is reported only with it)."""
     from actions.read_child_plans import runner as plans_runner
 
     stages = hubspot.stage_names()
-    if operations:
-        deals = operations_deals(hubspot, stages, stage_names)
+    if deals is not None:
         pairs = [(str(d["id"]), d) for d in deals]
+    elif operations:
+        pairs = [(str(d["id"]), d) for d in operations_deals(hubspot, stages, stage_names)]
     else:
         pairs = []
         for deal_id in deal_ids or []:
