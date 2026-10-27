@@ -149,15 +149,17 @@ class HubSpotClient:
 
     def _call(
         self, method: str, path: str, params: dict | None = None,
-        json_body: dict | None = None,
+        json_body: dict | None = None, attempts: int | None = None,
     ) -> dict:
-        """The one transport: send, retry 429/5xx with backoff, return JSON.
+        """The one transport: send, retry 429/5xx with backoff, return JSON. `attempts` caps the
+        tries (1 = send once, never retried).
 
         Only `_get`, `search_deals` (a read) and the writer's PATCH call this."""
         url = f"{self._base_url}{path}"
         headers = {"Authorization": f"Bearer {self._token}", "Accept": "application/json"}
 
-        for attempt in range(1, MAX_ATTEMPTS + 1):
+        limit = attempts or MAX_ATTEMPTS
+        for attempt in range(1, limit + 1):
             try:
                 if method == "GET":
                     response = self._session.get(
@@ -169,14 +171,14 @@ class HubSpotClient:
                     )
             except requests.RequestException as exc:
                 # Type only: the message can echo the URL.
-                if attempt == MAX_ATTEMPTS:
+                if attempt == limit:
                     raise HubSpotError(f"{method} {path} failed: {type(exc).__name__}") from None
                 self._sleep(self._backoff(attempt, None))
                 continue
 
             status = response.status_code
             if status == 429 or status >= 500:
-                if attempt == MAX_ATTEMPTS:
+                if attempt == limit:
                     raise HubSpotError(f"{method} {path} failed with HTTP {status}", status)
                 logger.info("hubspot: %s %s -> %s, retrying", method, path, status)
                 self._sleep(self._backoff(attempt, response.headers.get("Retry-After")))
@@ -213,6 +215,13 @@ class HubSpotClient:
             {"properties": ",".join(DEAL_PROPERTIES)},
         )
         return dict(body.get("properties") or {})
+
+    def read_plan_uploaded(self, deal_id: str) -> str | None:
+        """The deal's current `famly_plan_uploaded` value (read-only; None when empty). Raises
+        HubSpotError (status 404) if there is no such deal."""
+        body = self._get(f"/crm/v3/objects/deals/{deal_id}", {"properties": PLAN_UPLOADED_PROPERTY})
+        value = (body.get("properties") or {}).get(PLAN_UPLOADED_PROPERTY)
+        return None if value in (None, "") else str(value)
 
     def search_deals(self, filters: list[dict], properties: list[str], limit: int = 100) -> list[dict]:
         """READ-ONLY deal search (HubSpot's search endpoint is a POST, but it only reads).
@@ -329,6 +338,12 @@ WRITABLE_DEAL_PROPERTIES = frozenset(
 )
 
 
+# `famly_plan_uploaded` is NOT in WRITABLE_DEAL_PROPERTIES: the onboarding job and every other caller of
+# `write_deal_properties` are refused for it. Only `HubSpotDealWriter.write_plan_uploaded`, which only
+# the `hubspot-set-plan-uploaded` command calls, may write it.
+PLAN_UPLOADED_PROPERTY = "famly_plan_uploaded"
+
+
 class HubSpotDealWriter(HubSpotClient):
     """A HubSpotClient that can also write the sync properties (and a defaulted
     `end_date`) on a deal.
@@ -355,6 +370,23 @@ class HubSpotDealWriter(HubSpotClient):
                 ],
             }
         return out
+
+    def write_plan_uploaded(self, deal_id: str, value: str) -> None:
+        """PATCH `famly_plan_uploaded` to "true" or "false": ONE request, never retried here.
+        Called only by the `hubspot-set-plan-uploaded` command.
+
+        Raises:
+            ValueError: any other value (nothing sent).
+            HubSpotError: the request failed.
+        """
+        if value not in ("true", "false"):
+            raise ValueError("famly_plan_uploaded must be true or false")
+        self._call(
+            "PATCH",
+            f"/crm/v3/objects/deals/{deal_id}",
+            json_body={"properties": {PLAN_UPLOADED_PROPERTY: value}},
+            attempts=1,
+        )
 
     def write_deal_properties(self, deal_id: str, properties: dict) -> None:
         """PATCH the deal's sync properties.

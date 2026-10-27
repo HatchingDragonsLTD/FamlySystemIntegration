@@ -17,6 +17,7 @@ from dataclasses import asdict, is_dataclass
 from actions.contact_lookup import cli as contact_lookup
 from actions.create_timeline import chain_cancel, chain_resume, chain_status, chain_sweep
 from actions.delete_plans import delete_digest, delete_resume
+from actions.hubspot_plan_uploaded import cli as hubspot_set_plan_uploaded
 from actions.onboard import cli_enqueue as onboard_enqueue
 from actions.onboard import cli_phone_audit as onboard_phone_audit
 from actions.onboard import cli_status as onboard_status
@@ -69,6 +70,7 @@ ACTIONS = [
     onboard_worker,
     onboard_status,
     onboard_phone_audit,
+    hubspot_set_plan_uploaded,
     onboard_audit,
     probe_contact_create,
     probe_contact_reference,
