@@ -16,11 +16,16 @@ WHAT IS COMPARED (codes):
             no_hubspot_reference, expected_group_not_derivable, deal_dates_unreadable,
             child_ambiguous
   contacts  contact_missing, contact_no_email, bill_payer_contact_missing,
-            contact_relation_missing, bill_payer_not_emergency   (skipped for child-only stages;
-            parent names and phones are NOT compared: Famly is the source of truth after onboarding)
+            contact_relation_missing (+ the sub-code contact_relation_empty when the contact HAS a
+            RELATION record with a blank value, which the planner can repair), bill_payer_not_emergency,
+            contact_matched_via_additional_email (info)   (skipped for child-only stages; parent names
+            and phones are NOT compared: Famly is the source of truth after onboarding)
   payer     bill_payer_missing, bill_payer_not_linked, bill_payer_share_not_full,
             bill_payer_ambiguous, double_billing_risk, bill_payer_no_contact, bill_payer_no_email,
-            bill_payer_scan_failed   (skipped for child-only stages)
+            bill_payer_scan_failed, and for the deal's bill payer contact: bill_payer_recipient_present
+            (it is an invoice recipient of the child's payer) / bill_payer_recipient_missing (the payer
+            exists and lists the child, but the contact is not a recipient; read from the payer scan's
+            invoiceRecipients, no extra request)   (skipped for child-only stages)
   plans     plan_missing, plan_overlap_or_duplicate
 
             plan_matches | plan_differs (+ plan_dates_differ, plan_sessions_differ, plan_fees_differ) |
@@ -117,6 +122,8 @@ class FamlyContact:
     email: str = field(default="", repr=False)
     emergency: bool = False
     relation: bool = False
+    id: str = ""                    # the Famly contact id (ids are allowed in output)
+    relation_empty: bool = False    # a RELATION record exists but its value is blank
 
 
 @dataclass
@@ -168,7 +175,11 @@ def fetch_children(gql, site_ids: list[str]) -> dict[str, FamlyChild]:
                         email=normalise_email(c.get("email")),
                         emergency=bool(c.get("emergencyContact")),
                         relation=any(isinstance(rec, dict) and rec.get("key") == "RELATION" and rec.get("value")
-                                     for rec in c.get("records") or []))
+                                     for rec in c.get("records") or []),
+                        id=str(c.get("id") or ""),
+                        relation_empty=any(isinstance(rec, dict) and rec.get("key") == "RELATION"
+                                           and not str(rec.get("value") or "").strip()
+                                           for rec in c.get("records") or []))
                     for c in node.get("contacts") or [] if isinstance(c, dict)]
             cursor = listing.get("next") or None
             if not cursor:
@@ -350,6 +361,18 @@ def date_gap(prefix: str, famly_value: str | None, expected: str | None) -> str:
     return f"{prefix}_{direction}_{bucket}"
 
 
+def find_contact(child: FamlyChild, contact) -> tuple["FamlyContact | None", bool]:
+    """The child's Famly contact for a deal contact: the primary email first, then any additional
+    address. (contact or None, whether it was found only through an additional address)."""
+    primary = normalise_email(contact.email)
+    emails = (set(contact.emails) | {primary}) - {""}
+    found = next((c for c in child.contacts if c.email and c.email == primary), None)
+    if found is not None:
+        return found, False
+    found = next((c for c in child.contacts if c.email and c.email in emails), None)
+    return found, found is not None
+
+
 def contact_codes(deal_contacts, child: FamlyChild, index: "Index | None" = None) -> list[str]:
     """For each HubSpot contact on the deal, by canonical email. No names, no phones.
 
@@ -367,11 +390,9 @@ def contact_codes(deal_contacts, child: FamlyChild, index: "Index | None" = None
                 codes.append("bill_payer_contact_missing")
             continue
         # the primary address first (as before), then any additional address of the HubSpot contact
-        found = next((c for c in child.contacts if c.email and c.email == primary), None)
-        if found is None:
-            found = next((c for c in child.contacts if c.email and c.email in emails), None)
-            if found is not None:
-                codes.append("contact_matched_via_additional_email")    # info: rescued by a secondary address
+        found, via_additional = find_contact(child, contact)
+        if via_additional:
+            codes.append("contact_matched_via_additional_email")        # info: rescued by a secondary address
         if found is None:
             codes.append("contact_missing")
             codes.append("child_has_contacts_but_email_not_matched" if child.contacts else "child_has_no_contacts")
@@ -382,9 +403,31 @@ def contact_codes(deal_contacts, child: FamlyChild, index: "Index | None" = None
             continue
         if not found.relation:
             codes.append("contact_relation_missing")
+            if found.relation_empty:
+                codes.append("contact_relation_empty")      # sub-code: a blank RELATION, repairable by the planner
         if contact.is_bill_payer and not found.emergency:
             codes.append("bill_payer_not_emergency")
     return codes
+
+
+def recipient_codes(deal_contacts, payers, child: FamlyChild) -> list[str]:
+    """For the deal's bill payer contact: `bill_payer_recipient_present` when it is an invoice
+    recipient of the child's payer, `bill_payer_recipient_missing` when the payer exists (one live payer
+    matched by the contact's emails, listing this child) and the contact is not. No code when there is no
+    such payer (the payer codes cover that) or the contact is not on the child (contact codes cover that).
+    Read from `Payer.recipients`, which the payer scan already carries."""
+    contact = next((c for c in deal_contacts if c.is_bill_payer), None)
+    if contact is None or payers is None:
+        return []
+    decision = payer_scan.decide(deal_contacts, payers, child.id)
+    if decision.status != payer_scan.STATUS_PRESENT:
+        return []
+    payer = next((p for p in payers if p.id == decision.bill_payer_id), None)
+    famly_contact, _via = find_contact(child, contact)
+    if payer is None or famly_contact is None or not famly_contact.id:
+        return []
+    return ["bill_payer_recipient_present" if famly_contact.id in payer.recipients
+            else "bill_payer_recipient_missing"]
 
 
 def payer_codes(deal_contacts, payers, child_id: str) -> list[str]:
@@ -711,6 +754,7 @@ def run(hubspot, gql, rest, *, deal_ids: list[str] | None = None, operations: bo
                         from actions.onboard_dry_run.famly_reads import FamlyReads
                         payers_by_site[site_id] = FamlyReads(gql, site_ids=site_ids).bill_payers(site_id)
                     row.codes += payer_codes(deal_contacts, payers_by_site[site_id], child.id)
+                    row.codes += recipient_codes(deal_contacts, payers_by_site[site_id], child)
 
         if derive.is_child_only_stage(stage) and not include_left:
             continue

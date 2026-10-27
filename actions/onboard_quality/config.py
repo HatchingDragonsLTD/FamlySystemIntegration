@@ -21,6 +21,7 @@ ALERT_CODES = (
     "bill_payer_not_emergency",
     "bill_payer_share_zero",
     "bill_payer_other_payer_billing",
+    "bill_payer_recipient_missing",       # the payer's contact is not an invoice recipient: no invoices for the parent
     "double_billing_risk",
     "child_end_famly_later_over_31_days",
     "child_end_famly_earlier_over_31_days",
@@ -31,7 +32,7 @@ ALERT_CODES = (
 COUNT_CODES = ("plan_fee_over_10_percent", "child_start_differs", "child_end_differs")
 COUNT_PREFIXES = ("child_start_", "child_end_")          # the other start/end sub-codes
 
-IGNORE_CODES = ("child_group_differs", "child_name_not_comparable", "plan_input_sessions_missing",
+IGNORE_CODES = ("bill_payer_recipient_present", "child_group_differs", "child_name_not_comparable", "plan_input_sessions_missing",
                 "plan_not_derivable", "no_hubspot_reference")
 IGNORE_PREFIXES = ("child_name_", "name_")
 

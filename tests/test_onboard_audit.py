@@ -37,9 +37,11 @@ def famly_child(child_id="c1", **over):
     return child
 
 
-def payer(payer_id="p1", email="ada.l@example.org", children=None):
+def payer(payer_id="p1", email="ada.l@example.org", children=None, recipients=("k1",)):
+    """A live payer; by default the bill payer's Famly contact (k1) is an invoice recipient of it."""
     return {"billPayerId": payer_id, "email": email, "deletedAt": None,
-            "children": [{"childId": c, "share": {"multiplier": m}} for c, m in (children if children is not None else {"c1": 1.0}).items()]}
+            "children": [{"childId": c, "share": {"multiplier": m}} for c, m in (children if children is not None else {"c1": 1.0}).items()],
+            "invoiceRecipients": [{"relationId": r, "contactId": r} for r in recipients]}
 
 
 class FakeGql:
@@ -107,10 +109,54 @@ class AuditCase(Phase2Case):
         self.gql.children = [famly_child(**over)]
 
 
+class RecipientAndRelationCodeTests(AuditCase):
+    def test_a_recipient_contact_is_present_and_it_costs_no_new_famly_call(self):
+        codes = self.codes()
+        self.assertIn("bill_payer_recipient_present", codes)
+        self.assertNotIn("bill_payer_recipient_missing", codes)
+        self.assertEqual(set(self.gql.calls), {"AuditSiteChildren", "OnboardBillPayers"})   # the scan already reads it
+
+    def test_a_payer_without_the_contact_as_recipient_is_missing(self):
+        self.gql.payers = [payer(recipients=())]
+        self.assertIn("bill_payer_recipient_missing", self.codes())
+        self.gql.payers = [payer(recipients=("k2",))]                 # another parent is a recipient, not the payer's
+        self.assertIn("bill_payer_recipient_missing", self.codes())
+
+    def test_no_recipient_code_without_a_payer_or_when_the_payer_does_not_list_the_child(self):
+        for payers in ([], [payer(children={})]):
+            self.gql.payers = payers
+            codes = self.codes()
+            self.assertFalse([c for c in codes if c.startswith("bill_payer_recipient_")], payers)
+        self.gql.payers = []
+        self.assertIn("bill_payer_missing", self.codes())             # the payer codes already say it
+
+    def test_a_blank_relation_gets_the_empty_sub_code_and_an_absent_one_does_not(self):
+        blank = famly_child()
+        blank["contacts"][1]["records"] = [{"key": "RELATION", "value": ""}]
+        self.gql.children = [blank]
+        codes = self.codes()
+        self.assertEqual((codes.count("contact_relation_missing"), codes.count("contact_relation_empty")), (1, 1))
+        absent = famly_child()
+        absent["contacts"][1]["records"] = []
+        self.gql.children = [absent]
+        codes = self.codes()
+        self.assertIn("contact_relation_missing", codes)
+        self.assertNotIn("contact_relation_empty", codes)
+        self.gql.children = [famly_child()]
+        self.assertNotIn("contact_relation_missing", self.codes())
+
+    def test_the_new_codes_are_ids_and_codes_only_and_the_quality_check_tiers_them(self):
+        from actions.onboard_quality import config
+        self.assertEqual(config.tier("bill_payer_recipient_missing"), config.ALERT)
+        self.assertEqual(config.tier("bill_payer_recipient_present"), config.IGNORE)
+        self.assertEqual(config.tier("contact_relation_empty"), config.IGNORE)
+        self.assertEqual(config.tier("contact_relation_missing"), config.ALERT)
+
+
 class CodeTests(AuditCase):
     def test_a_matching_child_has_no_codes(self):
         summary, rows = self.audit()
-        self.assertEqual(rows[0].codes, ["plan_matches", "plan_fee_under_10_percent"])
+        self.assertEqual(rows[0].codes, ["bill_payer_recipient_present", "plan_matches", "plan_fee_under_10_percent"])
         self.assertEqual((rows[0].found_via, rows[0].child_id, rows[0].site_code, rows[0].stage),
                          ("deal_reference", "c1", "HDWEST", "Deposit Pending"))
         self.assertEqual(summary["childrenFoundBy"], {"deal_reference": 1})
@@ -180,14 +226,14 @@ class CodeTests(AuditCase):
 
     def test_plan_missing_and_overlap_come_from_the_existing_plans(self):
         self.rest.plans = {"c1": []}
-        self.assertEqual(self.codes(), ["plan_missing"])
+        self.assertEqual(self.codes(), ["bill_payer_recipient_present", "plan_missing"])
         self.rest.plans = {"c1": [good_plan(to="2026-09-01"), good_plan(id="b", **{"from": "2026-06-01"})]}
         self.assertIn("plan_overlap_or_duplicate", self.codes())
         self.rest.plans = {"c1": [good_plan(to="2026-09-01"), good_plan(id="b", **{"from": "2026-09-01"})]}
         self.assertNotIn("plan_overlap_or_duplicate", self.codes())      # `to` is exclusive
 
     def test_a_plan_that_matches_the_deal(self):
-        self.assertEqual(self.codes(), ["plan_matches", "plan_fee_under_10_percent"])
+        self.assertEqual(self.codes(), ["bill_payer_recipient_present", "plan_matches", "plan_fee_under_10_percent"])
 
     def test_each_plan_difference(self):
         cases = {
