@@ -61,6 +61,9 @@ MATCH_CREATE = "create"
 # or the read failed.
 RELATION_PRESENT, RELATION_WOULD_ADD, RELATION_UNREADABLE = "present", "would_add", "unreadable"
 
+# RETIRED as a hold (an unmatched parent on an existing child is now `would_create`, a repair that
+# Gate A approves). The code stays recognised: old job rows and Slack notices carry it, and it is an
+# informational footer code on a job that added a parent to an existing child.
 # Hold reasons owned by this module (derive.py owns the rest).
 DEAL_NOT_FOUND = "deal_not_found"
 CHILD_AMBIGUOUS_HOLD = "child_ambiguous"
@@ -490,6 +493,14 @@ class DryRun:
             out.append(entry)
         if present_ids:
             self._relations(child_id, out, present_ids, warnings)
+        if child["status"] == CHILD_FOUND and any(e.get("status") == WOULD_CREATE for e in out):
+            # The child has contacts that matched no deal parent: creating another may duplicate one.
+            matched = {e.get("famlyContactId") for e in out}
+            others = sorted((cid for cid, _mail in on_child if cid not in matched), key=links.id_sort_key)
+            if others:
+                candidates = sorted({c for e in out for c in e.get("candidateIds") or []},
+                                    key=links.id_sort_key)
+                plan["childOtherContacts"] = {"count": len(others), "candidateIds": candidates}
         return out
 
     def _relations(self, child_id: str, entries: list, indexes: list, warnings: list) -> None:
@@ -517,15 +528,10 @@ class DryRun:
         the parent's email changed in Famly), else one with the same canonical email (trimmed,
         lower-cased, googlemail.com = gmail.com; `matchedBy` = email).
 
-        One that is not:
-          * on a child that ALREADY EXISTED when the job started: a HOLD,
-            `contact_unmatched_on_existing_child`, with the ids of contacts on the
-            child that share the part before the @ (ids only: evidence for a
-            person, never a match). A contact is never added to a child somebody
-            else created on a guess.
-          * on a child the PIPELINE created (per the job history): `would_create`,
-            as the child was ours; this is how a re-run after a partial failure
-            completes the contacts that are missing.
+        One that is not is `would_create` on ANY existing child (a repair: Gate A lists it and asks
+        once). It is no longer a hold. When contacts on the child share the part before the @ with
+        the parent, their ids are kept as `candidateIds` (ids only: evidence for the approver, never
+        a match), and the plan carries `childOtherContacts` so Gate A can warn about duplicates.
         """
         target = normalise_email(contact.email)
         matched_by = "reference"
@@ -545,9 +551,8 @@ class DryRun:
                     "contactIds": here,
                 }
             )
-        elif own_child:
-            entry.update(status=WOULD_CREATE, matchedBy=MATCH_CREATE)
         else:
+            entry.update(status=WOULD_CREATE, matchedBy=MATCH_CREATE)
             wanted = local_part(contact.email)
             candidates = sorted(
                 dict.fromkeys(
@@ -555,14 +560,8 @@ class DryRun:
                 ),
                 key=links.id_sort_key,
             )
-            entry.update(status=UNMATCHED_ON_EXISTING_CHILD, candidateIds=candidates)
-            holds.append(
-                {
-                    "reason": UNMATCHED_ON_EXISTING_CHILD,
-                    "hubspotContactId": contact.hubspot_id,
-                    "candidateIds": candidates,
-                }
-            )
+            if candidates:
+                entry["candidateIds"] = candidates
 
     def _new_child_contact(self, contact, entry: dict) -> None:
         """The child does not exist yet, so every contact is created."""

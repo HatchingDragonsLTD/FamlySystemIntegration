@@ -442,6 +442,8 @@ def _write_phase(job, deps, plan, context, digest) -> dict:
     codes = (bad_codes + [f for f in failures if f != "contact_outcomes"] + flags + relation_flags
              + (["relation_added"] if relations_added else []) + syncer.reports + list(plan["warnings"]) + contact_warnings + bill_payer_codes
              + (["urn_allocated"] if urn_written else [])
+             # Informational footer code: a parent was added to a child that already existed.
+             + (["contact_unmatched_on_existing_child"] if not own_child and CREATED in contact_codes else [])
              + ["created" if child.created else "child_existed"])
     if failures:
         store.set_status(job.id, store.NEEDS_REVIEW, last_error_code=",".join(failures))
@@ -782,6 +784,13 @@ def _create_contacts(
     creates_sent = 0
 
     present_contacts: dict[str, str] = context.setdefault("present_contacts", {})
+    # The APPROVED plan is about one child. If the live child is not that child (the plan would have
+    # created one but it exists now, or a different child was found), nothing is added to it.
+    planned_child = plan["child"]
+    child_changed = (
+        (planned_child["status"] == "child_would_create" and not child.created)
+        or (planned_child["status"] == "child_found"
+            and planned_child.get("famlyChildId") != child.child_id))
 
     for slot, entry in enumerate(entries):
         hubspot_id = entry["hubspotContactId"]
@@ -790,21 +799,26 @@ def _create_contacts(
             contact = by_id[hubspot_id]
             target = normalise_email(contact.email)
 
+            if child_changed:
+                outcomes.append(f"{hubspot_id}:plan_changed")
+                all_ok = False
+                continue
             if child.clean_create and creates_sent == 0:
                 here = []                                   # a new child: nothing to find
             else:
                 # The live check: the HubSpot reference on this child first, then email.
                 here = famly.locate_contact(child_id, hubspot_id, target).ids
 
-            if len(here) == 1:
+            planned = entry.get("status")             # what the APPROVED plan said about this contact
+            if len(here) == 1 and planned == "would_create":
+                code = "plan_changed"                 # a matching contact appeared since approval
+            elif len(here) == 1:
                 code = PRESENT
                 present_contacts[hubspot_id] = here[0]
             elif len(here) > 1:
                 code = "ambiguous_on_child"
-            elif not own_child:
-                # A child that already existed: an unmatched contact is never added
-                # to it (the plan holds on this; this is the last line).
-                code = "contact_unmatched_on_existing_child"
+            elif planned == "present":
+                code = "plan_changed"                 # the contact the plan found is gone
             elif store.last_outcome_for(job.deal_id, child_id, hubspot_id, job.id)                     in UNRESOLVED_CONTACT_OUTCOMES:
                 # An earlier job sent this parent's create and never confirmed it, and the
                 # live list does not show it: do not create it a second time.

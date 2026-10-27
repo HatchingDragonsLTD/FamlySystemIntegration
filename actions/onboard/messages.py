@@ -51,7 +51,10 @@ _STATIC: dict[str, tuple[str, str]] = {
     "contact_name_incomplete": (NOT_DONE, "A parent's first or last name is missing in HubSpot, so they were not added."),
     "contact_ambiguous_on_child": (NOT_DONE, "A parent's email matches more than one contact on the child in Famly. Check the child's contacts."),
     "ambiguous_on_child": (NOT_DONE, "A parent's email matches more than one contact on the child in Famly. Check the child's contacts."),
-    "contact_unmatched_on_existing_child": (NOT_DONE, "A parent from the deal is not on the child in Famly, and was not added because the child already existed. Add them in Famly if needed."),
+    # RETIRED as a hold: an unmatched parent on an existing child is now a repair that Gate A approves.
+    # Recognised so that old job rows and Slack notices still render; now only an informational footer code.
+    "contact_unmatched_on_existing_child": (INFO, ""),
+    "plan_changed": (NOT_DONE, "The child in Famly changed after approval, so this parent was not added. Press Retry or run the job again to get a new approval."),
     "bill_payer_unclear": (NOT_DONE, "The deal does not have exactly one bill payer. Fix the Bill Payer label on the contacts."),
     # ---- the job stopped or a step failed ---------------------------------------
     "plan_read_failed": (NOT_DONE, "The deal could not be read from HubSpot or Famly. Try again later."),
@@ -248,6 +251,9 @@ _STATE: dict[str, str] = {
     "contact_relation_will_add": "Contact {id}{role}: already present; the relation will be set to Parent.",
     "contact_relation_unreadable": "Contact {id}{role}: already present; its relation could not be read, so it will not be changed.",
     "contact_flagged": "Contact {id}{role}: needs a person. {why}",
+    "contact_missing_on_existing_child": "Child found in Famly. Parent {n} of {total} is not on the child: will create.",
+    "child_other_contacts": "\u26a0\ufe0f The child already has {k} other contact(s) in Famly. If one is the same parent under another email, creating another will duplicate them. Check the child in Famly before approving.",
+    "child_other_contacts_candidates": "Possible matches (contacts on the child with the same part before the @ as a deal parent): {ids}.",
     "contact_not_checked": "Contact {id}{role}: not checked, because the child could not be resolved.",
     "bill_payer_would_create": "Bill payer: will be created.",
     "bill_payer_would_attach": "Bill payer: an existing bill payer will be linked to the child.",

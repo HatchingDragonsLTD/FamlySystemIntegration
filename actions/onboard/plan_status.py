@@ -10,8 +10,7 @@ from actions.onboard import messages
 
 _CHILD_VIA = {"external_system_reference": "child_found_reference", "urn": "child_found_urn",
               "famly_childid": "child_found_famly_childid"}
-_CONTACT_FLAG_CODES = {"no_email": "contact_no_email", "ambiguous_on_child": "contact_ambiguous_on_child",
-                       "contact_unmatched_on_existing_child": "contact_unmatched_on_existing_child"}
+_CONTACT_FLAG_CODES = {"no_email": "contact_no_email", "ambiguous_on_child": "contact_ambiguous_on_child"}
 
 
 def planned_writes(plan: dict) -> dict:
@@ -42,9 +41,11 @@ def _child_line(plan: dict, this_job_child_id: str | None) -> str:
     return messages.state(_CHILD_VIA.get(child.get("via"), "child_found_reference"))
 
 
-def _contact_line(entry: dict) -> str:
+def _contact_line(entry: dict, position: int = 1, total: int = 1, child_found: bool = False) -> str:
     fields = {"id": entry.get("hubspotContactId"), "role": " (bill payer)" if entry.get("isBillPayer") else ""}
     status = entry.get("status")
+    if status == "would_create" and child_found:
+        return messages.state("contact_missing_on_existing_child", n=position, total=total)
     if status == "would_create":
         return messages.state("contact_would_create", **fields)
     if status == "present":
@@ -98,7 +99,15 @@ def block(plan: dict, this_job_child_id: str | None = None) -> list[str]:
         stage = (plan.get("stage") or {}).get("name") or "a child-only stage"
         lines.append(messages.state("scope_child_only", stage=stage))
     else:
-        lines += [_contact_line(c) for c in plan.get("contacts") or []]
+        contacts = plan.get("contacts") or []
+        child_found = (plan.get("child") or {}).get("status") == "child_found"
+        lines += [_contact_line(c, n, len(contacts), child_found) for n, c in enumerate(contacts, start=1)]
+        other = plan.get("childOtherContacts")
+        if other and other.get("count"):
+            lines.append(messages.state("child_other_contacts", k=other["count"]))
+            if other.get("candidateIds"):
+                lines.append(messages.state("child_other_contacts_candidates",
+                                            ids=", ".join(other["candidateIds"])))
         section = plan.get("billPayer")
         if isinstance(section, dict) and section.get("status") != "skipped_stage":
             lines += _bill_payer_lines(section)

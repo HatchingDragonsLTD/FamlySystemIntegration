@@ -32,7 +32,8 @@ class RenderTests(unittest.TestCase):
 
     def test_every_state_sentence_formats_and_carries_no_stray_placeholder(self):
         for code in messages.state_codes():
-            text = messages.state(code, id="c1", role=" (bill payer)", stage="S", why="W", fields="f")
+            text = messages.state(code, id="c1", role=" (bill payer)", stage="S", why="W", fields="f",
+                                  n=1, total=2, k=1, ids="x")
             self.assertNotIn("{", text, code)
 
     def test_child_states(self):
@@ -58,7 +59,7 @@ class RenderTests(unittest.TestCase):
             contact("c6", "no_email"),
         ])
         got = self.lines(plan)[1:7]
-        self.assertEqual(got[0], messages.state("contact_would_create", id="c1", role=" (bill payer)"))
+        self.assertEqual(got[0], messages.state("contact_missing_on_existing_child", n=1, total=6))
         self.assertEqual(got[1], messages.state("contact_present_reference", id="c2", role=""))
         self.assertEqual(got[2], messages.state("contact_present_email", id="c3", role=""))
         self.assertEqual(got[3], messages.state("contact_relation_will_add", id="c4", role=""))

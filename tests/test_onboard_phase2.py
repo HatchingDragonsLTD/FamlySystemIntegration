@@ -807,7 +807,7 @@ class ChildCreateTests(Phase2Case):
                 self.famly.contacts[child_id] = []
         self.famly.after_first["OnboardChildByExternalRef"] = add
 
-    def test_a_child_that_now_exists_is_used_not_created_and_gets_no_unmatched_contact(self):
+    def test_a_child_that_now_exists_is_used_not_created_and_nothing_is_added_to_it(self):
         self.run_to_approval()
         self.approve()
         self.appear("child-existing")      # somebody else's child, with no contacts on it
@@ -815,8 +815,7 @@ class ChildCreateTests(Phase2Case):
         self.assertEqual(self.famly.child_creates, [])               # no create
         self.assertEqual(self.job().child_id, "child-existing")
         self.assertEqual(self.famly.contact_creates, [])             # and nothing added to it
-        self.assertEqual(self.job().outcomes, ["c1:contact_unmatched_on_existing_child",
-                                               "c2:contact_unmatched_on_existing_child"])
+        self.assertEqual(self.job().outcomes, ["c1:plan_changed", "c2:plan_changed"])
         self.assertEqual(result["status"], store.NEEDS_REVIEW)
 
     def test_two_children_found_before_the_write_is_needs_review(self):
@@ -1129,7 +1128,8 @@ class RerunTests(Phase2Case):
         # The child is the PIPELINE's (job history), so c2 stays would_create.
         self.assertEqual(result["status"], store.AWAITING_APPROVAL)
         self.assertIn("created by an earlier onboarding job", self.notify.gates[-1][0])
-        self.assertIn("Contact c2: will be created.", self.notify.gates[-1][0])
+        self.assertIn(messages.state("contact_missing_on_existing_child", n=2, total=2),
+                      self.notify.gates[-1][0])
         self.approve()
         self.run_worker()
         self.assertEqual(self.job().status, store.DONE)
@@ -1482,36 +1482,93 @@ class ExistingChildRuleTests(Phase2Case):
         self.assertTrue(store.mark_child_create_sent(job.id))
         return job
 
-    def test_an_existing_child_with_an_unmatched_contact_holds_with_no_writes(self):
+    def test_an_existing_child_with_an_unmatched_contact_asks_once_and_then_repairs_it(self):
         self.existing_child([("fc-1", "ada.l@example.org"), ("fc-3", "ben.b@other.com")])
         self.enqueue()
         result = self.run_worker()
-        self.assertEqual((result["status"], result["code"]),
-                         (store.HELD, "contact_unmatched_on_existing_child"))
-        self.assertEqual(self.notify.gates, [])                    # nothing to approve
-        self.assertFalse(self.famly.child_creates or self.famly.contact_creates)
-        self.assertTrue(any("contact_unmatched_on_existing_child" in n for n in self.notify.notices))
-        self.assertEqual(self.written()["famly_sync_note"],
-                         "Not started. Nothing was created in Famly. "
-                         + messages.lookup("contact_unmatched_on_existing_child")[1])
-        # Candidate ids live in the plan only; no email or name reaches Slack or the DB.
+        self.assertEqual(result["status"], store.AWAITING_APPROVAL)       # no hold, no re-run
+        self.assertEqual(len(self.notify.gates), 1)
+        text = self.notify.gates[0][0]
+        self.assertIn(messages.state("contact_missing_on_existing_child", n=2, total=2), text)
+        self.assertIn(messages.state("child_other_contacts", k=1), text)  # fc-3 matched no deal parent
+        self.assertIn(messages.state("child_other_contacts_candidates", ids="fc-3"), text)
+        self.assertIn("Famly writes planned: 0 child, 1 contact(s)", text)
+        self.assertFalse(self.famly.child_creates or self.famly.contact_creates)    # nothing before the click
+        self.approve()
+        final = self.run_worker()
+        self.assertEqual(final["status"], store.DONE)
+        self.assertEqual(self.job().outcomes, ["c1:present", "c2:created"])
+        created = self.famly.contact_creates[0]
+        self.assertEqual(created["externalSystemsReferences"], [{"foreignId": "c2", "system": "HUBSPOT"}])
+        self.assertEqual(created["records"], [{"key": "RELATION", "value": "Parent"}])
+        self.assertTrue(any("contact_unmatched_on_existing_child" in n for n in self.notify.notices))  # footer
         blob = self.all_output()
         for value in PII:
             self.assertNotIn(value, blob, value)
 
-    def test_every_unmatched_contact_on_an_existing_child_gets_its_own_hold(self):
+    def test_the_duplicate_warning_is_absent_when_every_contact_on_the_child_matched(self):
+        self.existing_child([("fc-1", "ada.l@example.org")])
+        self.enqueue()
+        self.assertEqual(self.run_worker()["status"], store.AWAITING_APPROVAL)
+        self.assertNotIn("other contact(s)", self.notify.gates[0][0])
+
+    def test_every_unmatched_contact_on_an_existing_child_is_planned_for_creation(self):
         from actions.onboard_dry_run.runner import DryRun
         self.existing_child([])
         plan = DryRun(self.hub, FamlyReads(self.famly, site_ids=[SITE_ID])).plan_deal(DEAL)
-        holds = [h for h in plan["holds"] if h["reason"] == "contact_unmatched_on_existing_child"]
-        self.assertEqual([(h["hubspotContactId"], h["candidateIds"]) for h in holds],
-                         [("c1", []), ("c2", [])])
+        self.assertEqual(plan["holds"], [])
+        self.assertEqual([(c["hubspotContactId"], c["status"]) for c in plan["contacts"]],
+                         [("c1", "would_create"), ("c2", "would_create")])
+        self.assertNotIn("childOtherContacts", plan)
+
+    def test_a_match_that_appears_after_approval_stops_with_plan_changed_and_creates_nothing(self):
+        from actions.onboard import worker as worker_mod
+        self.existing_child([("fc-1", "ada.l@example.org")])
+        self.run_to_approval()
+        self.approve()
+        real = worker_mod._create_contacts
+        famly = self.famly
+
+        def appear_then_run(*args, **kwargs):
+            famly.contacts["child-9"].append(("fc-2", "ben.b@example.org"))   # lands after the re-plan
+            return real(*args, **kwargs)
+        with mock.patch.object(worker_mod, "_create_contacts", appear_then_run):
+            result = self.run_worker()
+        self.assertEqual(self.job().outcomes, ["c1:present", "c2:plan_changed"])
+        self.assertEqual(result["status"], store.NEEDS_REVIEW)
+        self.assertEqual(self.famly.contact_creates, [])
+        self.assertTrue(any(messages.lookup("plan_changed")[1] in n for n in self.notify.notices))
+
+    def test_a_state_change_before_the_write_is_re_approved_by_the_plan_hash(self):
+        self.existing_child([("fc-1", "ada.l@example.org")])
+        self.run_to_approval()
+        self.approve()
+        self.famly.contacts["child-9"].append(("fc-2", "ben.b@example.org"))   # a match appears
+        result = self.run_worker()
+        self.assertEqual(result["status"], store.DONE)                 # the plan now has nothing to write
+        self.assertEqual(self.famly.contact_creates, [])
+
+    def test_retry_on_an_old_held_job_replans_into_the_repair_flow(self):
+        self.existing_child([("fc-1", "ada.l@example.org")])
+        old = store.enqueue(DEAL, "live").job
+        store.set_status(old.id, store.HELD, last_error_code="contact_unmatched_on_existing_child",
+                         outcomes=["contact_unmatched_on_existing_child"], approval_nonce="n1")
+        reply = approval.handle_click(slack.ACTION_ONBOARD_RETRY, approval.button_value(old.id, "", "n1"), "U1")
+        self.assertIn("queued", json.dumps(reply).lower())
+        result = self.run_worker()                                       # the fresh job
+        self.assertEqual(result["status"], store.AWAITING_APPROVAL)
+        self.assertIn(messages.state("contact_missing_on_existing_child", n=2, total=2),
+                      self.notify.gates[0][0])
+        self.assertNotEqual(self.job().id, old.id)
+        self.assertEqual(messages.lookup("contact_unmatched_on_existing_child"), (messages.INFO, ""))
+        # An old row or notice carrying the retired code still renders (in the footer).
+        self.assertIn("contact_unmatched_on_existing_child",
+                      messages.staff_text("D", "Old notice", ["contact_unmatched_on_existing_child"]))
 
     def test_the_same_plan_for_a_child_this_job_created_proceeds(self):
         job = self.own_child_job([("fc-1", "ada.l@example.org")])
         result = self.run_worker()
-        # c2 is unmatched but the child is OURS: it stays would_create, so the job
-        # asks for approval rather than holding.
+        # c2 is unmatched: would_create on any existing child, so the job asks for approval.
         self.assertEqual(result["status"], store.AWAITING_APPROVAL)
         self.assertIn("Child: already in Famly (created by this job).", self.notify.gates[0][0])
         self.approve(job)
@@ -1530,7 +1587,7 @@ class ExistingChildRuleTests(Phase2Case):
         self.assertEqual(self.hub.writes, [])
         text = self.notify.gates[0][0]
         self.assertIn("Famly writes planned: 0 child, 1 contact(s)", text)
-        self.assertIn("Contact c2: will be created.", text)
+        self.assertIn(messages.state("contact_missing_on_existing_child", n=2, total=2), text)
         self.assertIn("already present (matched by", text)
         # The click alone writes nothing either; the worker does, only afterwards.
         self.approve(job)
@@ -1562,12 +1619,13 @@ class ExistingChildRuleTests(Phase2Case):
         self.hub.contacts["c1"]["email"] = "ada.l@gmail.com"
         self.enqueue()
         self.assertEqual(self.run_worker()["status"], store.DONE)    # both matched
-        # A dot or a +tag is a different address: unmatched, so a hold.
+        # A dot or a +tag is a different address: unmatched, so it is planned for creation (asks once).
         store._reset_for_tests()
         self.famly.contacts["child-9"] = [("fc-1", "a.da.l@gmail.com"), ("fc-2", "ben.b@example.org")]
         self.enqueue()
         result = self.run_worker()
-        self.assertEqual(result["code"], "contact_unmatched_on_existing_child")
+        self.assertEqual(result["status"], store.AWAITING_APPROVAL)
+        self.assertIn("will create", self.notify.gates[-1][0])
 
 
 # --------------------------------------------------------------------------- #
@@ -1643,24 +1701,22 @@ class OriginFromHistoryTests(Phase2Case):
         self.assertEqual(self.job().outcomes, ["c1:created", "c2:created"])  # the last-moment rule agrees
         self.assertEqual(len(self.famly.child_creates), 1)
 
-    def test_a_child_with_the_deal_reference_but_no_job_record_holds(self):
+    def test_a_child_with_the_deal_reference_but_no_job_record_asks_for_the_repair(self):
         self.put_child("child-9", [("fc-1", "ada.l@example.org")])    # nobody's job made it
         self.assertEqual(store.created_child_ids_for_deal(DEAL), frozenset())
         self.enqueue()
         result = self.run_worker()
-        self.assertEqual((result["status"], result["code"]),
-                         (store.HELD, "contact_unmatched_on_existing_child"))
+        self.assertEqual(result["status"], store.AWAITING_APPROVAL)    # a repair: asks once, no hold
         self.assertFalse(self.famly.child_creates or self.famly.contact_creates)
-        self.assertEqual(self.notify.gates, [])
+        self.assertEqual(len(self.notify.gates), 1)
 
-    def test_a_child_found_only_by_the_urn_holds_even_if_a_job_recorded_its_id(self):
+    def test_a_child_found_only_by_the_urn_is_repaired_even_if_a_job_recorded_its_id(self):
         self.put_child("child-9", [("fc-1", "ada.l@example.org")], with_deal_reference=False)
         self.record_history(DEAL, "child-9")          # an earlier job "created" child-9 ...
         self.assertEqual(store.created_child_ids_for_deal(DEAL), frozenset({"child-9"}))
         self.enqueue()
         result = self.run_worker()                    # ... but it is found via the URN fallback
-        self.assertEqual((result["status"], result["code"]),
-                         (store.HELD, "contact_unmatched_on_existing_child"))
+        self.assertEqual(result["status"], store.AWAITING_APPROVAL)    # a repair: asks once, no hold
         self.assertFalse(self.famly.contact_creates)
 
     def test_a_job_record_for_another_deal_does_not_make_this_child_the_pipelines(self):
@@ -1671,8 +1727,7 @@ class OriginFromHistoryTests(Phase2Case):
         self.assertEqual(store.created_child_ids_for_deal("2002"), frozenset({"child-777", "child-9"}))
         self.enqueue()
         result = self.run_worker()
-        self.assertEqual((result["status"], result["code"]),
-                         (store.HELD, "contact_unmatched_on_existing_child"))
+        self.assertEqual(result["status"], store.AWAITING_APPROVAL)    # a repair: asks once, no hold
         self.assertFalse(self.famly.contact_creates)
 
     def test_a_job_that_only_found_an_existing_child_does_not_make_it_the_pipelines(self):

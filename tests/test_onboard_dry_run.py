@@ -541,7 +541,7 @@ class ContactPlanTests(DryRunTestCase):
         self.assertEqual(first["labels"], [
             {"typeId": 91, "label": "Bill Payer", "direction": "deal_to_contact"}])
 
-    def test_existing_child_unmatched_parent_is_a_hold_with_candidate_ids_only(self):
+    def test_existing_child_unmatched_parent_is_would_create_with_candidate_ids_only(self):
         self.famly.ext_refs["D1"] = ["child-1"]
         self.famly.child_contacts["child-1"] = [
             ("fc-1", "parent.one@example.org"),
@@ -550,29 +550,31 @@ class ContactPlanTests(DryRunTestCase):
         ]
         plan = self.plan()
         second = plan["contacts"][1]
-        self.assertEqual(second["status"], "contact_unmatched_on_existing_child")
+        self.assertEqual((second["status"], second["matchedBy"]), ("would_create", "create"))
         self.assertEqual(second["candidateIds"], ["fc-3"])   # ids only: evidence, not a match
         self.assertNotIn("famlyContactId", second)
         self.assertEqual(plan["child"]["origin"], "existing")
-        hold = [h for h in plan["holds"] if h["reason"] == "contact_unmatched_on_existing_child"]
-        self.assertEqual(hold, [{"reason": "contact_unmatched_on_existing_child",
-                                 "hubspotContactId": "c2", "candidateIds": ["fc-3"]}])
-        self.assertEqual(plan["status"], "held")
+        self.assertEqual(plan["holds"], [])                  # no longer a hold: Gate A approves it
+        self.assertEqual(plan["status"], "ready")
+        # The child has two contacts that matched no deal parent: the duplicate-risk warning's data.
+        self.assertEqual(plan["childOtherContacts"], {"count": 2, "candidateIds": ["fc-3"]})
         blob = json.dumps(plan)
         for text in ("example.org", "other.com", "parent.two", "@"):
             self.assertNotIn(text, blob)           # no email, not even a fragment
 
-    def test_a_pipeline_created_child_keeps_would_create_for_an_unmatched_contact(self):
+    def test_a_pipeline_created_child_and_an_existing_one_both_plan_the_missing_contact(self):
         self.famly.ext_refs["D1"] = ["child-1"]
         self.famly.child_contacts["child-1"] = [("fc-1", "parent.one@example.org")]
         plan = self.dry_with_own_child("child-1")
         self.assertEqual(plan["child"]["origin"], "created_by_pipeline")
         self.assertEqual([c["status"] for c in plan["contacts"]], ["present", "would_create"])
         self.assertEqual(plan["holds"], [])
-        # A DIFFERENT child id in the job history is not this child: it existed already.
+        self.assertNotIn("childOtherContacts", plan)         # every contact on the child matched a parent
+        # A DIFFERENT child id in the job history is not this child: it existed already, same plan.
         other = self.dry_with_own_child("some-other-child")
         self.assertEqual(other["child"]["origin"], "existing")
-        self.assertEqual(self.reasons(other), ["contact_unmatched_on_existing_child"])
+        self.assertEqual([c["status"] for c in other["contacts"]], ["present", "would_create"])
+        self.assertEqual(self.reasons(other), [])
 
     def test_a_child_found_only_by_the_urn_is_existing_even_if_the_history_names_it(self):
         from actions.onboard_dry_run.runner import DryRun
@@ -581,7 +583,8 @@ class ContactPlanTests(DryRunTestCase):
         plan = DryRun(self.hub, FamlyReads(self.famly, site_ids=[WEST_ID])).plan_deal(
             "D1", None, created_child_ids={"child-9"})
         self.assertEqual((plan["child"]["via"], plan["child"]["origin"]), ("urn", "existing"))
-        self.assertEqual(self.reasons(plan), ["contact_unmatched_on_existing_child"])
+        self.assertEqual([c["status"] for c in plan["contacts"]], ["present", "would_create"])
+        self.assertEqual(self.reasons(plan), [])
 
     def dry_with_own_child(self, child_id):
         from actions.onboard_dry_run.runner import DryRun

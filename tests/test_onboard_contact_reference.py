@@ -76,7 +76,7 @@ class MatchingTests(ReferenceCase):
         # A reference that exists only on the sibling's child does not match this child.
         self.famly.contact_refs.pop("fc-1")
         plan = self.plan()
-        self.assertEqual(self.entry(plan, "c1")["status"], "contact_unmatched_on_existing_child")
+        self.assertEqual(self.entry(plan, "c1")["status"], "would_create")    # no match: a repair
 
     def test_an_unknown_create_outcome_is_settled_by_the_reference_lookup_too(self):
         # The create lands but answers HTTP 500, and the child's contact list lags: only the
