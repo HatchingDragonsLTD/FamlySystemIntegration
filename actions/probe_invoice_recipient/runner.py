@@ -18,8 +18,13 @@ at the end for deletion by hand (the public schema has no contact delete; a paye
 cannot be deleted without deleteChildren first).
 
 THE STEPS (5 writes in all)
-  1. create a contact on the test child, with no reference;
-  2. create a bill payer on the test child at share 0.0 (nothing bills);
+  1. create a contact on the test child, with no reference (or, with --contact-id, reuse an
+     AAProbe test contact after a read shows it is on that child: no write, step 1 is skipped);
+  2. create a bill payer on the test child at share 0.0 (nothing bills). The document and the
+     variables are built from the LIVE SCHEMA by the same builders the pipeline uses
+     (`bill_payer_writes.load_plan`, `create_document`, `write_probe.build_share`); only fixed test
+     values go in (name AAProbe IR, an example.com email, the test child, share 0.0). No HubSpot
+     contact, phone or address. If it fails, one read counts the child's bill payers;
   3. addInvoiceRecipients with the contact as relationId; read the payer's recipients back;
   4. the same addInvoiceRecipients again; read back (deduplicated or duplicated? an error is
      reported as its class and code only);
@@ -30,12 +35,16 @@ THE STEPS (5 writes in all)
 """
 
 import json
+import os
 import re
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from actions.onboard import bill_payer_writes as bpw
+from actions.probe_bill_payers import write_probe
 from actions.probe_bill_payers.runner import assert_read_only
 from actions.probe_contact_reference.runner import (
     UUID_RE, ProbeRefused, assert_probe_mutation, verify_test_child)
@@ -50,7 +59,6 @@ SITE_CHILDREN_DOC = HERE / "site_children.graphql"
 READ_PAYERS_DOC = HERE / "read_payers.graphql"
 READ_CONTACTS_DOC = HERE / "read_contacts.graphql"
 CREATE_CONTACT_DOC = HERE / "create_contact.graphql"
-CREATE_PAYER_DOC = HERE / "create_bill_payer.graphql"
 ADD_DOC = HERE / "add_recipients.graphql"
 UPDATE_CONTACT_DOC = HERE / "update_contact.graphql"
 
@@ -58,13 +66,12 @@ READ_DOCS = (SITE_CHILDREN_DOC, READ_PAYERS_DOC, READ_CONTACTS_DOC)
 # document -> (top-level field, the one call it makes)
 WRITE_DOCS = {
     CREATE_CONTACT_DOC: ("contacts", "create"),
-    CREATE_PAYER_DOC: ("billPayers", "create"),
     ADD_DOC: ("billPayers", "addInvoiceRecipients"),
     UPDATE_CONTACT_DOC: ("contacts", "update"),
 }
 OPS = {SITE_CHILDREN_DOC: "ProbeIRSiteChildren", READ_PAYERS_DOC: "ProbeIRPayers",
        READ_CONTACTS_DOC: "ProbeRefRead", CREATE_CONTACT_DOC: "ProbeIRCreateContact",
-       CREATE_PAYER_DOC: "ProbeIRCreatePayer", ADD_DOC: "ProbeIRAddRecipients",
+       ADD_DOC: "ProbeIRAddRecipients",
        UPDATE_CONTACT_DOC: "ProbeIRUpdateContact"}
 
 MAX_WRITES = 5
@@ -102,9 +109,57 @@ def check_documents() -> None:
     assert_probe_mutation(UPDATE_CONTACT_DOC, "update")
 
 
-def error_info(exc: Exception) -> str:
-    """The error CLASS and CODE only: the exception type, the HTTP status and any `extensions.code`
-    values (matched against a strict pattern). Never a message."""
+VALIDATION_RE = re.compile(
+    r"variable|field|argument|unknown type|cannot query|expected|required|not defined|validation|"
+    r"of type|input|enum", re.I)
+
+
+def _string_values(value) -> list[str]:
+    found = []
+    if isinstance(value, dict):
+        for item in value.values():
+            found += _string_values(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            found += _string_values(item)
+    elif isinstance(value, str) and len(value) >= 3:
+        found.append(value)
+    return found
+
+
+def sanitise_message(messages: list, variables) -> str | None:
+    """A GraphQL VALIDATION message that is safe to print, or None. Kept only when it looks like a
+    validation error (it names a field, type or argument), truncated to 200 characters, and only if it
+    holds no `@`, no run of more than 6 digits and no string value from the variables."""
+    text = "; ".join(m for m in messages if isinstance(m, str)).strip()
+    if not text or not VALIDATION_RE.search(text):
+        return None
+    text = text[:200]
+    if "@" in text or re.search(r"\d{7,}", text):
+        return None
+    lowered = text.casefold()
+    if any(value.casefold() in lowered for value in _string_values(variables)):
+        return None
+    return text
+
+
+def _error_messages(exc: Exception) -> list:
+    body = getattr(exc, "body", None)
+    if isinstance(body, str):
+        try:
+            parsed = json.loads(body)
+        except ValueError:
+            return [body]
+        body = parsed
+    errors = list(body.get("errors") or []) if isinstance(body, dict) else []
+    errors += [e for e in getattr(exc, "errors", None) or [] if e not in errors]
+    return [e.get("message") for e in errors if isinstance(e, dict)]
+
+
+def error_info(exc: Exception, variables=None) -> str:
+    """The error CLASS and CODE: the exception type, the HTTP status and any `extensions.code` values
+    (matched against a strict pattern). For an HTTP 400 also a sanitised validation message (see
+    `sanitise_message`), so the wrong field or type can be seen without any personal data."""
     body = getattr(exc, "body", None)
     if isinstance(body, str):
         try:
@@ -119,7 +174,12 @@ def error_info(exc: Exception) -> str:
         if isinstance(code, str) and CODE_RE.match(code):
             codes.add(code)
     status = getattr(exc, "status_code", None)
-    return f"{type(exc).__name__} status={status} codes={sorted(codes) or 'none'}"
+    info = f"{type(exc).__name__} status={status} codes={sorted(codes) or 'none'}"
+    if status == 400:
+        message = sanitise_message(_error_messages(exc), variables)
+        if message:
+            info += f" message={message!r}"
+    return info
 
 
 def captured_update_template(text: str | None = None) -> dict | None:
@@ -173,7 +233,8 @@ class Result:
 
 
 def run_probe(child_id: str, confirm: bool, rest, gql, out: Callable[[str], None] = print,
-              sleep: Callable[[float], None] = time.sleep, template: dict | None = None) -> Result:
+              sleep: Callable[[float], None] = time.sleep, template: dict | None = None,
+              contact_id: str | None = None) -> Result:
     """Run the probe. Raises ProbeRefused (nothing written) if a guard fails."""
     if not confirm:
         raise ProbeRefused("refusing without --confirm; nothing was written")
@@ -182,6 +243,8 @@ def run_probe(child_id: str, confirm: bool, rest, gql, out: Callable[[str], None
     child_id = child_id.strip()
     check_documents()
     verify_test_child(rest, child_id)
+    if contact_id is not None and not UUID_RE.match(str(contact_id).strip().lower()):
+        raise ProbeRefused("--contact-id is not a UUID; nothing was written")
     template = template if template is not None else captured_update_template()
     out(f"CAP: 1 contact, 1 bill payer, {MAX_WRITES} write requests; each write once, never retried")
     out(f"step 5 uses: {'the captured request in docs' if template else 'the schema shape'}")
@@ -218,17 +281,29 @@ def run_probe(child_id: str, confirm: bool, rest, gql, out: Callable[[str], None
     if site_id is None:
         raise ProbeRefused("the child was not found at any site; nothing was written")
 
-    def send(doc: Path, variables: dict):
-        """ONE write request, never retried. Returns (response body or None, error text or None)."""
+    def send(doc: Path, variables: dict, operation: str | None = None, checked: bool = False):
+        """ONE write request, never retried. Returns (response body or None, error text or None).
+        `checked` is for a document the caller has already passed through its own mutation check."""
         if result.writes >= MAX_WRITES:
             result.stopped = "write cap reached"
             return None, "cap"
-        assert doc in WRITE_DOCS
+        assert checked or doc in WRITE_DOCS
         result.writes += 1
         try:
-            return gql.execute(query_path=doc, variables=variables, operation_name=OPS[doc]), None
+            return gql.execute(query_path=doc, variables=variables,
+                               operation_name=operation or OPS[doc]), None
         except (GraphQLError, GraphQLHTTPError) as exc:
-            return None, error_info(exc)
+            return None, error_info(exc, variables)
+
+    def count_child_payers() -> int | None:
+        """ONE read of the site's live bill payers: how many list this child (None if unreadable)."""
+        try:
+            return sum(
+                1 for row in pages(READ_PAYERS_DOC, {"siteIds": [site_id], "includeDeleted": False},
+                                   ("billPayers", "listBySiteIds"))
+                if child_id in [str(c.get("childId")) for c in row.get("children") or []])
+        except (GraphQLError, GraphQLHTTPError):
+            return None
 
     def read_recipients() -> list | None:
         """The payer's (relationId, contactId) pairs, or None if the payer is not listed (reads only;
@@ -259,31 +334,65 @@ def run_probe(child_id: str, confirm: bool, rest, gql, out: Callable[[str], None
 
     rows = result.rows
 
+    # The bill payer create document and variables come from the LIVE schema, by the pipeline's own
+    # builders. Built (and the schema read) BEFORE any write: if they cannot be built, nothing is sent.
+    try:
+        payer_plan = bpw.load_plan(gql)
+    except bpw.NotConfigured:
+        raise ProbeRefused("the bill payer create could not be built from the live schema; "
+                           "nothing was written") from None
+    payer_text = bpw.create_document(payer_plan)
+    bpw.assert_stage_mutation(payer_text, "create")
+
+    if contact_id is not None:
+        result.contact_id = contact_id.strip()
+        node = read_contact()
+        if node is None:
+            raise ProbeRefused("the contact is not on that child; nothing was written")
+        if not str((node.get("name") or {}).get("fullName") or "").startswith("AAProbe"):
+            raise ProbeRefused("the contact is not an AAProbe test contact; nothing was written")
+        rows["1_contact_reused_on_this_child"] = True
+
     # ---- 1. a contact with no reference ------------------------------------ #
-    body, error = send(CREATE_CONTACT_DOC, {"contacts": [{
-        "name": "AAProbe IR", "email": f"probe-ir-{stamp}@example.com",
-        "phoneNumbers": [{"value": "+447700900123", "phoneType": "MOBILE"}],
-        "records": [{"key": "TITLE", "value": "AAProbe"}, {"key": "OCCUPATION", "value": "AAProbe"}],
-        "childIds": [child_id], "roles": [], "emergencyContact": False}]})
-    created = ((((body or {}).get("data") or {}).get("contacts") or {}).get("create")) or []
-    result.contact_id = str(created[0]["id"]) if created and created[0].get("id") else None
-    rows["1_contact_created"] = result.contact_id is not None
-    if error:
-        rows["1_error"] = error
-    if result.contact_id is None:
-        result.stopped = "no contact id came back; nothing else was sent (a contact may exist: check Famly)"
-        return _finish(result, out)
+    if contact_id is None:
+        body, error = send(CREATE_CONTACT_DOC, {"contacts": [{
+            "name": "AAProbe IR", "email": f"probe-ir-{stamp}@example.com",
+            "phoneNumbers": [{"value": "+447700900123", "phoneType": "MOBILE"}],
+            "records": [{"key": "TITLE", "value": "AAProbe"}, {"key": "OCCUPATION", "value": "AAProbe"}],
+            "childIds": [child_id], "roles": [], "emergencyContact": False}]})
+        created = ((((body or {}).get("data") or {}).get("contacts") or {}).get("create")) or []
+        result.contact_id = str(created[0]["id"]) if created and created[0].get("id") else None
+        rows["1_contact_created"] = result.contact_id is not None
+        if error:
+            rows["1_error"] = error
+        if result.contact_id is None:
+            result.stopped = "no contact id came back; nothing else was sent (a contact may exist: check Famly)"
+            return _finish(result, out)
 
     # ---- 2. a bill payer at share 0.0 -------------------------------------- #
-    body, error = send(CREATE_PAYER_DOC, {"billPayers": [{
-        "siteId": site_id, "name": "AAProbe IR", "email": f"probe-ir-payer-{stamp}@example.com",
-        "children": [{"childId": child_id, "share": {"multiplier": SHARE}}]}]})
+    w = payer_plan.write
+    payload = {w.site_field: site_id, w.name_field: "AAProbe IR"}
+    if w.email_field:
+        payload[w.email_field] = f"probe-ir-payer-{stamp}@example.com"
+    entry = {w.child_id_field: child_id}
+    if w.share_field:
+        entry[w.share_field] = write_probe.build_share(w, SHARE)
+    payload[w.children_field] = [entry]
+    payer_variables = {"input": [payload] if "[" in w.create_arg_type else payload}
+    handle = tempfile.NamedTemporaryFile("w", suffix=".graphql", delete=False, encoding="utf-8")
+    try:
+        handle.write(payer_text)
+        handle.close()
+        body, error = send(Path(handle.name), payer_variables, operation=bpw.CREATE_OP, checked=True)
+    finally:
+        os.unlink(handle.name)
     made = ((((body or {}).get("data") or {}).get("billPayers") or {}).get("create")) or []
     result.payer_id = str(made[0]["billPayerId"]) if made and made[0].get("billPayerId") else None
     rows["2_bill_payer_created"] = result.payer_id is not None
     if error:
         rows["2_error"] = error
     if result.payer_id is None:
+        rows["2_child_bill_payer_count_after"] = count_child_payers()
         result.stopped = "no bill payer id came back; nothing else was sent (a payer may exist: check Famly)"
         return _finish(result, out)
 

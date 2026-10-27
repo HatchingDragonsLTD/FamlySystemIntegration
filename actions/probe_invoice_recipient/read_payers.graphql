@@ -5,6 +5,9 @@ query ProbeIRPayers($siteIds: [SiteId!]!, $next: BillPayerCursor, $includeDelete
     listBySiteIds(siteIds: $siteIds, nextToken: $next, includeDeleted: $includeDeleted) {
       result {
         billPayerId
+        children {
+          childId
+        }
         invoiceRecipients {
           relationId
           contactId

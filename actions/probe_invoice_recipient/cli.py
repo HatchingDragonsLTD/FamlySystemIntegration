@@ -17,6 +17,9 @@ HELP = ("ONE-OFF WRITE PROBE: link a TEST contact to a TEST bill payer as an inv
 
 def add_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--child-id", required=True, metavar="ID", help="The TEST child's id")
+    parser.add_argument("--contact-id", metavar="ID", default=None,
+                        help="Reuse this AAProbe test contact (it must be on the test child) instead of "
+                             "creating one: step 1 is skipped and is not a write")
     parser.add_argument("--confirm", action="store_true",
                         help=f"Required. Creates 1 test contact and 1 test bill payer "
                              f"({runner.MAX_WRITES} write requests at most)")
@@ -24,7 +27,8 @@ def add_args(parser: argparse.ArgumentParser) -> None:
 
 def handle(args: argparse.Namespace):
     try:
-        result = runner.run_probe(args.child_id, args.confirm, RestClient(), _public_client())
+        result = runner.run_probe(args.child_id, args.confirm, RestClient(), _public_client(),
+                                  contact_id=args.contact_id)
     except runner.ProbeRefused as exc:
         print(str(exc), file=sys.stderr)
         raise SystemExit(3) from None
