@@ -32,6 +32,30 @@ RULES = {
     },
 }
 
+# The rules as shipped in reference/funding_rules.json, with every site filled in (HDCITY and HDWEST were
+# filled in on 2026-10-14). RULES above stays the fixture for the temp-file cases: it keeps two sites empty so
+# the gap errors can be tested. Changing the shipped file must be a deliberate change here too.
+SHIPPED_RULES = {
+    "fundingMethod": "ASSISTED",
+    "institutions": {
+        "HDCW": RULES["institutions"]["HDCW"],
+        "HDCITY": {
+            "maxFundedMinutes": 630,
+            "fundedWeeklyHours": {
+                "30": {"all_year_round": 23.47058824, "term_only": 31.5},
+                "15": {"all_year_round": 11.73529412, "term_only": 15.75},
+            },
+        },
+        "HDWEST": {
+            "maxFundedMinutes": 600,
+            "fundedWeeklyHours": {
+                "30": {"all_year_round": 22.35294118, "term_only": 30},
+                "15": {"all_year_round": 11.17647059, "term_only": 15},
+            },
+        },
+    },
+}
+
 PROJECT = Path(__file__).resolve().parent.parent
 
 
@@ -261,7 +285,7 @@ class ShippedFileTests(unittest.TestCase):
     def test_the_shipped_file_matches_the_agreed_rules(self):
         shipped = json.loads((PROJECT / "reference" / "funding_rules.json").read_text(encoding="utf-8"))
 
-        self.assertEqual(shipped, RULES)
+        self.assertEqual(shipped, SHIPPED_RULES)
 
     def test_the_default_path_is_that_file(self):
         self.assertEqual(funding_rules.rules_path(), PROJECT / "reference" / "funding_rules.json")
@@ -269,11 +293,15 @@ class ShippedFileTests(unittest.TestCase):
     def test_hdcw_resolves_from_the_shipped_file(self):
         self.assertEqual(resolve_funding("HDCW", "15", True)["fundingHours"], 16.5)
 
-    def test_the_sites_still_to_be_filled_in_are_hard_errors_today(self):
-        with self.assertRaisesRegex(
-            FundingRulesError, "no fundedWeeklyHours for HDCITY > 30 > term_only"
-        ):
-            resolve_funding("HDCITY", "30", True)
+    def test_every_shipped_site_resolves_every_entitlement_and_term_combination(self):
+        for site in SHIPPED_RULES["institutions"]:
+            for entitlement in ("30", "15"):
+                for term_only in (True, False):
+                    with self.subTest(site=site, entitlement=entitlement, term_only=term_only):
+                        result = resolve_funding(site, entitlement, term_only)
+                        self.assertGreater(result["fundingHours"], 0)
+                        self.assertEqual(result["maxFundedMinutes"],
+                                         SHIPPED_RULES["institutions"][site]["maxFundedMinutes"])
 
     def test_no_pull_command_touches_the_file(self):
         for module in PROJECT.glob("actions/pull_*/*.py"):
