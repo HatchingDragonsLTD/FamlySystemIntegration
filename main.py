@@ -44,6 +44,7 @@ from actions.pull_products import cli as pull_products
 from actions.pull_references import cli as pull_references
 from actions.pull_roster import cli as pull_roster
 from actions.pull_sessions import cli as pull_sessions
+from actions.reference_refresh import cli as reference_refresh
 from actions.read_child_plans import cli as read_child_plans
 from actions.staff_credentials import cli as staff_credentials
 from actions.plan_write.runner import PlanCommitRefused
@@ -63,6 +64,7 @@ ACTIONS = [
     pull_products,
     pull_institution_defaults,
     pull_references,
+    reference_refresh,
     pull_roster,
     contact_lookup,
     onboard_dry_run,

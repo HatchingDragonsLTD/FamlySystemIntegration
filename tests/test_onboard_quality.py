@@ -6,6 +6,7 @@ import ast
 import csv
 import os
 import tempfile
+import time
 import unittest
 from datetime import date, timedelta
 from pathlib import Path
@@ -13,6 +14,7 @@ from unittest import mock
 
 from actions.onboard_audit import runner as audit
 from actions.onboard_quality import cli, config, runner
+from integrations import reference_files
 
 TODAY = date(2026, 10, 27)
 
@@ -46,6 +48,15 @@ class QualityCase(unittest.TestCase):
         scope = mock.patch.object(runner, "scope_deals", return_value=[])
         scope.start()
         self.addCleanup(scope.stop)
+        # the five reference files, fresh, in a temp REFERENCE_DIR (the freshness check reads their mtimes)
+        self.ref = self.root / "reference"
+        self.ref.mkdir()
+        for name in reference_files.NAMES:
+            (self.ref / f"{name}.json").write_text("{}", encoding="utf-8")
+        env = mock.patch.dict(os.environ, {"REFERENCE_DIR": str(self.ref),
+                                           **{v: "" for v in reference_files.ENV_VARS.values()}})
+        env.start()
+        self.addCleanup(env.stop)
 
     def audit_returns(self, rows):
         patcher = mock.patch.object(runner.audit, "run", return_value=({}, rows))
@@ -275,6 +286,43 @@ class RunTests(QualityCase):
             with self.assertRaises(SystemExit) as ctx:
                 cli.handle(args)
         self.assertEqual(ctx.exception.code, 1)
+
+    def test_a_stale_reference_file_adds_one_line_and_the_state_logic_is_untouched(self):
+        old = time.time() - 5 * 86400
+        os.utime(self.ref / "groups_catalogue.json", (old, old))
+        (self.ref / "session_titles.json").unlink()
+        self.audit_returns([row(1, codes=["contact_missing"])])
+        with mock.patch.object(runner.logger, "info") as info:
+            result = self.go()
+        self.assertEqual(result["referenceStale"], ["groups_catalogue", "session_titles"])
+        stale = [p for p in self.posts if "Reference data is stale" in p]
+        self.assertEqual(len(stale), 1)
+        self.assertIn("groups_catalogue (5 days)", stale[0])
+        self.assertIn("session_titles (missing)", stale[0])
+        self.assertNotIn("session_catalogue", stale[0])
+        logged = [call.args for call in info.call_args_list if "reference dir=" in call.args[0]]
+        self.assertEqual(len(logged), 1)
+        self.assertEqual(str(logged[0][1]), str(self.ref))
+        self.assertEqual(logged[0][2]["groups_catalogue"], 5)
+        self.assertEqual(logged[0][2]["session_titles"], "missing")
+        self.assertEqual(runner.load_state(self.state), {"1": ["contact_missing"]})
+        self.posts.clear()
+        for name in reference_files.NAMES:
+            (self.ref / f"{name}.json").write_text("{}", encoding="utf-8")
+        self.assertEqual(self.go()["referenceStale"], [])
+        self.assertEqual(self.posts, [])
+
+    def test_a_failed_stale_line_does_not_change_the_state_or_the_post_result(self):
+        old = time.time() - 9 * 86400
+        os.utime(self.ref / "groups_catalogue.json", (old, old))
+        self.audit_returns([row(1, codes=["contact_missing"])])
+
+        def only_stale_fails(text):
+            self.posts.append(text)
+            return "Reference data is stale" not in text
+        result = self.go(post=only_stale_fails)
+        self.assertEqual((result["posted"], result["postFailed"]), (True, False))
+        self.assertEqual(runner.load_state(self.state), {"1": ["contact_missing"]})
 
     def test_the_csv_has_the_audit_columns_and_only_the_last_8_are_kept(self):
         self.reports.mkdir()

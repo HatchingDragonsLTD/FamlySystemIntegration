@@ -34,15 +34,14 @@ Environment:
 """
 
 import json
-import os
 from pathlib import Path
 from typing import Any
 
+from integrations import reference_files
+
 # reference/session_catalogue.json, resolved relative to the project root
 # (this file lives in integrations/, one level down).
-DEFAULT_CATALOGUE_PATH = (
-    Path(__file__).resolve().parent.parent / "reference" / "session_catalogue.json"
-)
+DEFAULT_CATALOGUE_PATH = reference_files.default_path("session_catalogue")
 
 # The funded variant keys, and the (has_meals, has_activities) each answers.
 VARIANT_BOTH = "with_meals_and_activities"
@@ -62,9 +61,8 @@ class SessionCatalogueError(RuntimeError):
 
 
 def catalogue_path() -> Path:
-    """The catalogue file in use."""
-    override = os.environ.get("SESSION_CATALOGUE_FILE", "").strip()
-    return Path(override) if override else DEFAULT_CATALOGUE_PATH
+    """The catalogue file in use (SESSION_CATALOGUE_FILE, else REFERENCE_DIR, else reference/)."""
+    return reference_files.path_for("session_catalogue")
 
 
 def _read() -> dict:

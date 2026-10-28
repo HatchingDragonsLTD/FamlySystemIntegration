@@ -39,14 +39,13 @@ them and `integrations.catalogue.load_titles` that reads them cannot disagree:
     PRODUCTS_CATALOGUE_FILE   reference/products_catalogue.json
 """
 
-import os
 from pathlib import Path
 from typing import Any
 
-_REFERENCE_DIR = Path(__file__).resolve().parent.parent / "reference"
+from integrations import reference_files
 
-DEFAULT_SESSION_TITLES_PATH = _REFERENCE_DIR / "session_titles.json"
-DEFAULT_PRODUCTS_CATALOGUE_PATH = _REFERENCE_DIR / "products_catalogue.json"
+DEFAULT_SESSION_TITLES_PATH = reference_files.default_path("session_titles")
+DEFAULT_PRODUCTS_CATALOGUE_PATH = reference_files.default_path("products_catalogue")
 
 SLOT_LABELS = {
     "morning": "Morning",
@@ -73,15 +72,13 @@ PRODUCT_PREFIXES = (
 
 
 def session_titles_path() -> Path:
-    """The pulled raw session titles file in use."""
-    override = os.environ.get("SESSION_TITLES_FILE", "").strip()
-    return Path(override) if override else DEFAULT_SESSION_TITLES_PATH
+    """The pulled raw session titles file in use (SESSION_TITLES_FILE, else REFERENCE_DIR, else reference/)."""
+    return reference_files.path_for("session_titles")
 
 
 def products_catalogue_path() -> Path:
-    """The pulled products catalogue file in use."""
-    override = os.environ.get("PRODUCTS_CATALOGUE_FILE", "").strip()
-    return Path(override) if override else DEFAULT_PRODUCTS_CATALOGUE_PATH
+    """The pulled products catalogue file in use (PRODUCTS_CATALOGUE_FILE, else REFERENCE_DIR, else reference/)."""
+    return reference_files.path_for("products_catalogue")
 
 
 def session_display_name(raw_title: Any) -> str:

@@ -301,6 +301,13 @@ def quality_baseline(deals: int, issues: int, codes: int) -> str:
             f"across {codes} code(s). From now on only new issues are posted.")
 
 
+def quality_reference_stale(stale: dict[str, int | None], limit_days: int) -> str:
+    """One line: the reference files older than `limit_days` (file name and age in days; None = missing)."""
+    parts = [f"{name} ({'missing' if age is None else f'{age} days'})" for name, age in sorted(stale.items())]
+    return (f"Reference data is stale (older than {limit_days} days): {', '.join(parts)}. "
+            "Check the reference-refresh cron and logs/reference.log.")
+
+
 def _ids_line(refs: list[str], total: int, limit: int) -> str:
     shown = ", ".join(refs[:limit])
     return shown + (f" and {total - limit} more" if total > limit else "")

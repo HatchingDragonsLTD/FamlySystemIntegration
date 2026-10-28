@@ -14,6 +14,7 @@ package imports no writer. Ids and codes only: no names, emails, phones or addre
 
 import json
 import logging
+import time
 from collections import Counter
 from datetime import date, timedelta
 from pathlib import Path
@@ -21,6 +22,7 @@ from pathlib import Path
 from actions.onboard import messages, notifier, store
 from actions.onboard_audit import runner as audit
 from actions.onboard_dry_run import derive
+from integrations import reference_files
 
 from . import config
 
@@ -123,6 +125,32 @@ def write_report(rows, reports_dir: Path, today: date) -> Path:
 # --------------------------------------------------------------------------- #
 # The run
 # --------------------------------------------------------------------------- #
+def reference_ages(now_ts: float | None = None) -> dict[str, int | None]:
+    """Age in whole days of each of the five generated reference files (None when the file is missing)."""
+    now_ts = time.time() if now_ts is None else now_ts
+    ages: dict[str, int | None] = {}
+    for name, path in reference_files.all_paths().items():
+        try:
+            ages[name] = max(0, int((now_ts - path.stat().st_mtime) // 86400))
+        except OSError:
+            ages[name] = None
+    return ages
+
+
+def check_reference_freshness(post, now_ts: float | None = None) -> list[str]:
+    """Log the resolved reference directory and each file's age, and post ONE line when any file is older
+    than REFERENCE_MAX_AGE_DAYS (or missing). Separate from the state logic: a failed post here changes
+    nothing else. Returns the stale file names."""
+    ages = reference_ages(now_ts)
+    directory = reference_files.reference_dir() or reference_files.REPO_DIR
+    logger.info("onboard-quality-check: reference dir=%s ages_days=%s", directory,
+                {name: ("missing" if age is None else age) for name, age in ages.items()})
+    stale = {name: age for name, age in ages.items() if age is None or age > config.REFERENCE_MAX_AGE_DAYS}
+    if stale:
+        _post(post, messages.quality_reference_stale(stale, config.REFERENCE_MAX_AGE_DAYS))
+    return sorted(stale)
+
+
 def _post(post, text: str) -> bool:
     """Post to Slack; a failure is logged (the type only) and never raised."""
     try:
@@ -176,8 +204,9 @@ def run(hubspot, gql, rest, *, baseline: bool = False, digest: bool = False, pos
         logger.warning("onboard-quality-check: Slack post failed, state left unchanged")
     else:
         save_state(state_file, alerts, today)
+    stale_reference = check_reference_freshness(post)         # its own line; never touches the state logic above
     return {"mode": "baseline" if (baseline or first_run) else "digest" if digest else "alerts",
-            "postFailed": post_failed,
+            "postFailed": post_failed, "referenceStale": stale_reference,
             "dealsChecked": len(rows), "openAlertIssues": sum(open_by_code.values()),
             "new": sum(len(v) for v in new.values()), "resolved": resolved, "persisting": persisting,
             "tiers": {name: dict(sorted(counts.items())) for name, counts in tiers.items()},

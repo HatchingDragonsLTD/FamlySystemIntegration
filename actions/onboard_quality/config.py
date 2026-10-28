@@ -44,6 +44,9 @@ CHILD_NOT_YET_EXPECTED_STAGES = ("Deposit Pending",)
 LEFT_NURSERY_STAGE = "Left Nursery"
 LEFT_NURSERY_WINDOW_DAYS = 45
 
+# A reference file (the five generated ones) older than this many days adds one Slack line to the run.
+REFERENCE_MAX_AGE_DAYS = 3
+
 MAX_IDS_PER_CODE = 25
 KEEP_REPORTS = 8
 STATE_FILE_NAME = "onboard_quality_state.json"      # beside ONBOARD_STORE_PATH

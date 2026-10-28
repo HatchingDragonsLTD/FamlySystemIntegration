@@ -26,7 +26,6 @@ backs the previous file up first, timestamped alongside it.
 
 import json
 import logging
-import os
 import shutil
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -34,7 +33,7 @@ from pathlib import Path
 from typing import Any
 
 from core.client import GraphQLClient, GraphQLError, GraphQLHTTPError
-from integrations import catalogue
+from integrations import catalogue, reference_files
 from integrations.catalogue import UnknownInstitutionError  # re-exported; see there
 
 logger = logging.getLogger(__name__)
@@ -42,15 +41,12 @@ logger = logging.getLogger(__name__)
 QUERY_PATH = Path(__file__).with_name("query.graphql")
 OPERATION_NAME = "Groups"
 
-DEFAULT_CATALOGUE_PATH = (
-    Path(__file__).resolve().parents[2] / "reference" / "groups_catalogue.json"
-)
+DEFAULT_CATALOGUE_PATH = reference_files.default_path("groups_catalogue")
 
 
 def catalogue_path() -> Path:
-    """The groups catalogue file in use."""
-    override = os.environ.get("GROUPS_CATALOGUE_FILE", "").strip()
-    return Path(override) if override else DEFAULT_CATALOGUE_PATH
+    """The groups catalogue file in use (GROUPS_CATALOGUE_FILE, else REFERENCE_DIR, else reference/)."""
+    return reference_files.path_for("groups_catalogue")
 
 
 @dataclass

@@ -58,15 +58,14 @@ Environment:
 """
 
 import json
-import os
 from pathlib import Path
 from typing import Any
 
+from integrations import reference_files
+
 # reference/institution_defaults.json, resolved relative to the project root
 # (this file lives in integrations/, one level down).
-DEFAULT_CATALOGUE_PATH = (
-    Path(__file__).resolve().parent.parent / "reference" / "institution_defaults.json"
-)
+DEFAULT_CATALOGUE_PATH = reference_files.default_path("institution_defaults")
 
 # The two schedule buckets a billing profile is bucketed into, by its
 # attendanceSchedule.fullYear boolean (see actions/pull_institution_defaults).
@@ -99,9 +98,8 @@ class InstitutionDefaultsError(RuntimeError):
 
 
 def catalogue_path() -> Path:
-    """The institution_defaults file in use."""
-    override = os.environ.get("INSTITUTION_DEFAULTS_FILE", "").strip()
-    return Path(override) if override else DEFAULT_CATALOGUE_PATH
+    """The institution_defaults file in use (INSTITUTION_DEFAULTS_FILE, else REFERENCE_DIR, else reference/)."""
+    return reference_files.path_for("institution_defaults")
 
 
 def schedule_key(term_time_only: Any) -> str:

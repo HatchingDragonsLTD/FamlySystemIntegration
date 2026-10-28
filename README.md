@@ -864,6 +864,44 @@ any of `FAMLY_CATALOGUE_FILE` / `SESSION_CATALOGUE_FILE` / `GROUPS_CATALOGUE_FIL
 available -- crontab does not load `.env` on its own, so either source it in
 the command or configure the variables in the crontab/systemd unit itself.
 
+### Refreshing on the droplet (`reference-refresh`)
+
+`python main.py reference-refresh [--dry-run]` is the safe, scheduled version of `pull-references` for the
+five generated files (`session_catalogue`, `session_titles`, `groups_catalogue`, `products_catalogue`,
+`institution_defaults`). `catalogue.json` and `funding_rules.json` are hand-maintained and never touched.
+
+**`REFERENCE_DIR`** moves the five files out of the repo (the droplet uses `/home/drew/famly-reference`, so a
+pull never dirties tracked files and `git pull` keeps working). Per file the order is: the file's own
+variable (`SESSION_CATALOGUE_FILE`, `SESSION_TITLES_FILE`, `GROUPS_CATALOGUE_FILE`,
+`PRODUCTS_CATALOGUE_FILE`, `INSTITUTION_DEFAULTS_FILE`), then `REFERENCE_DIR/<file>.json`, then the repo's
+`reference/`. Unset, nothing changes. Every loader re-reads its file on every call, so no restart is needed
+after a refresh. The web unit, the workers and the cron job must all see the same `REFERENCE_DIR` (put it in
+`.env`, which all of them load).
+
+The command copies the live files to `REFERENCE_DIR/.staging`, runs the pulls against the copies, and
+replaces nothing if any pull reports an error for any institution. Each staged file must be valid JSON,
+not empty, and must not have lost more than 20 percent of its leaf entries (exactly 20 percent is allowed);
+otherwise every live file is kept and Slack gets file, old and new counts (exit 1). When all pass, each
+changed file is backed up (`<name>.<UTC stamp>.bak.json` beside it), replaced with `os.replace` (a failure
+part-way restores the files already replaced), and the backups are pruned to the newest 5 per file. Slack
+gets one summary (ids and counts only), with its own `:warning: pricing inputs changed` line when
+`institution_defaults.json` changed; nothing is posted when nothing changed. `--dry-run` prints the
+validation, the diff counts, the number of Famly calls and the duration, and replaces and posts nothing.
+Exit 0 on success or no change, 1 on any refusal or error (including a failed Slack post after a replace).
+
+`onboard-quality-check` logs the resolved reference directory and each file's age on every run and adds one
+Slack line when any of the five is older than 3 days (or missing).
+
+Cron (droplet user `drew`; not installed by the repo; `mkdir -p logs` once):
+
+```cron
+CRON_TZ=Europe/London
+10 3 * * * cd /home/drew/famly && flock -n /tmp/reference_refresh.lock /home/drew/famly/venv/bin/python main.py reference-refresh >> logs/reference.log 2>&1
+```
+
+If the droplet's cron ignores `CRON_TZ` (see the quality-check note in `docs/status.md`), 03:10 London is
+03:10 UTC in winter and 02:10 UTC in summer.
+
 ## The daily people-roster cache (`pull-roster`)
 
 `python main.py pull-roster [--institution CODE] [--dry-run]` refreshes a

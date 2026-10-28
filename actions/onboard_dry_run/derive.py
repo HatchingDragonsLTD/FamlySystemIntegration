@@ -18,12 +18,11 @@ or two longer.
 
 import calendar
 import json
-import os
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from integrations import catalogue
+from integrations import catalogue, reference_files
 
 # location_of_interest -> site code. Anything else (Shoreditch, Head office,
 # Nannying, Other, empty) is a HOLD.
@@ -37,7 +36,7 @@ HATCHLINGS = "Hatchlings"
 LITTLEWINGS = "Littlewings"
 VOYAGERS = "Voyagers"
 
-DEFAULT_GROUPS_PATH = Path(__file__).resolve().parents[2] / "reference" / "groups_catalogue.json"
+DEFAULT_GROUPS_PATH = reference_files.default_path("groups_catalogue")
 
 # Hold reason codes.
 SITE_UNMAPPED = "site_unmapped"
@@ -186,8 +185,7 @@ def site_for_location(location: Any) -> tuple[str, str]:
 
 
 def groups_path() -> Path:
-    override = os.environ.get("GROUPS_CATALOGUE_FILE", "").strip()
-    return Path(override) if override else DEFAULT_GROUPS_PATH
+    return reference_files.path_for("groups_catalogue")
 
 
 def group_id_for(site_code: str, title: str) -> str:
