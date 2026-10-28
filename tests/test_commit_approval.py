@@ -20,7 +20,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
-from actions.plan_write import approval, preview_store
+from actions.plan_write import approval, plan_flag, preview_store
 from actions.read_child_plans.runner import ChildPlansResult, Plan
 from tests import fast_sqlite  # noqa: F401  (SQLite without fsync: see the module)
 
@@ -83,6 +83,14 @@ class StoreTestCase(unittest.TestCase):
         )
         live.start()
         self.addCleanup(live.stop)
+
+        # The flag step runs in a background thread after a commit: it may post a Slack line and wait
+        # between plan reads. Neither may happen for real in a test.
+        for target, name, fake in ((plan_flag.slack, "post_notice", lambda text: True),
+                                   (plan_flag, "_sleep", lambda seconds: None)):
+            patcher = mock.patch.object(target, name, fake)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def save_pending(
         self,

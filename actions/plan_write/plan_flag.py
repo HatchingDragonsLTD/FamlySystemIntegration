@@ -4,7 +4,10 @@ it there, the deal's flag is set to true through the one HubSpot writer (`write_
 
   * only a first plan sets it: a plan added alongside another (`old_plan_id`) leaves the flag alone;
   * the live value is read first and nothing is written when it is already true;
-  * a preview with no deal id (the webhook did not send one) sets nothing (`no_deal_id`);
+  * a preview with no deal id (the webhook did not send one) sets nothing (`no_deal_id`) and says so in Slack;
+  * the live read is tried up to five times (waits of 1, 2, 4 and 8 seconds, in the background thread); a
+    plan still not there writes nothing (`commit_not_confirmed`) and says so in Slack;
+  * the flag is only ever set to "true" here, never "false";
   * a rejected, refused, failed or in-progress commit never reaches this module;
   * a HubSpot problem NEVER undoes or retries the Famly commit: it is a code in the log and one Slack
     line (codes and ids only). The reconcile mode of `hubspot-set-plan-uploaded --from-famly` repairs it.
@@ -13,6 +16,7 @@ Never raises. Returns a short code.
 """
 
 import logging
+import time
 
 from actions.read_child_plans import runner as read_child_plans
 from core.hubspot import HubSpotDealWriter, HubSpotError
@@ -25,12 +29,43 @@ SKIPPED_ADDITIONAL, NO_DEAL_ID, NOT_CONFIRMED = (
     "plan_flag_skipped_additional_plan", "plan_flag_no_deal_id", "plan_flag_commit_not_confirmed")
 HUBSPOT_FAILED = "plan_flag_hubspot_failed"
 
+# The live read of the child's plans can lag the commit (Famly's read model), so it is tried again after
+# each of these waits, in the background thread only (reads only; never the approval response).
+READ_WAITS = (1, 2, 4, 8)
+_sleep = time.sleep
+
 
 def _confirmed(claimed, plan_id) -> bool:
     """A live read of the child's plans shows the committed plan (by id when known, else any plan)."""
     plans = read_child_plans.run(claimed.child_id, version=claimed.version).plans
     ids = {str(getattr(p, "id", "")) for p in plans}
     return str(plan_id) in ids if plan_id else bool(plans)
+
+
+def _confirmed_with_retries(claimed, plan_id) -> bool:
+    """`_confirmed`, tried again after each wait in READ_WAITS (1, 2, 4, 8 seconds: at most five reads).
+    A read that raises is logged at WARNING with the error type and counts as "not yet"; it never passes."""
+    for attempt in range(len(READ_WAITS) + 1):
+        try:
+            if _confirmed(claimed, plan_id):
+                return True
+        except Exception as exc:  # noqa: BLE001 - an unmade check is "not confirmed", never a pass
+            logger.warning("PLAN FLAG plan read failed preview_id=%s attempt=%d error=%s",
+                           getattr(claimed, "preview_id", None), attempt + 1, type(exc).__name__)
+        if attempt < len(READ_WAITS):
+            _sleep(READ_WAITS[attempt])
+    return False
+
+
+def _tell(code: str, claimed, deal_id, notify) -> None:
+    """One Slack line for a flag that was not set: the code and an id (the deal's, else the preview's)."""
+    which = f"deal {deal_id}" if deal_id else f"preview {getattr(claimed, 'preview_id', None)}"
+    try:
+        (notify or slack.post_notice)(
+            f"famly_plan_uploaded was not set for {which} (code {code}). The plan is in Famly; run "
+            "hubspot-set-plan-uploaded --from-famly to repair the flag.")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("PLAN FLAG notice failed (%s)", type(exc).__name__)
 
 
 def after_commit(claimed, plan_id, writer=None, notify=None) -> str:
@@ -40,12 +75,10 @@ def after_commit(claimed, plan_id, writer=None, notify=None) -> str:
         if getattr(claimed, "old_plan_id", None):
             return _done(SKIPPED_ADDITIONAL, claimed, deal_id)
         if not deal_id:
+            _tell(NO_DEAL_ID, claimed, deal_id, notify)
             return _done(NO_DEAL_ID, claimed, deal_id)
-        try:
-            confirmed = _confirmed(claimed, plan_id)
-        except Exception:  # noqa: BLE001 - an unmade check is "not confirmed", never a pass
-            confirmed = False
-        if not confirmed:
+        if not _confirmed_with_retries(claimed, plan_id):
+            _tell(NOT_CONFIRMED, claimed, deal_id, notify)
             return _done(NOT_CONFIRMED, claimed, deal_id)
         writer = writer or HubSpotDealWriter()
         if (writer.read_plan_uploaded(deal_id) or "").strip().lower() == "true":

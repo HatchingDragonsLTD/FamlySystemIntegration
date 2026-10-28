@@ -12,10 +12,15 @@ web framework.
 No argparse, no commit path.
 """
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any
 
+from integrations import slack
+
 from . import hubspot_flatten, input_schema, runner, warnings as plan_warnings
+
+logger = logging.getLogger(__name__)
 
 # Wrappers a webhook may nest the payload under. Checked in order.
 PAYLOAD_WRAPPER_KEYS = ("properties", "data")
@@ -63,10 +68,11 @@ def unwrap_payload(payload: Any) -> Any:
 DEAL_ID_KEYS = ("dealId", "deal_id", "hs_object_id")
 
 
-def deal_id_of(payload: Any) -> str | None:
-    """The HubSpot deal record id the webhook carried, or None. Digits only (an id, never personal
-    data); anything else is ignored, never echoed."""
-    body = unwrap_payload(payload)
+DEAL_ID_CONFLICT = "plan_flag_deal_id_conflict"
+
+
+def _id_in(body: Any) -> str | None:
+    """The first of DEAL_ID_KEYS in `body` that holds digits only, else None."""
     if not isinstance(body, dict):
         return None
     for key in DEAL_ID_KEYS:
@@ -74,6 +80,29 @@ def deal_id_of(payload: Any) -> str | None:
         if value.isdigit():
             return value
     return None
+
+
+def deal_id_of(payload: Any, notify=None) -> str | None:
+    """The HubSpot deal record id the webhook carried, or None. Digits only (an id, never personal
+    data); anything else is ignored, never echoed.
+
+    Read from the TOP LEVEL of the body and from the unwrapped inner dict (`properties` or `data`): a
+    webhook may put the deal id beside the wrapper or inside it. When both hold DIFFERENT ids the id is
+    treated as missing: a code is logged (`plan_flag_deal_id_conflict`), one Slack line is sent and nothing
+    is written for this deal."""
+    top = _id_in(payload)
+    inner = _id_in(unwrap_payload(payload))
+    if top and inner and top != inner:
+        logger.warning("PLAN FLAG %s ids=%s,%s", DEAL_ID_CONFLICT, top, inner)
+        try:
+            (notify or slack.post_notice)(
+                f"famly_plan_uploaded will not be set for this plan (code {DEAL_ID_CONFLICT}): the webhook "
+                f"body holds two different deal ids ({top} and {inner}). Run "
+                "hubspot-set-plan-uploaded --from-famly after approving to repair the flag.")
+        except Exception as exc:  # noqa: BLE001 - a Slack problem never breaks the preview
+            logger.warning("PLAN FLAG conflict notice failed (%s)", type(exc).__name__)
+        return None
+    return top or inner
 
 
 def parse_hubspot_payload(payload: Any) -> input_schema.PlanInput:

@@ -77,6 +77,10 @@ class AfterCommitCase(StoreTestCase):
         notice = mock.patch.object(plan_flag.slack, "post_notice", side_effect=lambda t: self.notices.append(t))
         notice.start()
         self.addCleanup(notice.stop)
+        self.waits = []
+        sleep = mock.patch.object(plan_flag, "_sleep", side_effect=self.waits.append)
+        sleep.start()
+        self.addCleanup(sleep.stop)
 
     def save(self, deal_id="555", old_plan_id=None, child_id=CHILD_ID):
         if old_plan_id:
@@ -121,17 +125,63 @@ class CommitSetsTheFlag(AfterCommitCase):
             self.approve()
         self.assertEqual((self.writer.reads, self.writer.writes), ([], []))
 
-    def test_a_preview_with_no_deal_id_sets_nothing(self):
+    def test_a_preview_with_no_deal_id_still_commits_sets_nothing_and_says_so_in_slack(self):
         self.save(deal_id=None)
-        with self.commit_lands():
-            self.approve()
+        with self.commit_lands() as commit:
+            text = self.approve()
+        self.assertTrue(text.startswith("✅ Plan committed"))
+        self.assertEqual(commit.call_count, 1)
         self.assertEqual((self.writer.reads, self.writer.writes), ([], []))
+        self.assertEqual(len(self.notices), 1)
+        self.assertIn("plan_flag_no_deal_id", self.notices[0])
+        self.assertIn(f"preview {PREVIEW_ID}", self.notices[0])
 
-    def test_a_commit_that_cannot_be_read_back_sets_nothing(self):
+    def test_a_commit_that_cannot_be_read_back_sets_nothing_after_bounded_retries_and_says_so(self):
         self.save()
         with mock.patch.object(plan_runner, "commit", return_value=FakeResult()):   # the plan never shows
-            self.approve()
+            text = self.approve()
+        self.assertTrue(text.startswith("✅ Plan committed"))                       # the approval is never blocked
         self.assertEqual((self.writer.reads, self.writer.writes), ([], []))
+        self.assertEqual(self.waits, [1, 2, 4, 8])                                  # bounded: five reads at most
+        self.assertEqual(len(self.notices), 1)
+        self.assertIn("plan_flag_commit_not_confirmed", self.notices[0])
+        self.assertIn("555", self.notices[0])
+
+    def test_a_plan_that_shows_up_on_a_later_read_sets_the_flag_once(self):
+        self.save()
+        reads = []
+
+        def lagging(child_id, version=3, client=None):
+            reads.append(1)
+            plans = list(self.live_plans) + ([Plan(id="plan-created-1", from_="2026-09-01")] if len(reads) > 3 else [])
+            return SimpleNamespace(child_id=child_id, plans=plans)
+        with mock.patch.object(plan_runner, "commit", return_value=FakeResult()),                 mock.patch.object(approval.read_child_plans, "run", lagging):
+            self.approve()
+        # one read for the live check before the commit, then reads until the plan shows
+        self.assertEqual(self.writer.writes, [("555", "true")])
+        self.assertEqual(self.waits, [1, 2])
+        self.assertEqual(self.notices, [])
+
+    def test_a_read_that_raises_is_logged_with_its_type_and_never_counts_as_confirmed(self):
+        self.save()
+
+        def broken(claimed, plan_id):
+            raise ConnectionError("down")
+        with mock.patch.object(plan_flag, "_confirmed", broken),                 mock.patch.object(plan_flag.logger, "warning") as warning,                 mock.patch.object(plan_runner, "commit", return_value=FakeResult()):
+            self.approve()
+        self.assertEqual(self.writer.writes, [])
+        self.assertEqual(warning.call_count, 5)
+        self.assertIn("ConnectionError", warning.call_args.args)
+        self.assertEqual(len(self.notices), 1)
+
+    def test_the_flag_is_only_ever_set_to_true(self):
+        for flag in (None, "false", "true"):
+            with self.subTest(flag=flag):
+                self.writer.flags["555"], self.writer.writes[:] = flag, []
+                claimed = SimpleNamespace(deal_id="555", old_plan_id=None, child_id=CHILD_ID, version=3, preview_id="p")
+                with mock.patch.object(plan_flag, "_confirmed", return_value=True):
+                    plan_flag.after_commit(claimed, "plan-1", writer=self.writer)
+                self.assertTrue(all(value == "true" for _deal, value in self.writer.writes))
 
 
 class NoCommitNoFlag(AfterCommitCase):
@@ -196,6 +246,30 @@ class HubSpotProblemsNeverTouchFamly(AfterCommitCase):
 
 
 class DealIdTests(unittest.TestCase):
+    def test_the_id_is_read_from_the_top_level_and_from_inside_the_wrapper(self):
+        cases = [({"dealId": "9", "properties": {"hubspot_x": "1"}}, "9"),          # beside the wrapper
+                 ({"properties": {"hs_object_id": "8"}}, "8"),                       # inside it
+                 ({"data": {"deal_id": 7}}, "7"),
+                 ({"dealId": "6", "properties": {"hs_object_id": "6"}}, "6"),         # the same id in both places
+                 ({"dealId": "a1", "properties": {"hs_object_id": "5"}}, "5")]        # a bad one is ignored
+        for body, wanted in cases:
+            self.assertEqual(hubspot_intake.deal_id_of(body), wanted, body)
+
+    def test_two_different_ids_in_the_two_places_mean_no_id_one_coded_log_and_one_slack_line(self):
+        notices = []
+        with mock.patch.object(hubspot_intake.logger, "warning") as warning:
+            found = hubspot_intake.deal_id_of({"dealId": "11", "properties": {"hs_object_id": "22"}},
+                                              notify=notices.append)
+        self.assertIsNone(found)
+        self.assertIn(hubspot_intake.DEAL_ID_CONFLICT, warning.call_args.args)
+        self.assertEqual(len(notices), 1)
+        self.assertIn("plan_flag_deal_id_conflict", notices[0])
+
+    def test_a_conflict_stores_no_deal_id_and_so_writes_nothing(self):
+        # the stored value is exactly deal_id_of's answer (web.prepare_preview), and None writes nothing
+        with mock.patch.object(plan_flag.slack, "post_notice"):
+            self.assertIsNone(hubspot_intake.deal_id_of({"dealId": "11", "data": {"deal_id": "22"}}))
+
     def test_the_deal_id_comes_from_the_webhook_payload_digits_only(self):
         self.assertEqual(hubspot_intake.deal_id_of({"dealId": "123"}), "123")
         self.assertEqual(hubspot_intake.deal_id_of({"properties": {"hs_object_id": 456}}), "456")

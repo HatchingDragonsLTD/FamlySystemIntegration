@@ -17,7 +17,7 @@ from pathlib import Path
 from unittest import mock
 
 from actions.additional_plan import web as additional_plan_web
-from actions.plan_write import approval, preview_store, runner
+from actions.plan_write import approval, plan_flag, preview_store, runner
 from actions.read_child_plans.runner import ChildPlansResult, Plan
 from integrations import slack
 from tests import fast_sqlite  # noqa: F401  (SQLite without fsync: see the module)
@@ -283,6 +283,14 @@ class ApproveThroughCommitTests(unittest.TestCase):
         )
         live.start()
         self.addCleanup(live.stop)
+
+        # The flag step after a commit runs inline here, with no real Slack post and no waiting.
+        for target, name, fake in ((approval, "_spawn", lambda work: work()),
+                                   (plan_flag.slack, "post_notice", lambda text: True),
+                                   (plan_flag, "_sleep", lambda seconds: None)):
+            patcher = mock.patch.object(target, name, fake)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def test_the_commit_request_carries_old_plan_id_and_replace_old_plan(self):
         preview_store.save(
