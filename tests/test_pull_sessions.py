@@ -208,6 +208,58 @@ class UnmatchedTitleTests(PullSessionsTestCase):
         self.assertEqual(result.unmatched[0].session_id, "s-2")
 
 
+class AmbiguousSlotTests(PullSessionsTestCase):
+    """Two Famly sessions that parse to one slot are never resolved by order: nothing is written for the slot."""
+
+    def existing(self):
+        self.write_existing_session_catalogue({"institutions": {"HDCITY": {
+            "funded": {"no_meals": {"morning": MORNING_UUID}}, "non_funded": {"full_day": AFTERNOON_UUID}}}})
+
+    def test_a_duplicate_slot_keeps_the_existing_id_and_reports_every_session_claiming_it(self):
+        self.existing()
+        client = FakeRest({CITY_ID: [session("new-a", "(FNM) Morning"), session("new-b", "(FNM) Morning")], CW_ID: []})
+
+        result = pull_sessions.pull_all(client=client)
+
+        city = result.catalogue["institutions"]["HDCITY"]
+        self.assertEqual(city["funded"]["no_meals"]["morning"], MORNING_UUID)         # the old id stays
+        self.assertEqual(result.written_counts["HDCITY"], 0)
+        self.assertEqual(sorted((u.session_id, u.reason, u.slot) for u in result.unmatched),
+                         [("new-a", "ambiguous_slot", "funded.no_meals.morning"),
+                          ("new-b", "ambiguous_slot", "funded.no_meals.morning")])
+
+    def test_the_order_famly_returns_them_in_does_not_matter(self):
+        self.existing()
+        first = pull_sessions.pull_all(client=FakeRest(
+            {CITY_ID: [session("a", "Full Day"), session("b", "Full Day")], CW_ID: []}))
+        second = pull_sessions.pull_all(client=FakeRest(
+            {CITY_ID: [session("b", "Full Day"), session("a", "Full Day")], CW_ID: []}))
+        for result in (first, second):
+            self.assertEqual(result.catalogue["institutions"]["HDCITY"]["non_funded"]["full_day"], AFTERNOON_UUID)
+            self.assertEqual({u.session_id for u in result.unmatched}, {"a", "b"})
+
+    def test_a_duplicate_with_no_existing_id_leaves_the_slot_empty(self):
+        result = pull_sessions.pull_all(client=FakeRest(
+            {CITY_ID: [session("a", "Full Day"), session("b", "Full Day")], CW_ID: []}))
+        self.assertNotIn("full_day", result.catalogue["institutions"]["HDCITY"]["non_funded"])
+
+    def test_the_same_session_listed_twice_is_not_ambiguous_and_other_slots_still_write(self):
+        result = pull_sessions.pull_all(client=FakeRest(
+            {CITY_ID: [session("a", "Full Day"), session("a", "Full Day"), session("m", "Morning"),
+                       session("x1", "Afternoon"), session("x2", "Afternoon")], CW_ID: []}))
+        city = result.catalogue["institutions"]["HDCITY"]["non_funded"]
+        self.assertEqual((city["full_day"], city["morning"]), ("a", "m"))
+        self.assertNotIn("afternoon", city)
+        self.assertEqual({u.session_id for u in result.unmatched}, {"x1", "x2"})
+        self.assertEqual(result.written_counts["HDCITY"], 2)
+
+    def test_the_summary_carries_the_slot(self):
+        result = pull_sessions.pull_all(client=FakeRest(
+            {CITY_ID: [session("a", "Full Day"), session("b", "Full Day")], CW_ID: []}))
+        summary = pull_sessions.summary_payload(result)
+        self.assertEqual({row["slot"] for row in summary["unmatched"]}, {"non_funded.full_day"})
+
+
 class MergeBehaviorTests(PullSessionsTestCase):
     """A partial run (a failed or skipped institution) must not lose data."""
 

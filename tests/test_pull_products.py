@@ -589,9 +589,10 @@ class WriteHalfProductsTests(PullProductsTestCase):
             {**FULL_IDS, **HALF_IDS},
         )
 
-    def test_a_pull_with_no_halves_drops_stale_half_ids(self):
-        # A previous pull stored halves; Famly no longer has them. They must
-        # not be kept alive next to the fresh full pair.
+    def test_a_pull_with_no_halves_keeps_the_existing_half_ids_and_reports_the_failure(self):
+        # A previous pull stored halves; this pull could not resolve them (Famly shows no "(1/2)" product).
+        # Removing a working half pair would turn every half-day plan into a hard error, so the existing
+        # half ids stay and the failure is reported (half_products_failed).
         self.write_existing_institution_defaults(
             {
                 "institutions": {
@@ -611,8 +612,28 @@ class WriteHalfProductsTests(PullProductsTestCase):
         pull_products.write_addon_products(result, path=self.institution_defaults_file)
 
         entry = self.written()["institutions"]["HDCITY"]
-        self.assertEqual(entry["addonProducts"], FULL_IDS)
+        self.assertEqual(entry["addonProducts"], {
+            **FULL_IDS, "halfMealsProductId": "stale-half-meals", "halfActivitiesProductId": "stale-half-activities"})
         self.assertEqual(entry["ruleGroupId"], "rg-keep")
+        self.assertIn("HDCITY", result.half_products_failed)
+
+    def test_a_failed_half_pull_with_no_existing_halves_writes_none(self):
+        self.write_existing_institution_defaults(
+            {"institutions": {"HDCITY": {"addonProducts": {"mealsProductId": "old-meals",
+                                                           "activitiesProductId": "old-activities"}}}})
+        result = pull_products.pull_all(client=self.clean_client())
+        pull_products.write_addon_products(result, path=self.institution_defaults_file)
+        self.assertEqual(self.written()["institutions"]["HDCITY"]["addonProducts"], FULL_IDS)
+
+    def test_a_clean_half_pull_still_replaces_the_half_ids(self):
+        self.write_existing_institution_defaults(
+            {"institutions": {"HDCITY": {"addonProducts": {**FULL_IDS, "halfMealsProductId": "old-half",
+                                                           "halfActivitiesProductId": "old-half-2"}}}})
+        result = pull_products.pull_all(client=FakeRest(
+            bodies={CITY_ID: products_body(with_halves()), CW_ID: products_body(with_halves())}))
+        pull_products.write_addon_products(result, path=self.institution_defaults_file)
+        self.assertEqual(self.written()["institutions"]["HDCITY"]["addonProducts"], {**FULL_IDS, **HALF_IDS})
+        self.assertEqual(result.half_products_failed, {})
 
     def test_a_broken_full_pair_leaves_existing_halves_untouched_too(self):
         existing = {

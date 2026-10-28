@@ -6,8 +6,11 @@ The five files (see integrations/reference_files.py) live in REFERENCE_DIR on th
      against the STAGED copies (the pulls only read Famly; every path they write is a staged one);
   2. if any pull reports an error for any institution: replaces nothing, alerts, exits 1;
   3. validates each staged file: valid JSON, not empty, and its leaf entry count (session, group, product
-     and default ids) has not dropped by more than 20 percent against the live file. If any file fails the
-     whole refresh is refused, every live file is kept, and one alert gives file, old and new counts;
+     and default ids) has not dropped by more than 20 percent against the live file. It also refuses a
+     staged institution_defaults.json that LACKS a half-day add-on pair the live file has (a removal), and a
+     sessions pull whose UNMATCHED set holds a session id that is not in the known set recorded beside the
+     reference files (see below). If anything fails the whole refresh is refused, every live file is kept,
+     and one alert says why (counts, and ids for unmatched sessions);
   4. otherwise backs up each file that changed (a timestamped .bak next to it), puts each staged file in
      place with an atomic os.replace (a failure part-way restores the files already replaced), then prunes
      the backups to the newest KEEP_BACKUPS per file;
@@ -15,7 +18,19 @@ The five files (see integrations/reference_files.py) live in REFERENCE_DIR on th
      when institution_defaults.json changed (it changes what plans cost). Nothing is posted when nothing
      changed.
 
-`--dry-run` stops after validation and the diff: nothing is replaced and nothing is posted.
+`--dry-run` stops after validation and the diff: nothing is replaced and nothing is posted; it also reports,
+per institution, the unmatched sessions, the ambiguous slots and the half-pair status.
+
+UNMATCHED SESSIONS. A session whose title does not parse, or two sessions claiming one slot
+(`ambiguous_slot`), is unmatched: nothing is written for it, so its slot keeps the id it had (possibly stale)
+or stays empty. The ids that are known and reviewed are kept in KNOWN_FILE_NAME in REFERENCE_DIR.
+  * no unmatched sessions: passes, whether or not a known set is recorded;
+  * unmatched sessions and no recorded set: refused until `--record-unmatched-baseline` records them;
+  * a recorded set: refused only for an id that is NOT in it (Slack lists the new ids and counts);
+  * `--accept-unmatched ID` (repeatable) adds a reviewed id: it must be unmatched now, and it is logged.
+After a successful run the set becomes (known and still unmatched) plus the accepted ids, so an id that was
+resolved and breaks again is new again. The set is written only after a successful run, never on a refusal.
+Product and group unmatched stay warnings (log and report).
 
 Never touched: catalogue.json and funding_rules.json (hand-maintained) or any file outside the five.
 Ids, codes and counts only in the log and in Slack; the pulls' own logging is unchanged. Exit 0 on success
@@ -41,10 +56,13 @@ from . import messages
 logger = logging.getLogger(__name__)
 
 STAGING_DIR_NAME = ".staging"
+KNOWN_FILE_NAME = "unmatched_sessions_known.json"
 KEEP_BACKUPS = 5
 MAX_DROP_PERCENT = 20
 STAMP_FORMAT = "%Y%m%dT%H%M%SZ"
 PRICING_FILE = "institution_defaults"
+HALF_FIELDS = ("halfMealsProductId", "halfActivitiesProductId")
+AMBIGUOUS_SLOT = "ambiguous_slot"
 
 
 # --------------------------------------------------------------------------- #
@@ -126,6 +144,106 @@ def pull_problems(outcome) -> dict[str, list[str]]:
         if items:
             problems.setdefault(name, []).extend(items)
     return problems
+
+
+# --------------------------------------------------------------------------- #
+# Half pair, unmatched sessions and the known set
+# --------------------------------------------------------------------------- #
+def _filled(value) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _half_pair(data, code: str) -> bool:
+    """True when `code`'s addonProducts holds BOTH half ids."""
+    institutions = data.get("institutions") if isinstance(data, dict) else None
+    entry = institutions.get(code) if isinstance(institutions, dict) else None
+    addon = entry.get("addonProducts") if isinstance(entry, dict) else None
+    return isinstance(addon, dict) and all(_filled(addon.get(field)) for field in HALF_FIELDS)
+
+
+def half_pair_removed(live, staged) -> list[str]:
+    """Institution codes whose live file has a half pair that the staged file lacks."""
+    institutions = live.get("institutions") if isinstance(live, dict) else None
+    if not isinstance(institutions, dict):
+        return []
+    return sorted(str(code) for code in institutions if _half_pair(live, code) and not _half_pair(staged, code))
+
+
+def half_pair_status(staged, outcome) -> dict[str, str]:
+    """Per institution: present | failed_kept (the pull failed and the file still has them) | failed_missing | absent."""
+    institutions = staged.get("institutions") if isinstance(staged, dict) else None
+    failed = set(getattr(outcome.results.get("products"), "half_products_failed", None) or {})
+    status = {}
+    for code in sorted(institutions or {}):
+        has = _half_pair(staged, code)
+        if code in failed:
+            status[str(code)] = "failed_kept" if has else "failed_missing"
+        else:
+            status[str(code)] = "present" if has else "absent"
+    return status
+
+
+def unmatched_sessions(outcome) -> tuple[dict[str, list[str]], dict[str, int]]:
+    """({institution: unmatched session ids}, {institution: ambiguous slot count}) from the sessions pull. A
+    session with no id is keyed '<institution>:no_id'. Ids and counts only."""
+    result = outcome.results.get("sessions")
+    ids: dict[str, set[str]] = {}
+    slots: dict[str, set[str]] = {}
+    for item in getattr(result, "unmatched", None) or []:
+        code = str(getattr(item, "institution", "") or "?")
+        ids.setdefault(code, set()).add(str(getattr(item, "session_id", None) or f"{code}:no_id"))
+        if getattr(item, "reason", None) == AMBIGUOUS_SLOT and getattr(item, "slot", None):
+            slots.setdefault(code, set()).add(item.slot)
+    return ({c: sorted(v) for c, v in sorted(ids.items())}, {c: len(v) for c, v in sorted(slots.items())})
+
+
+def load_known(path: Path) -> set[str] | None:
+    """The recorded known unmatched session ids, or None when no set has been recorded (missing or unreadable)."""
+    data = load(path)
+    ids = data.get("ids") if isinstance(data, dict) else None
+    return {str(i) for i in ids} if isinstance(ids, list) else None
+
+
+def save_known(path: Path, ids: set[str], now: datetime) -> None:
+    """Write the known set atomically (a temp file beside it, then os.replace)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(path.name + ".new")
+    temp.write_text(json.dumps({"recorded": now.strftime(STAMP_FORMAT), "ids": sorted(ids)}, indent=2) + "\n",
+                    encoding="utf-8")
+    os.replace(temp, path)
+
+
+def _by_institution(current: dict[str, list[str]], only: set[str]) -> str:
+    parts = []
+    for code, ids in current.items():
+        mine = [i for i in ids if i in only]
+        if mine:
+            shown = ", ".join(mine[:messages.MAX_IDS])
+            parts.append(f"{code} {len(mine)} ({shown}{' ...' if len(mine) > messages.MAX_IDS else ''})")
+    return "; ".join(parts)
+
+
+def unmatched_refusal(current: dict[str, list[str]], known: set[str] | None, accept: set[str],
+                      baseline: bool) -> dict | None:
+    """A refusal item, or None. See the module text for the rules."""
+    every = {i for ids in current.values() for i in ids}
+    bad_accept = sorted(accept - every)
+    if bad_accept:
+        return {"file": "session_catalogue", "old": 0, "new": 0, "reason": "accepted id is not unmatched",
+                "text": f"--accept-unmatched named an id that is not unmatched now: {', '.join(bad_accept)}"}
+    if not every:
+        return None
+    if known is None and not baseline:
+        return {"file": "session_catalogue", "old": 0, "new": len(every), "reason": "no baseline",
+                "text": f"{len(every)} unmatched session(s) and no baseline recorded; review them, then run with "
+                        f"--record-unmatched-baseline: {_by_institution(current, every)}"}
+    allowed = (known or set()) | accept | (every if baseline else set())
+    new = every - allowed
+    if new:
+        return {"file": "session_catalogue", "old": 0, "new": len(new), "reason": "new unmatched sessions",
+                "text": f"{len(new)} NEW unmatched session(s) ({len(every) - len(new)} known): "
+                        f"{_by_institution(current, new)}"}
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -260,17 +378,20 @@ def _result(started: float, **fields) -> dict:
     return fields
 
 
-def run(*, dry_run: bool = False, post=None, pull=None, replace=os.replace, now: datetime | None = None) -> dict:
+def run(*, dry_run: bool = False, post=None, pull=None, replace=os.replace, now: datetime | None = None,
+        accept_unmatched=(), record_baseline: bool = False, known_path: Path | None = None) -> dict:
     """Run the refresh. Returns counts and codes only; `exit` is the process exit code."""
     started = time.monotonic()
     post = post or slack.post_notice
     pull = pull or pull_references.pull_all_references
     mode = "dry_run" if dry_run else "write"
+    accept = {str(i).strip() for i in accept_unmatched if str(i).strip()}
 
     directory = reference_files.reference_dir()
     if directory is None:
         logger.error("reference-refresh: REFERENCE_DIR is not set; refusing to run (it would write into the repo)")
         return _result(started, ok=False, mode=mode, code="reference_dir_not_set")
+    known_path = known_path or directory / KNOWN_FILE_NAME
 
     live = reference_files.all_paths()
     staging = directory / STAGING_DIR_NAME
@@ -307,6 +428,11 @@ def run(*, dry_run: bool = False, post=None, pull=None, replace=os.replace, now:
             old_leaves = leaves(old_data) or {}
             count, reason = validate(name, new_data, old_leaves)
             files[name] = {"old": len(old_leaves), "new": count, "refused": reason}
+            if not reason and name == PRICING_FILE:
+                removed = half_pair_removed(old_data, new_data)
+                if removed:
+                    reason = f"half-day add-on pair removed for {', '.join(removed)}"
+                    files[name]["refused"] = reason
             if reason:
                 refusals.append({"file": name, "old": len(old_leaves), "new": count, "reason": reason})
                 continue
@@ -316,16 +442,47 @@ def run(*, dry_run: bool = False, post=None, pull=None, replace=os.replace, now:
         counts = {name: {k: sum(len(c[k]) for c in per.values()) for k in ("added", "removed", "changed")}
                   for name, per in changes.items()}
 
+        # Unmatched sessions: only an id outside the recorded known set refuses.
+        current, ambiguous = unmatched_sessions(outcome)
+        known = load_known(known_path)
+        every = {i for ids in current.values() for i in ids}
+        refusal = unmatched_refusal(current, known, accept, record_baseline)
+        if refusal:
+            refusals.append(refusal)
+        report = {
+            "unmatchedSessions": {code: len(ids) for code, ids in current.items()},
+            "ambiguousSlots": ambiguous,
+            "halfPair": half_pair_status(load(staged[PRICING_FILE]), outcome),
+            "newUnmatchedSessions": len(every - (known or set()) - accept),
+            "knownSetRecorded": known is not None,
+            "productsUnmatched": len(getattr(outcome.results.get("products"), "unmatched", None) or []),
+            "groupsUnmatched": len(getattr(outcome.results.get("groups"), "unmatched", None) or []),
+        }
+        if report["productsUnmatched"] or report["groupsUnmatched"]:
+            logger.warning("reference-refresh: unmatched products=%d groups=%d (warnings only)",
+                           report["productsUnmatched"], report["groupsUnmatched"])
+
         if refusals:
-            logger.error("reference-refresh: refused %s", [(r["file"], r["old"], r["new"], r["reason"]) for r in refusals])
+            logger.error("reference-refresh: refused %s",
+                         [(r["file"], r["old"], r["new"], r["reason"]) for r in refusals])
             posted = False if dry_run else _post(post, messages.refused(refusals))
-            return _result(started, ok=False, mode=mode, code="refused", files=files, famlyCalls=famly_calls,
-                           posted=posted)
+            return _result(started, ok=False, mode=mode, code="refused", files=files, report=report,
+                           famlyCalls=famly_calls, posted=posted)
+
+        # What the known set becomes after a successful run: the ids still unmatched that were known, plus the
+        # ones just accepted or baselined. Written only after the replace has succeeded, never on a refusal.
+        next_known = ((known or set()) & every) | accept | (every if record_baseline else set())
+        write_known = not dry_run and (next_known != known if known is not None else record_baseline)
+        for accepted in sorted(accept):
+            logger.info("reference-refresh: accepted unmatched session id=%s", accepted)
 
         if dry_run or not changes:
+            if write_known:
+                save_known(known_path, next_known, now or datetime.now(timezone.utc))
+                logger.info("reference-refresh: known unmatched set recorded (%d id(s))", len(next_known))
             logger.info("reference-refresh: %s, %d file(s) would change", mode, len(changes))
             return _result(started, ok=True, mode=mode, code="dry_run" if dry_run else "no_change", files=files,
-                           changes=counts, famlyCalls=famly_calls)
+                           changes=counts, report=report, famlyCalls=famly_calls)
 
         stamp = (now or datetime.now(timezone.utc)).strftime(STAMP_FORMAT)
         changed = [name for name in reference_files.NAMES if name in changes]
@@ -333,15 +490,19 @@ def run(*, dry_run: bool = False, post=None, pull=None, replace=os.replace, now:
         if not ok:
             logger.error("reference-refresh: replace failed at %s; restored %d file(s)", failed, count)
             posted = _post(post, messages.replace_failed(failed, count))
-            return _result(started, ok=False, mode=mode, code="replace_failed", files=files, famlyCalls=famly_calls,
-                           posted=posted)
+            return _result(started, ok=False, mode=mode, code="replace_failed", files=files, report=report,
+                           famlyCalls=famly_calls, posted=posted)
 
+        if write_known:
+            save_known(known_path, next_known, now or datetime.now(timezone.utc))
+            logger.info("reference-refresh: known unmatched set recorded (%d id(s))", len(next_known))
         pruned = sum(prune_backups(live[name]) for name in reference_files.NAMES)
         pricing = {code: sorted(kinds["added"] + kinds["removed"] + kinds["changed"])
                    for code, kinds in changes.get(PRICING_FILE, {}).items()}
         posted = _post(post, messages.summary(changes, pricing))
         logger.info("reference-refresh: replaced %s; pruned %d backup(s); famly calls %d", changed, pruned, famly_calls)
         return _result(started, ok=posted, mode=mode, code="replaced" if posted else "replaced_post_failed",
-                       files=files, changes=counts, famlyCalls=famly_calls, pruned=pruned, posted=posted)
+                       files=files, changes=counts, report=report, famlyCalls=famly_calls, pruned=pruned,
+                       posted=posted)
     finally:
         shutil.rmtree(staging, ignore_errors=True)

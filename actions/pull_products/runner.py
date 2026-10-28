@@ -53,9 +53,11 @@ TWO SEPARATE CONCERNS, not to be confused:
      reported (`half_products_failed`) but does NOT block the full pair --
      an institution with no half products still needs its full pair
      resolved, and a half-day booking only fails (in hubspot_flatten, naming
-     the missing title) if one is actually requested. A failed half pull also
-     leaves the halves out of what is written, so a stale half id is never
-     kept alive next to a fresh full pair.
+     the missing title) if one is actually requested. A failed half pull KEEPS
+     the half ids the file already has (removing a working half pair would turn
+     every half-day plan into a hard error) and reports the failure; `reference-
+     refresh` shows it and a refresh that would REMOVE a present half pair is
+     refused.
 
 SHARED FILE, SEPARATE OWNERSHIP: `institution_defaults.json` is also written
 by `actions/pull_institution_defaults` (ruleGroupId + schedules). Each pull
@@ -463,7 +465,7 @@ def write_addon_products(result: PullResult, path: Path | None = None) -> Path |
 
     Backs up the existing file first, same convention as every other pull.
     Only the `addonProducts` key of each successfully-resolved institution is
-    touched -- any `ruleGroupId`/`schedules` already there (written by
+    touched (an institution whose HALF pair failed keeps the half ids it already had) -- any `ruleGroupId`/`schedules` already there (written by
     `pull_institution_defaults`) is preserved untouched, and so is every
     OTHER institution's entire entry, whether or not it was in this run.
 
@@ -485,6 +487,16 @@ def write_addon_products(result: PullResult, path: Path | None = None) -> Path |
     for code, addon in result.addon_products.items():
         existing_entry = merged_institutions.get(code)
         entry = dict(existing_entry) if isinstance(existing_entry, dict) else {}
+        addon = dict(addon)
+        if code in result.half_products_failed:
+            # The half pair did not resolve THIS run (a missing or duplicated title): keep the half ids the
+            # file already has rather than removing them. Removing a working half pair would turn
+            # every half-day plan into a hard error; the failure is still reported (half_products_failed).
+            existing_addon = entry.get("addonProducts")
+            for field_name in institution_defaults._HALF_ADDON_PRODUCT_FIELDS:
+                kept = existing_addon.get(field_name) if isinstance(existing_addon, dict) else None
+                if field_name not in addon and isinstance(kept, str) and kept.strip():
+                    addon[field_name] = kept
         entry["addonProducts"] = addon
         merged_institutions[code] = entry
 

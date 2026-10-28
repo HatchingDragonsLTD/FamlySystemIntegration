@@ -103,6 +103,8 @@ class UnmatchedSession:
     session_id: str | None
     title: str
     reason: str
+    # Set for AMBIGUOUS_SLOT: the catalogue slot two or more sessions claim (e.g. "funded.no_meals.morning").
+    slot: str | None = None
 
 
 @dataclass
@@ -227,6 +229,16 @@ def _read_existing_catalogue(path: Path) -> dict:
         ) from exc
 
     return raw if isinstance(raw, dict) else {}
+
+
+AMBIGUOUS_SLOT = "ambiguous_slot"
+
+
+def _slot_key(parsed) -> str:
+    """The catalogue slot a parsed title maps to, as a dotted key (ids and structure only)."""
+    if parsed.funded:
+        return f"funded.{parsed.variant}.{parsed.slot}"
+    return f"non_funded.{parsed.slot}"
 
 
 def _merge_institution(existing: Any, new_entries: dict) -> dict:
@@ -364,6 +376,12 @@ def pull_all(
         new_entries: dict = {"funded": {}, "non_funded": {}}
         new_titles: dict[str, str] = {}
         count = 0
+        # slot key -> the session ids that parse to it, in the order Famly returned them. Two DIFFERENT ids
+        # for one slot are ambiguous: nothing is written for the slot (the existing id stays) and every
+        # session claiming it is reported (reason AMBIGUOUS_SLOT), never "last one wins".
+        slot_claims: dict[str, list[str]] = {}
+        slot_titles: dict[tuple[str, str], str] = {}
+        slot_parsed: dict[str, Any] = {}
 
         for session in sessions:
             title = session.get("title")
@@ -400,12 +418,31 @@ def pull_all(
                 )
                 continue
 
+            slot_key = _slot_key(parsed)
+            claims = slot_claims.setdefault(slot_key, [])
+            if session_id not in claims:
+                claims.append(session_id)
+            slot_parsed[slot_key] = parsed
+            slot_titles[(slot_key, session_id)] = readable_title
+
+        for slot_key, claims in slot_claims.items():
+            if len(claims) > 1:
+                for claimed_id in claims:
+                    unmatched.append(
+                        UnmatchedSession(
+                            institution=code,
+                            session_id=claimed_id,
+                            title=slot_titles[(slot_key, claimed_id)],
+                            reason=AMBIGUOUS_SLOT,
+                            slot=slot_key,
+                        )
+                    )
+                continue
+            parsed = slot_parsed[slot_key]
             if parsed.funded:
-                new_entries["funded"].setdefault(parsed.variant, {})[parsed.slot] = (
-                    session_id
-                )
+                new_entries["funded"].setdefault(parsed.variant, {})[parsed.slot] = claims[0]
             else:
-                new_entries["non_funded"][parsed.slot] = session_id
+                new_entries["non_funded"][parsed.slot] = claims[0]
             count += 1
 
         merged_institutions[code] = _merge_institution(
@@ -553,6 +590,7 @@ def summary_payload(
                 "sessionId": u.session_id,
                 "title": u.title,
                 "reason": u.reason,
+                "slot": u.slot,
             }
             for u in result.unmatched
         ],

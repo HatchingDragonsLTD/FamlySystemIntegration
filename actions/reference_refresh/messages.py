@@ -21,7 +21,10 @@ def refused(refusals: list[dict]) -> str:
     """A staged file failed validation: every live file was kept. Each: name, old, new, reason."""
     lines = ["Reference refresh REFUSED: every live file was kept."]
     for item in refusals:
-        lines.append(f"• {item['file']}: {item['reason']} (old {item['old']} entries, new {item['new']})")
+        if item.get("text"):
+            lines.append(f"• {item['file']}: {item['text']}")
+        else:
+            lines.append(f"• {item['file']}: {item['reason']} (old {item['old']} entries, new {item['new']})")
     return "\n".join(lines)
 
 

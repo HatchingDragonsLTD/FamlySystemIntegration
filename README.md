@@ -889,6 +889,19 @@ gets one summary (ids and counts only), with its own `:warning: pricing inputs c
 validation, the diff counts, the number of Famly calls and the duration, and replaces and posts nothing.
 Exit 0 on success or no change, 1 on any refusal or error (including a failed Slack post after a replace).
 
+**Pricing-input guards.** (1) A pull that cannot resolve an institution's half-day add-on pair
+(`half_products_failed`) now KEEPS the half ids the file already has, and a refresh whose staged
+`institution_defaults.json` lacks a half pair the live file has is refused. (2) When two Famly sessions parse
+to one slot, `pull-sessions` writes nothing for the slot (the existing id stays) and reports every session
+claiming it as unmatched with reason `ambiguous_slot`. (3) Unmatched sessions: the ids already reviewed are kept
+in `REFERENCE_DIR/unmatched_sessions_known.json`. None unmatched: pass. Some unmatched and no recorded set:
+refused until you review them and run `reference-refresh --record-unmatched-baseline` once. After that a refresh
+is refused only for an id not in the set (Slack lists the new ids and counts); review it and add it with
+`reference-refresh --accept-unmatched SESSION_ID` (repeatable; the id must be unmatched now; logged). Ids that
+stop being unmatched leave the set. The set is written only after a successful run, never on a refusal.
+Product and group unmatched stay warnings. `--dry-run` shows per institution the unmatched sessions, ambiguous
+slots and half-pair status (`present`, `absent`, `failed_kept`, `failed_missing`).
+
 `onboard-quality-check` logs the resolved reference directory and each file's age on every run and adds one
 Slack line when any of the five is older than 3 days (or missing).
 
