@@ -7,6 +7,8 @@ import sys
 
 from core.hubspot import HubSpotDealWriter
 
+from actions.onboard_audit import scope as scope_mod
+
 from . import runner
 
 NAME = "hubspot-set-plan-uploaded"
@@ -20,6 +22,7 @@ def add_args(parser: argparse.ArgumentParser) -> None:
                         help="Deal ids (digits, one per line) or the onboard-audit CSV (dealId column)")
     source.add_argument("--operations", action="store_true",
                         help="--from-famly only: every deal in the Operations pipeline (at most 60 writes per run)")
+    scope_mod.add_arguments(parser)
     parser.add_argument("--value", choices=runner.VALUES, default=None,
                         help="The value to set: true or false (not with --from-famly)")
     parser.add_argument("--from-famly", action="store_true",
@@ -36,8 +39,9 @@ def _reconcile(args: argparse.Namespace):
 
     writer = HubSpotDealWriter()
     rest = ReadOnlyRest(RestClient())
+    scope_report: dict = {}
     if args.operations:
-        states = runner.operations_states(writer)
+        states = runner.operations_states(writer, scope_mod.resolve(args.leave_after, args.all_dates), scope_report)
     else:
         with open(args.file, encoding="utf-8-sig") as handle:
             ids = runner.parse_deal_ids(handle.read())
@@ -45,10 +49,15 @@ def _reconcile(args: argparse.Namespace):
     result = runner.reconcile(writer, lambda child_id: bool(plans_runner.run(child_id, client=rest).plans),
                               states, args.confirm)
     result["famlyRequests"] = rest.calls
+    result.update(scope_report)
     return result
 
 
 def handle(args: argparse.Namespace):
+    if (args.leave_after or args.all_dates) and not (args.operations and args.from_famly):
+        print("--leave-after and --all-dates only apply with --operations --from-famly; nothing was done",
+              file=sys.stderr)
+        raise SystemExit(3)
     if args.from_famly:
         if args.value is not None:
             print("--value is not used with --from-famly; nothing was done", file=sys.stderr)
@@ -60,6 +69,9 @@ def handle(args: argparse.Namespace):
             raise SystemExit(3) from None
         except runner.FileRefused as exc:
             print(f"refused: {exc.code}; nothing was done", file=sys.stderr)
+            raise SystemExit(3) from None
+        except scope_mod.ScopeError as exc:
+            print(f"{exc}; nothing was done", file=sys.stderr)
             raise SystemExit(3) from None
         results = result.get("results", {})
         if result["mode"] == "stopped":

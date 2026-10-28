@@ -50,6 +50,8 @@ from actions.pull_roster.runner import ROSTER_TIME_RANGE
 from core import hubspot as hubspot_cfg
 from core.hubspot import HubSpotClient, HubSpotError
 
+from . import scope as scope_mod
+
 logger = logging.getLogger(__name__)
 
 CHILDREN_QUERY = Path(__file__).parent / "audit_children.graphql"
@@ -678,21 +680,28 @@ def operations_deals(hubspot, stages: dict[str, tuple[str, str]], stage_names: l
 
 def run(hubspot, gql, rest, *, deal_ids: list[str] | None = None, operations: bool = False,
         stage_names: list[str] | None = None, site_ids: list[str] | None = None,
-        include_left: bool = False, deals: list[dict] | None = None) -> tuple[dict, list[Row]]:
+        include_left: bool = False, deals: list[dict] | None = None, scope=None) -> tuple[dict, list[Row]]:
     """The audit. Exactly one of `deal_ids` / `operations` / `deals`. Returns (summary, rows).
 
     `deals`: deal dicts the caller already read (the operations search rows), audited as given with no
     further per-deal HubSpot read (onboard-quality-check passes its in-scope subset).
 
     `include_left`: plans of a CHILD-ONLY stage (Left Nursery) are neither read nor compared
-    unless it is set (plan_missing for them is reported only with it)."""
+    unless it is set (plan_missing for them is reported only with it).
+
+    `scope` (a `scope.Scope`, `--operations` only): drop the deals the shared operations scope excludes
+    (see scope.py); the counts included and excluded by reason are in `summary["scope"]`. None = every deal."""
     from actions.read_child_plans import runner as plans_runner
 
     stages = hubspot.stage_names()
+    scope_counts = None
     if deals is not None:
         pairs = [(str(d["id"]), d) for d in deals]
     elif operations:
-        pairs = [(str(d["id"]), d) for d in operations_deals(hubspot, stages, stage_names)]
+        found = operations_deals(hubspot, stages, stage_names)
+        if scope is not None:
+            found, scope_counts = scope_mod.apply(found, stages, scope)
+        pairs = [(str(d["id"]), d) for d in found]
     else:
         pairs = []
         for deal_id in deal_ids or []:
@@ -764,7 +773,10 @@ def run(hubspot, gql, rest, *, deal_ids: list[str] | None = None, operations: bo
             logger.warning("onboard-audit: plan read failed (%s)", type(exc).__name__)
             row.codes.append("plans_not_readable")
 
-    return summarise(rows, hubspot, gql, rest), rows
+    summary = summarise(rows, hubspot, gql, rest)
+    if scope_counts is not None:
+        summary["scope"] = scope_counts
+    return summary, rows
 
 
 def summarise(rows: list[Row], hubspot, gql, rest) -> dict:

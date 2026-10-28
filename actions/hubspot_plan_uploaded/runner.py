@@ -69,21 +69,29 @@ def preflight(writer: HubSpotDealWriter) -> str | None:
     return None
 
 
-def operations_states(writer) -> list[tuple[str, str | None, str | None]]:
-    """(deal id, famly_childid, flag) for every deal in the Operations pipeline, any stage (a child-only
-    stage such as Left Nursery is included): ONE stage-list read plus one search page per 100 deals."""
+def operations_states(writer, scope=None, report: dict | None = None,
+                      property_name: str = PLAN_UPLOADED_PROPERTY) -> list[tuple[str, str | None, str | None]]:
+    """(deal id, famly_childid, value of `property_name`) for the deals of the Operations pipeline: ONE
+    stage-list read plus one search page per 100 deals. `scope` (an `onboard_audit.scope.Scope`) applies the
+    shared operations scope (Leave Date cutoff); None = every deal in any stage, as before. `report`, when
+    given, receives the scope counts under "scope"."""
+    from actions.onboard_audit import scope as scope_mod
     from actions.onboard_dry_run import derive
 
-    ids = [sid for sid, (pipeline, _stage) in writer.stage_names().items()
-           if derive.norm_stage(pipeline) == "operations"]
+    stages = writer.stage_names()
+    ids = [sid for sid, (pipeline, _stage) in stages.items() if derive.norm_stage(pipeline) == "operations"]
     if not ids:
         return []
     rows = writer.search_deals([{"propertyName": "dealstage", "operator": "IN", "values": ids}],
-                               ["famly_childid", PLAN_UPLOADED_PROPERTY])
+                               ["famly_childid", property_name, "end_date", "dealstage"])
+    if scope is not None:
+        rows, counts = scope_mod.apply(rows, stages, scope)
+        if report is not None:
+            report["scope"] = counts
 
     def clean(value):
         return None if value in (None, "") else str(value).strip() or None
-    return [(str(r["id"]), clean(r.get("famly_childid")), clean(r.get(PLAN_UPLOADED_PROPERTY))) for r in rows]
+    return [(str(r["id"]), clean(r.get("famly_childid")), clean(r.get(property_name))) for r in rows]
 
 
 def file_states(writer, ids: list[str]) -> list[tuple[str, str | None, str | None] | tuple[str, str]]:
