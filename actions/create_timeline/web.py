@@ -33,7 +33,7 @@ import os
 import uuid
 
 from actions.plan_write import timeline
-from actions.plan_write.hubspot_intake import unwrap_payload
+from actions.plan_write.hubspot_intake import deal_id_of, unwrap_payload
 from actions.read_child_plans import runner as read_child_plans
 from integrations import slack
 
@@ -100,7 +100,7 @@ def handle(payload: dict) -> tuple[dict, int]:
         data["errors"] = ["body must be a JSON object"]
         return data, 422
 
-    parsed = engine.parse_request(raw)
+    parsed = engine.parse_request(raw, deal_id=deal_id_of(payload))
     if parsed.request is None:
         data["errors"] = parsed.errors
         return data, 422

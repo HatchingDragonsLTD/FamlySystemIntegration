@@ -133,7 +133,14 @@ TIMELINE_FIELDS = (
     "fully_funded",
 )
 
-ALLOWED_FIELDS = frozenset(_PLAN_FIELDS + _DISCOUNT_FIELDS + TIMELINE_FIELDS)
+# The HubSpot deal record id (an id, never personal data), kept so a plan committed on the queue or chain
+# route can set the deal's famly_plan_uploaded. It rides in the stored payload and every segment payload
+# (it is not a TIMELINE_FIELD) and into prepare_preview, which stores it. It is EXCLUDED from the queue's
+# idempotency key (`queue_timeline.jobs.job_key`), so no existing key changes and the deal id never
+# decides whether two requests are the same job.
+DEAL_ID_KEYS = hubspot_intake.DEAL_ID_KEYS
+
+ALLOWED_FIELDS = frozenset(_PLAN_FIELDS + _DISCOUNT_FIELDS + TIMELINE_FIELDS + DEAL_ID_KEYS)
 
 # The funding settings a funded segment carries and a non-funded one must not.
 _FUNDING_SETTING_FIELDS = ("fundingMethod", "fundingHours", "maxFundedMinutes")
@@ -169,13 +176,29 @@ def _text(value) -> str:
     return "" if value is None else str(value).strip()
 
 
+def _digits(value) -> str:
+    text = "" if value is None else str(value).strip()
+    return text if text.isdigit() else ""
+
+
 def clean_payload(raw: dict) -> dict:
-    """The allow-listed fields of `raw`, and nothing else."""
-    return {key: raw[key] for key in ALLOWED_FIELDS if key in raw}
+    """The allow-listed fields of `raw`, and nothing else. A deal id key is kept only as digits."""
+    out = {key: raw[key] for key in ALLOWED_FIELDS if key in raw and key not in DEAL_ID_KEYS}
+    for key in DEAL_ID_KEYS:
+        if _digits(raw.get(key)):
+            out[key] = _digits(raw.get(key))
+    return out
 
 
-def parse_request(raw: dict) -> ParsedRequest:
+_FROM_RAW = object()
+
+
+def parse_request(raw: dict, deal_id=_FROM_RAW) -> ParsedRequest:
     """Read the timeline fields out of the (already unwrapped) payload.
+
+    `deal_id` is the id read from the ORIGINAL body (`hubspot_intake.deal_id_of`, which also looks beside the
+    wrapper that was unwrapped to make `raw`). Passed, it is authoritative: the stored payload carries it
+    as `dealId` and any other deal id key in `raw` is dropped, so a conflict (deal_id None) stores no id.
 
     Dates may arrive as ISO strings or HubSpot epoch milliseconds, exactly as
     `from`/`to` do. A flag that is true but is missing its dates is an error --
@@ -217,10 +240,16 @@ def parse_request(raw: dict) -> ParsedRequest:
     if errors:
         return ParsedRequest(errors=errors)
 
+    payload = clean_payload(raw)
+    if deal_id is not _FROM_RAW:
+        payload = {k: v for k, v in payload.items() if k not in DEAL_ID_KEYS}
+        if _digits(deal_id):
+            payload["dealId"] = _digits(deal_id)
+
     return ParsedRequest(
         request=TimelineRequest(
             child_id=child_id,
-            payload=clean_payload(raw),
+            payload=payload,
             start=start,
             leave=leave,
             funding=funding,

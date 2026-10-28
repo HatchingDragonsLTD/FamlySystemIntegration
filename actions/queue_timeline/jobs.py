@@ -53,6 +53,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from actions.plan_write import preview_store
+from actions.plan_write.hubspot_intake import DEAL_ID_KEYS
 
 logger = logging.getLogger(__name__)
 
@@ -113,9 +114,13 @@ def _now() -> str:
 
 
 def job_key(child_id: str, start: str, payload: dict) -> str:
-    """The idempotency key: child, start date and a hash of the payload."""
+    """The idempotency key: child, start date and a hash of the payload.
+
+    The HubSpot deal id keys are left out of the hash: they are carried for the famly_plan_uploaded flag,
+    not part of what the request IS, so every key stays exactly what it was before they were carried."""
+    hashed = {k: v for k, v in payload.items() if k not in DEAL_ID_KEYS}
     digest = hashlib.sha256(
-        json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+        json.dumps(hashed, sort_keys=True, default=str).encode("utf-8")
     ).hexdigest()
     return hashlib.sha256(f"{child_id}|{start}|{digest}".encode("utf-8")).hexdigest()
 
