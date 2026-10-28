@@ -46,6 +46,8 @@ from actions.plan_write import (
     hubspot_intake,
     input_schema,
     rounding,
+    status_codes,
+    status_sync,
 )
 from actions.plan_write import web as plan_write_web
 from actions.read_child_plans import runner as read_child_plans
@@ -526,6 +528,22 @@ def stop_chain(
         return False
 
 
+def stop_for_attention(chain_id: str, reason: str, **kwargs) -> bool:
+    """`stop_chain` for a FAILURE (a commit that failed or could not be verified, a preview that failed or was
+    refused, a plan that does not join): when this call ended the chain, the deal's famly_plan_status gets
+    needs_attention with a note CODE (never the reason text), off this thread. A reject, an expiry and a
+    cancellation are not failures and use `stop_chain` directly. Never raises."""
+    stopped = stop_chain(chain_id, reason, **kwargs)
+    if stopped:
+        try:
+            chain = chains.get(chain_id)
+            deal = (chain.payload or {}).get("dealId") if chain is not None else None
+            status_sync.attention_async(deal, status_codes.chain_failed(reason))
+        except Exception:  # noqa: BLE001 - reporting must never break the chain's own handling
+            logger.warning("PLAN STATUS chain hook failed chain_id=%s", chain_id)
+    return stopped
+
+
 def stop_for_reject(stored, user) -> bool:
     """The approver rejected a chain preview: the chain ends there."""
     chain = chains.get(stored.chain_id)
@@ -543,7 +561,7 @@ def stop_for_failure(stored, detail: str) -> bool:
     chain = chains.get(stored.chain_id)
     if chain is None:
         return False
-    return stop_chain(
+    return stop_for_attention(
         chain.chain_id,
         f"{heading_text(chain.segments, stored.chain_index)} could not be "
         f"committed: {detail}",
@@ -583,16 +601,16 @@ def present_segment(
             heading=f"*{where}*",
         )
     except Exception as exc:
-        stop_chain(
+        stop_for_attention(
             chain.chain_id, f"the preview of {where} failed: {type(exc).__name__}: {exc}"
         )
         raise
 
     if status != 200:
         problems = "; ".join(str(e) for e in data.get("errors") or []) or f"HTTP {status}"
-        stop_chain(chain.chain_id, f"the preview of {where} was refused: {problems}")
+        stop_for_attention(chain.chain_id, f"the preview of {where} was refused: {problems}")
     elif not data.get("slack_posted"):
-        stop_chain(chain.chain_id, f"the preview of {where} could not be posted to Slack.")
+        stop_for_attention(chain.chain_id, f"the preview of {where} could not be posted to Slack.")
         return data, 502
 
     return data, status
@@ -721,7 +739,7 @@ def continue_after_commit(chain_id: str, index: int) -> None:
         _verify_and_advance(chain, index)
     except Exception as exc:  # noqa: BLE001 - reported to Slack, never raised
         logger.exception("CHAIN CONTINUE FAILED chain_id=%s index=%s", chain_id, index)
-        stop_chain(
+        stop_for_attention(
             chain_id,
             f"after {_short_name(chain, index)} was committed: "
             f"{type(exc).__name__}: {exc}",
@@ -746,7 +764,7 @@ def _verify_and_advance(chain: chains.Chain, index: int) -> None:
         this = _find(plans, plan_id)
 
     if this is None:
-        stop_chain(
+        stop_for_attention(
             chain.chain_id,
             f"{name} was committed (plan `{plan_id}`) but is not in the child's "
             f"plans when read back (looked {READBACK_RETRIES + 1} times, "
@@ -780,7 +798,7 @@ def _verify_and_advance(chain: chains.Chain, index: int) -> None:
         previous_id = chain.segments[index - 1].get("plan_id")
         previous = _find(plans, previous_id)
         if previous is None:
-            stop_chain(
+            stop_for_attention(
                 chain.chain_id,
                 f"the previous plan (`{previous_id}`) is not in the child's plans "
                 f"when read back after {name} was committed.",
@@ -789,7 +807,7 @@ def _verify_and_advance(chain: chains.Chain, index: int) -> None:
 
         problem = join_problem(previous, this)
         if problem:
-            stop_chain(
+            stop_for_attention(
                 chain.chain_id,
                 f"after {name} was committed, {problem}",
                 extra_lines=[
@@ -801,7 +819,7 @@ def _verify_and_advance(chain: chains.Chain, index: int) -> None:
 
     latest = max(plans, key=lambda p: _day(p.from_) or date.min)
     if latest.id != plan_id:
-        stop_chain(
+        stop_for_attention(
             chain.chain_id,
             f"{name} (`{plan_id}`) is not the child's latest-starting plan "
             f"(`{latest.id}` starts {latest.from_}), so the next plan cannot "

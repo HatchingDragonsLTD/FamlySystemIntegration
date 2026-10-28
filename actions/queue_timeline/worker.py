@@ -54,6 +54,8 @@ from actions.plan_write import (
     hubspot_flatten,
     preview_store,
     rounding,
+    status_codes,
+    status_sync,
 )
 from actions.plan_write import web as plan_write_web
 from actions.read_child_plans import runner as read_child_plans
@@ -221,6 +223,10 @@ def fail(job_id: str, reason: str) -> None:
     job = jobs.get(job_id)
     logger.error("QUEUE JOB FAILED job_id=%s: %s", job_id, reason)
     post_failed(job, reason)
+    try:     # the deal's famly_plan_status: a code, off this thread, never the reason text
+        status_sync.attention_async((job.payload or {}).get("dealId"), status_codes.queue_job_failed(reason))
+    except Exception:  # noqa: BLE001 - reporting must never break the queue's own handling
+        logger.warning("PLAN STATUS queue hook failed job_id=%s", job_id)
 
     if jobs.state_increment("consecutive_failures") >= BREAKER_THRESHOLD:
         jobs.set_paused(True)

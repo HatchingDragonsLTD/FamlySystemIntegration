@@ -22,6 +22,8 @@ from tests import fast_sqlite  # noqa: F401  (SQLite without fsync: see the modu
 
 logging.disable(logging.CRITICAL)
 BOOL = {"type": "bool", "fieldType": "booleancheckbox", "options": []}
+STATUS_DEF = {"type": "enumeration", "fieldType": "select", "options": ["plan_created", "needs_attention"]}
+NOTE_DEF = {"type": "string", "fieldType": "text", "options": []}
 
 
 class FakeWriter:
@@ -34,9 +36,25 @@ class FakeWriter:
         self.children = {}                          # deal id -> famly_childid
         self.stages = {}
         self.search_rows = []
+        self.status, self.notes = {}, {}            # deal id -> famly_plan_status / famly_plan_note
+        self.status_writes, self.note_writes, self.order = [], [], []
+        self.definitions = {"famly_plan_uploaded": BOOL, "famly_plan_status": STATUS_DEF, "famly_plan_note": NOTE_DEF}
 
     def deal_property_definitions(self):
-        return {"famly_plan_uploaded": BOOL}
+        return self.definitions
+
+    def read_plan_status_state(self, deal_id):
+        return self.children.get(deal_id), self.status.get(deal_id), self.notes.get(deal_id) or None
+
+    def write_plan_status(self, deal_id, value):
+        self.order.append("status")
+        self.status_writes.append((deal_id, value))
+        self.status[deal_id] = value
+
+    def write_plan_note(self, deal_id, note):
+        self.order.append("note")
+        self.note_writes.append((deal_id, note))
+        self.notes[deal_id] = note
 
     def read_plan_uploaded(self, deal_id):
         self.reads.append(deal_id)
@@ -102,14 +120,17 @@ class CommitSetsTheFlag(AfterCommitCase):
         with self.commit_lands():
             text = self.approve()
         self.assertTrue(text.startswith("✅ Plan committed"))
-        self.assertEqual(self.writer.writes, [("555", "true")])
+        self.assertEqual(self.writer.writes, [("555", "true")])                  # the legacy flag (switch on)
+        self.assertEqual(self.writer.status_writes, [("555", "plan_created")])
+        self.assertEqual(self.writer.note_writes, [("555", "")])                 # the note is cleared
 
     def test_a_value_that_is_already_true_writes_nothing(self):
         self.writer.flags["555"] = "true"
+        self.writer.status["555"] = "plan_created"
         self.save()
         with self.commit_lands():
             self.approve()
-        self.assertEqual(self.writer.writes, [])
+        self.assertEqual((self.writer.writes, self.writer.status_writes, self.writer.note_writes), ([], [], []))
         self.assertEqual(self.writer.reads, ["555"])                        # it was read first
 
     def test_a_double_click_sets_it_once(self):
@@ -119,11 +140,12 @@ class CommitSetsTheFlag(AfterCommitCase):
             self.approve()
         self.assertEqual(self.writer.writes, [("555", "true")])
 
-    def test_a_plan_added_alongside_another_leaves_the_flag_alone(self):
+    def test_a_plan_added_alongside_another_writes_plan_created_but_leaves_the_old_flag_alone(self):
         self.save(old_plan_id="existing-plan-1")
         with self.commit_lands():
             self.approve()
-        self.assertEqual((self.writer.reads, self.writer.writes), ([], []))
+        self.assertEqual((self.writer.reads, self.writer.writes), ([], []))      # the legacy flag: untouched
+        self.assertEqual(self.writer.status_writes, [("555", "plan_created")])
 
     def test_a_preview_with_no_deal_id_still_commits_sets_nothing_and_says_so_in_slack(self):
         self.save(deal_id=None)

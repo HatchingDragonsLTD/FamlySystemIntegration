@@ -34,6 +34,7 @@ from actions.read_child_plans import runner as read_child_plans
 from core.rest_client import RestHTTPError
 from integrations import child_lookup, slack
 from tests import fast_sqlite  # noqa: F401  (SQLite without fsync: see the module)
+from tests import null_hubspot
 
 logging.disable(logging.CRITICAL)
 
@@ -207,6 +208,7 @@ class FakeFamly:
 
 class ChainTestCase(unittest.TestCase):
     def setUp(self):
+        null_hubspot.patch_all(self)        # the plan flag / status step never reaches a real HubSpot
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         root = Path(self._tmp.name)

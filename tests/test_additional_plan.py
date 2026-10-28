@@ -21,6 +21,7 @@ from actions.plan_write import approval, plan_flag, preview_store, runner
 from actions.read_child_plans.runner import ChildPlansResult, Plan
 from integrations import slack
 from tests import fast_sqlite  # noqa: F401  (SQLite without fsync: see the module)
+from tests import null_hubspot
 
 logging.disable(logging.CRITICAL)
 
@@ -284,7 +285,8 @@ class ApproveThroughCommitTests(unittest.TestCase):
         live.start()
         self.addCleanup(live.stop)
 
-        # The flag step after a commit runs inline here, with no real Slack post and no waiting.
+        # The flag step after a commit runs inline here, with no real Slack post, no HubSpot and no waiting.
+        null_hubspot.patch_all(self)
         for target, name, fake in ((approval, "_spawn", lambda work: work()),
                                    (plan_flag.slack, "post_notice", lambda text: True),
                                    (plan_flag, "_sleep", lambda seconds: None)):

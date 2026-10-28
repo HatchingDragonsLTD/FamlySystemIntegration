@@ -328,6 +328,16 @@ def _set_plan_flag(claimed, plan_id) -> None:
         logger.exception("PLAN FLAG failed preview_id=%s", getattr(claimed, "preview_id", None))
 
 
+def _report_plan_attention(claimed, detail) -> None:
+    """Off the request thread: tell the deal's famly_plan_status a direct commit failed (see plan_flag). The LAST
+    thing `_after_failed_commit` does for a direct commit; it never raises and changes no decision, claim state
+    or message. (A chain's failure is reported by the chain engine.)"""
+    try:
+        _spawn(lambda: plan_flag.report_failed_commit(claimed, detail))
+    except Exception:  # noqa: BLE001 - nothing here may touch the commit outcome that already happened
+        logger.exception("PLAN STATUS hook failed preview_id=%s", getattr(claimed, "preview_id", None))
+
+
 def _start_day(value) -> date | None:
     if not isinstance(value, str) or len(value.strip()) < 10:
         return None
@@ -402,6 +412,7 @@ def _after_failed_commit(claimed, preview_id, detail) -> None:
     """
     if not claimed.chain_id:
         preview_store.release_claim(preview_id or "")
+        _report_plan_attention(claimed, detail)
         return
 
     preview_store.mark(preview_id or "", preview_store.STATUS_FAILED)

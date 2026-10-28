@@ -23,6 +23,7 @@ from unittest import mock
 from actions.plan_write import approval, plan_flag, preview_store
 from actions.read_child_plans.runner import ChildPlansResult, Plan
 from tests import fast_sqlite  # noqa: F401  (SQLite without fsync: see the module)
+from tests import null_hubspot
 
 logging.disable(logging.CRITICAL)
 
@@ -84,8 +85,9 @@ class StoreTestCase(unittest.TestCase):
         live.start()
         self.addCleanup(live.stop)
 
-        # The flag step runs in a background thread after a commit: it may post a Slack line and wait
-        # between plan reads. Neither may happen for real in a test.
+        # The flag step runs in a background thread after a commit: it may post a Slack line, wait between
+        # plan reads and write to the deal. None of that may happen for real in a test.
+        null_hubspot.patch_all(self)
         for target, name, fake in ((plan_flag.slack, "post_notice", lambda text: True),
                                    (plan_flag, "_sleep", lambda seconds: None)):
             patcher = mock.patch.object(target, name, fake)

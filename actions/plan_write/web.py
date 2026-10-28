@@ -36,7 +36,7 @@ from actions.read_child_plans.runner import (
 )
 from integrations import catalogue, child_lookup, slack
 
-from . import auto_round, funded_hours, hubspot_intake, preview_store
+from . import auto_round, funded_hours, hubspot_intake, preview_store, status_codes, status_sync
 from . import warnings as plan_warnings
 
 logger = logging.getLogger(__name__)
@@ -229,13 +229,22 @@ def prepare_preview(
         RestHTTPError: propagated deliberately. The router classifies it, so
             every action reports upstream failures the same way.
     """
-    result = hubspot_intake.handle_intake(
-        payload,
-        version=PLAN_VERSION,
-        dry_run=True,  # never commit from the webhook path
-        old_plan_id=old_plan_id,
-        replace_old_plan=replace_old_plan,
-    )
+    try:
+        result = hubspot_intake.handle_intake(
+            payload,
+            version=PLAN_VERSION,
+            dry_run=True,  # never commit from the webhook path
+            old_plan_id=old_plan_id,
+            replace_old_plan=replace_old_plan,
+        )
+    except Exception as exc:
+        # Famly refused the preview request itself: tell the deal (a code, off this thread), then propagate
+        # exactly as before so the router still classifies it.
+        status = getattr(exc, "status_code", None)
+        if status is not None:
+            status_sync.attention_async(hubspot_intake.deal_id_of(payload),
+                                        status_codes.plan_rejected_by_famly(status))
+        raise
 
     preview = result.result
     warnings = _serialise_warnings(result.warnings)
@@ -253,7 +262,8 @@ def prepare_preview(
 
     if not result.ok or preview is None:
         # Validation failures are a client problem (bad payload) -> 422. Nothing
-        # is posted to Slack: there is no plan to approve.
+        # is posted to Slack: there is no plan to approve. The deal is told (a code, never the error text).
+        status_sync.attention_async(hubspot_intake.deal_id_of(payload), status_codes.plan_rejected(result.errors))
         return Prepared(data=data, status=422, result=result, preview=preview, warnings=warnings)
 
     store_body = result.plan_body or {}

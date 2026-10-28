@@ -915,6 +915,32 @@ CRON_TZ=Europe/London
 If the droplet's cron ignores `CRON_TZ` (see the quality-check note in `docs/status.md`), 03:10 London is
 03:10 UTC in winter and 02:10 UTC in summer.
 
+### Plan status on the deal (`famly_plan_status`, `famly_plan_note`)
+
+The server writes two HubSpot deal properties that workflows can wait on (they replace `famly_plan_uploaded`):
+`famly_plan_status` (dropdown: `plan_created`, `needs_attention`) and `famly_plan_note` (a short CODE, never
+free text, a name or an email). Each is written with one PATCH, never retried and never blocking Famly; a
+missing property or a dropdown value HubSpot does not offer is logged, posted to Slack as a code, and skipped.
+The note is written first, then the status.
+
+- `plan_created` (note cleared): after a commit is confirmed by a live read of the child's plans, for every
+  plan including one added alongside another. A later success overwrites an earlier `needs_attention`.
+- `needs_attention` with a note code: `plan_rejected:<input_invalid|session_catalogue|institution_defaults|
+  addon_products|famly_http_<status>|timeline_invalid|segments_invalid>` (preview or request rejected),
+  `commit_failed_http_4xx`, `commit_failed_http_5xx`, `commit_failed` (a direct commit failed),
+  `commit_unknown` (committed but not confirmed after the live reads), `queue_job_failed[:kind]`,
+  `chain_failed[:kind]`. The deal id comes from the webhook body (`dealId`), the stored preview, the job or the chain.
+- `PLAN_FLAG_LEGACY_WRITE` (default on; only `off` disables it) also sets `famly_plan_uploaded = true` after a
+  confirmed first plan. Delete the old property, then set it to `off`. `hubspot-set-plan-uploaded` keeps working.
+
+Backfill: `python main.py hubspot-set-plan-status --from-famly (--operations | --file PATH) [--confirm]`. A dry
+run unless `--confirm`. It writes `plan_created` only where a live read shows the child has a plan AND the
+deal's status is empty; it never overwrites a status, never writes `needs_attention`, never writes or clears
+a note, skips deals without `famly_childid` or with an unreadable plan list, and writes at most 60 per run
+(`--operations` defers the rest; run again). `--operations` covers the Operations deals in the shared scope
+(Leave Date on or after `ONBOARD_SCOPE_LEAVE_AFTER`, default 2026-01-01, or no Leave Date and not Left Nursery;
+`--leave-after YYYY-MM-DD` and `--all-dates` override it; the output reports counts by reason).
+
 ## The daily people-roster cache (`pull-roster`)
 
 `python main.py pull-roster [--institution CODE] [--dry-run]` refreshes a

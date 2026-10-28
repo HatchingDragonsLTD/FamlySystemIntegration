@@ -25,6 +25,7 @@ caller for a single run only: never stored, logged or printed (CLAUDE.md).
 
 import logging
 import os
+import re
 import time
 from typing import Any, Callable
 
@@ -237,6 +238,18 @@ class HubSpotClient:
             return None if value in (None, "") else str(value).strip() or None
         return clean(props.get("famly_childid")), clean(props.get(PLAN_UPLOADED_PROPERTY))
 
+    def read_plan_status_state(self, deal_id: str) -> tuple[str | None, str | None, str | None]:
+        """(the deal's `famly_childid`, its `famly_plan_status`, its `famly_plan_note`), each None when empty.
+        One read-only GET. Raises HubSpotError (status 404) if there is no deal."""
+        body = self._get(f"/crm/v3/objects/deals/{deal_id}",
+                         {"properties": f"famly_childid,{PLAN_STATUS_PROPERTY},{PLAN_NOTE_PROPERTY}"})
+        props = body.get("properties") or {}
+
+        def clean(value):
+            return None if value in (None, "") else str(value).strip() or None
+        return (clean(props.get("famly_childid")), clean(props.get(PLAN_STATUS_PROPERTY)),
+                clean(props.get(PLAN_NOTE_PROPERTY)))
+
     def search_deals(self, filters: list[dict], properties: list[str], limit: int = 100) -> list[dict]:
         """READ-ONLY deal search (HubSpot's search endpoint is a POST, but it only reads).
 
@@ -357,6 +370,17 @@ WRITABLE_DEAL_PROPERTIES = frozenset(
 # the `hubspot-set-plan-uploaded` command calls, may write it.
 PLAN_UPLOADED_PROPERTY = "famly_plan_uploaded"
 
+# The plan status the deal's workflows wait on (replaces famly_plan_uploaded): a dropdown with exactly these
+# internal values and a short text note that holds a CODE only. Like the old flag they are NOT in
+# WRITABLE_DEAL_PROPERTIES: only the two dedicated writers below may write them, one PATCH each.
+PLAN_STATUS_PROPERTY = "famly_plan_status"
+PLAN_NOTE_PROPERTY = "famly_plan_note"
+PLAN_STATUS_CREATED = "plan_created"
+PLAN_STATUS_NEEDS_ATTENTION = "needs_attention"
+PLAN_STATUS_VALUES = (PLAN_STATUS_CREATED, PLAN_STATUS_NEEDS_ATTENTION)
+# A note is a code: lowercase letters, digits and _ : . , - only (never a name, an email or free text), or empty.
+PLAN_NOTE_PATTERN = re.compile(r"^[a-z0-9_:.,-]{0,100}$")
+
 
 class HubSpotDealWriter(HubSpotClient):
     """A HubSpotClient that can also write the sync properties (and a defaulted
@@ -401,6 +425,30 @@ class HubSpotDealWriter(HubSpotClient):
             json_body={"properties": {PLAN_UPLOADED_PROPERTY: value}},
             attempts=1,
         )
+
+    def write_plan_status(self, deal_id: str, value: str) -> None:
+        """PATCH `famly_plan_status` to `plan_created` or `needs_attention`: ONE request, never retried here.
+
+        Raises:
+            ValueError: any other value (nothing sent).
+            HubSpotError: the request failed.
+        """
+        if value not in PLAN_STATUS_VALUES:
+            raise ValueError("famly_plan_status must be plan_created or needs_attention")
+        self._call("PATCH", f"/crm/v3/objects/deals/{deal_id}",
+                   json_body={"properties": {PLAN_STATUS_PROPERTY: value}}, attempts=1)
+
+    def write_plan_note(self, deal_id: str, note: str) -> None:
+        """PATCH `famly_plan_note` to a CODE (PLAN_NOTE_PATTERN) or to "" (clears it): ONE request, never retried.
+
+        Raises:
+            ValueError: anything that is not a code (nothing sent).
+            HubSpotError: the request failed.
+        """
+        if not isinstance(note, str) or not PLAN_NOTE_PATTERN.match(note):
+            raise ValueError("famly_plan_note must be a code (a-z 0-9 _ : . , -) or empty")
+        self._call("PATCH", f"/crm/v3/objects/deals/{deal_id}",
+                   json_body={"properties": {PLAN_NOTE_PROPERTY: note}}, attempts=1)
 
     def write_deal_properties(self, deal_id: str, properties: dict) -> None:
         """PATCH the deal's sync properties.
