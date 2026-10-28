@@ -8,7 +8,8 @@ package imports no writer. Ids and codes only: no names, emails, phones or addre
   state   {dealId: [alert codes]} in a JSON file beside ONBOARD_STORE_PATH, diffed with the previous run;
   Slack   new issues (never more than MAX_IDS_PER_CODE ids per code), nothing when nothing is new, a
           one-line baseline summary, the Monday digest, a short failure notice. A Slack failure never
-          fails the run.
+          raises, but when this run had something to post and the post failed the state file is NOT
+          advanced (`postFailed`; the CLI exits 1), so the same issues are announced next run.
 """
 
 import json
@@ -151,7 +152,6 @@ def run(hubspot, gql, rest, *, baseline: bool = False, digest: bool = False, pos
     previous = load_state(state_file)
     first_run = previous is None
     new, resolved, persisting = diff(previous or {}, alerts)
-    save_state(state_file, alerts, today)
     report = write_report(rows, reports_dir, today)
     requests = {"hubspot": getattr(hubspot, "calls", None), "famlyGraphql": getattr(gql, "calls", None),
                 "famlyRest": getattr(rest, "calls", None)}
@@ -161,6 +161,7 @@ def run(hubspot, gql, rest, *, baseline: bool = False, digest: bool = False, pos
 
     open_by_code = tiers[config.ALERT]
     posted = False
+    has_post = bool(baseline or first_run or new or digest)
     if baseline or first_run:
         posted = _post(post, messages.quality_baseline(len(rows), sum(open_by_code.values()), len(open_by_code)))
     elif new or digest:
@@ -168,7 +169,15 @@ def run(hubspot, gql, rest, *, baseline: bool = False, digest: bool = False, pos
         posted = _post(post, messages.quality_report(
             refs, open_by_code, resolved, persisting, config.MAX_IDS_PER_CODE,
             digest_tiers=tiers if digest else None))
+    # State advances only once what this run found has been announced (or there was nothing to announce), so
+    # a failed post leaves the previous state and the same issues are new again next run.
+    post_failed = has_post and not posted
+    if post_failed:
+        logger.warning("onboard-quality-check: Slack post failed, state left unchanged")
+    else:
+        save_state(state_file, alerts, today)
     return {"mode": "baseline" if (baseline or first_run) else "digest" if digest else "alerts",
+            "postFailed": post_failed,
             "dealsChecked": len(rows), "openAlertIssues": sum(open_by_code.values()),
             "new": sum(len(v) for v in new.values()), "resolved": resolved, "persisting": persisting,
             "tiers": {name: dict(sorted(counts.items())) for name, counts in tiers.items()},

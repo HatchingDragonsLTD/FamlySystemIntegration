@@ -52,8 +52,12 @@ class QualityCase(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
+    def slack_ok(self, text):
+        self.posts.append(text)
+        return True                                                  # the real notifier returns a bool
+
     def go(self, **kwargs):
-        kwargs.setdefault("post", self.posts.append)
+        kwargs.setdefault("post", self.slack_ok)
         return runner.run(self.hub, self.gql, self.rest, today=TODAY, state_file=self.state,
                           reports_dir=self.reports, **kwargs)
 
@@ -190,14 +194,64 @@ class RunTests(QualityCase):
         self.assertIn("Counted only: 2 issue(s) in 2 code(s)", text)
         self.assertIn("child_start_differs: 1", text)
 
-    def test_a_slack_failure_does_not_fail_the_run(self):
+    def test_a_failed_post_leaves_the_state_file_byte_identical_and_the_cli_exits_non_zero(self):
+        self.audit_returns([row(1, codes=["contact_missing"])])
+        self.go()
+        before = self.state.read_bytes()
+        self.audit_returns([row(1, codes=["contact_missing"]), row(2, codes=["plan_missing"])])
+        for failure in (RuntimeError("slack down"), False):          # raises, or returns False
+            def broken(text, failure=failure):
+                if isinstance(failure, Exception):
+                    raise failure
+                return failure
+            result = self.go(post=broken)
+            self.assertEqual((result["posted"], result["postFailed"], result["new"]), (False, True, 1))
+            self.assertEqual(self.state.read_bytes(), before)
+        self.assertTrue(list(self.reports.glob("quality_*.csv")))     # the CSV is written either way
+        args = argparse.Namespace(baseline=False, digest=False)
+        with mock.patch.object(runner, "run", return_value={"postFailed": True}), \
+                mock.patch("actions.urn_lookup.runner._public_client"), \
+                mock.patch("core.rest_client.RestClient"), \
+                mock.patch.object(audit, "ReadOnlyHubSpot"):
+            with self.assertRaises(SystemExit) as ctx:
+                cli.handle(args)
+        self.assertEqual(ctx.exception.code, 1)
+
+    def test_a_good_post_advances_the_state_and_nothing_to_post_still_advances_it(self):
+        self.audit_returns([row(1, codes=["contact_missing"]), row(2, codes=["plan_missing"])])
+        self.go()
+        self.audit_returns([row(1, codes=["contact_missing"]), row(3, codes=["plan_missing"])])
+        result = self.go()                                           # new issue, post succeeds
+        self.assertEqual((result["posted"], result["postFailed"]), (True, False))
+        self.assertEqual(runner.load_state(self.state), {"1": ["contact_missing"], "3": ["plan_missing"]})
+        self.posts.clear()
+        self.audit_returns([row(1, codes=["contact_missing"])])      # only a resolution: nothing to post
+        result = self.go()
+        self.assertEqual((self.posts, result["posted"], result["postFailed"]), ([], False, False))
+        self.assertEqual(runner.load_state(self.state), {"1": ["contact_missing"]})
+
+    def test_a_failed_post_then_a_good_run_announces_the_same_new_issues(self):
+        self.audit_returns([row(1, codes=["contact_missing"])])
+        self.go()
+        self.audit_returns([row(1, codes=["contact_missing"]), row(2, codes=["plan_missing"])])
+
+        def broken(text):
+            raise RuntimeError("slack down")
+        self.go(post=broken)
+        self.posts.clear()
+        result = self.go()
+        self.assertEqual((result["new"], result["persisting"], result["posted"]), (1, 1, True))
+        self.assertIn("plan_missing: 1 new", self.posts[0])
+
+    def test_a_failed_first_run_post_leaves_no_state_so_the_next_run_is_a_first_run_again(self):
         self.audit_returns([row(1, codes=["contact_missing"])])
 
         def broken(text):
             raise RuntimeError("slack down")
         result = self.go(post=broken)
-        self.assertFalse(result["posted"])
-        self.assertIsNotNone(runner.load_state(self.state))          # the run still recorded its state
+        self.assertEqual((result["mode"], result["postFailed"]), ("baseline", True))
+        self.assertFalse(self.state.exists())
+        self.assertEqual(self.go()["mode"], "baseline")
 
     def test_an_audit_failure_posts_a_failure_notice_with_the_code_only_and_raises(self):
         self.audit_returns([row(1, codes=["contact_missing"])])
