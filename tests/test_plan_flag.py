@@ -386,7 +386,9 @@ class ReconcileCliTests(unittest.TestCase):
         import tempfile
         with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as handle:
             handle.write("\n".join(str(n) for n in range(1, 62)))
+        # a fake token: this test used to pass only because the developer's real one was in .env
         with mock.patch.object(cli, "HubSpotDealWriter", return_value=FakeWriter()), \
+                mock.patch.dict("os.environ", {"FAMLY_ACCESS_TOKEN": "test-token"}), \
                 contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as ctx:
             cli.handle(self.parse("--file", handle.name, "--from-famly"))
         self.assertEqual(ctx.exception.code, 3)
