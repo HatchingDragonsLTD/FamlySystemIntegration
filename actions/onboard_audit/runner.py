@@ -512,6 +512,11 @@ def _end_of(value: str | None) -> str:
 FEE_TOLERANCE = 0.10
 _DAY_KEYS = (("monday", "MONDAY"), ("tuesday", "TUESDAY"), ("wednesday", "WEDNESDAY"),
              ("thursday", "THURSDAY"), ("friday", "FRIDAY"))
+# The literal "none" in a weekday property means the child does not attend that day: not booked, exactly like an
+# empty value (after the trim and lowercase of `normalise_slot`). Any OTHER unknown value stays unreadable, and
+# all five days none or empty is still `plan_input_sessions_missing`. This is the AUDIT's day reading only:
+# plan derivation (`hubspot_flatten.build_session_bookings`) is unchanged and still treats "none" as a slot.
+NOT_ATTENDING = "none"
 
 
 def _slot_by_session(institution: str) -> dict[str, str]:
@@ -600,7 +605,7 @@ def compare_plan(plans: list, deal: dict, institution: str | None, today=None) -
     unreadable = False
     for key, enum in _DAY_KEYS:
         slot = catalogue.normalise_slot(deal.get(key))
-        if not slot:
+        if not slot or slot == NOT_ATTENDING:
             continue
         if slot not in catalogue.VALID_SLOTS:
             unreadable = True

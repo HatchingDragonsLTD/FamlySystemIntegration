@@ -564,3 +564,52 @@ class ReadOnlyGuardTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WeekdayNoneTests(AuditCase):
+    """The literal `none` in monday..friday means the child does not attend that day (audit only)."""
+
+    def set_days(self, **days):
+        self.hub.deals[DEAL].update({day: "" for day in ("monday", "tuesday", "wednesday", "thursday", "friday")})
+        self.hub.deals[DEAL].update(days)
+
+    def test_none_is_skipped_like_an_empty_day_after_the_trim_and_lowercase(self):
+        for value in ("none", "None", "  NONE  "):
+            with self.subTest(value=value):
+                self.set_days(monday="morning", tuesday="Full Day", wednesday=value, friday=value)
+                codes = self.codes()
+                self.assertIn("plan_matches", codes)
+                self.assertNotIn("plan_input_sessions_missing", codes)
+                self.assertNotIn("plan_not_derivable", codes)
+
+    def test_a_typo_or_any_other_unknown_value_still_makes_the_set_unreadable(self):
+        for value in ("nope", "none.", "n/a", "no", "whenever", "half day"):
+            with self.subTest(value=value):
+                self.set_days(monday="morning", tuesday="Full Day", wednesday=value)
+                self.assertIn("plan_input_sessions_missing", self.codes())
+
+    def test_all_five_days_none_or_empty_is_still_sessions_missing(self):
+        self.set_days(monday="none", tuesday="none", wednesday="none", thursday="none", friday="none")
+        self.assertIn("plan_input_sessions_missing", self.codes())
+        self.set_days(monday="none", tuesday="", wednesday="None")
+        codes = self.codes()
+        self.assertIn("plan_input_sessions_missing", codes)
+        self.assertIn("plan_not_derivable", codes)
+
+    def test_a_mix_of_none_and_valid_slots_compares_normally(self):
+        self.set_days(monday="morning", tuesday="none", wednesday="Full Day")
+        self.rest.plans = {"c1": [good_plan(planParts=[{"sessionBookings": [
+            {"sessionId": "s-m", "day": "MONDAY"}, {"sessionId": "s-f", "day": "WEDNESDAY"}]}])]}
+        self.assertIn("plan_matches", self.codes())
+        self.rest.plans = {"c1": [good_plan(planParts=[{"sessionBookings": [          # a booking on the none day
+            {"sessionId": "s-m", "day": "MONDAY"}, {"sessionId": "s-f", "day": "TUESDAY"},
+            {"sessionId": "s-f", "day": "WEDNESDAY"}]}])]}
+        codes = self.codes()
+        self.assertIn("plan_sessions_differ", codes)
+
+    def test_plan_derivation_is_unchanged_and_still_treats_none_as_a_slot(self):
+        from actions.plan_write import hubspot_flatten
+        bookings, errors = hubspot_flatten.build_session_bookings(
+            {"institution": "HDWEST", "monday": "none", "tuesday": "morning"})
+        self.assertEqual(bookings, [])
+        self.assertTrue(any("none" in e and "not a valid slot" in e for e in errors), errors)
