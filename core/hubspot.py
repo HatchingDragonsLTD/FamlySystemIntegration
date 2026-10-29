@@ -378,8 +378,9 @@ PLAN_NOTE_PROPERTY = "famly_plan_note"
 PLAN_STATUS_CREATED = "plan_created"
 PLAN_STATUS_NEEDS_ATTENTION = "needs_attention"
 PLAN_STATUS_VALUES = (PLAN_STATUS_CREATED, PLAN_STATUS_NEEDS_ATTENTION)
-# A note is a code: lowercase letters, digits and _ : . , - only (never a name, an email or free text), or empty.
-PLAN_NOTE_PATTERN = re.compile(r"^[a-z0-9_:.,-]{0,100}$")
+# A note is a code: lowercase letters, digits and _ : . , - + only (never a name, an email or free text), or
+# empty. The `+` is for a "+N" count of further sub-codes (`a,b,c,+2`).
+PLAN_NOTE_PATTERN = re.compile(r"^[a-z0-9_:.,+-]{0,100}$")
 
 
 class HubSpotDealWriter(HubSpotClient):

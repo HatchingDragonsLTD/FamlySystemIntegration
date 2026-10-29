@@ -416,7 +416,7 @@ class HookPointTests(harness.ChainTestCase):
         _data, status = plan_write_web.handle({"properties": bad, "dealId": ID})
         self.assertEqual(status, 422)
         self.assertEqual(self.writer.status_writes, [(ID, "needs_attention")])
-        self.assertEqual(self.writer.note_writes, [(ID, "plan_rejected:input_invalid")])
+        self.assertEqual(self.writer.note_writes, [(ID, "plan_rejected:input_invalid:child_id_missing")])
         self.writer.status_writes.clear(), self.writer.note_writes.clear()
         plan_write_web.handle(bad)
         self.assertEqual((self.writer.status_writes, self.writer.note_writes), ([], []))
@@ -460,7 +460,7 @@ class QueueHookTests(queue_tests.QueueTestCase):
         bad.pop("start_date")
         _data, status = queue_tests.queue_web.handle({"properties": bad, "dealId": ID})
         self.assertEqual(status, 422)
-        self.assertEqual(self.writer.note_writes, [(ID, "plan_rejected:input_invalid")])
+        self.assertEqual(self.writer.note_writes, [(ID, "plan_rejected:input_invalid:start_date_missing")])
 
 
 if __name__ == "__main__":

@@ -930,6 +930,20 @@ The note is written first, then the status.
   `commit_failed_http_4xx`, `commit_failed_http_5xx`, `commit_failed` (a direct commit failed),
   `commit_unknown` (committed but not confirmed after the live reads), `queue_job_failed[:kind]`,
   `chain_failed[:kind]`. The deal id comes from the webhook body (`dealId`), the stored preview, the job or the chain.
+- A rejection note also says WHICH rule failed, as up to three comma-joined sub-codes and then `,+N`, for example
+  `plan_rejected:input_invalid:start_date_missing,no_bookings,+2` or `plan_rejected:segments_invalid:day_slot_invalid`
+  (the fixed table is `SUBCODE_RULES` in `actions/plan_write/status_codes.py`: one code per validation rule, e.g.
+  `child_id_missing`, `start_date_missing`, `start_date_invalid`, `end_date_invalid`, `leave_before_start`,
+  `no_bookings`, `day_slot_invalid`, `institution_missing`, `defaults_incomplete`, `addon_exceeds_days`,
+  `funding_invalid`; anything unrecognised is `other`). Never raw text or values. Every rejected preview, and
+  every rejected queue or chain request, also posts ONE Slack line: the deal id and the code only.
+- `python main.py plan-check --file ids.txt` (read-only, max 60 deals): reads each deal from HubSpot (GET only)
+  and prints, per deal and counted by sub-code, which of those rules its plan inputs would fail. It is PARTIAL:
+  it rebuilds only the inputs the repo reads from the deal (child id, start and end date, site, weekday slots,
+  `billable_fees`) and runs the same intake functions on them. The rest of the plan_preview body (funded,
+  meals and activities, termTimeOnly, add-ons, discounts, site_code, note) is built by the workflow's custom-code
+  action, which is not in this repo, so a deal that passes can still be rejected for those. It also reports
+  `fees_missing`, `fees_unparseable` and `site_unknown`, which only it can see.
 - `PLAN_FLAG_LEGACY_WRITE` (default on; only `off` disables it) also sets `famly_plan_uploaded = true` after a
   confirmed first plan. Delete the old property, then set it to `off`. `hubspot-set-plan-uploaded` keeps working.
 

@@ -121,6 +121,31 @@ def attention_now(deal_id, note_code: str, writer=None, notify=None) -> list[str
         return ["failed"]
 
 
+def rejection_text(deal_id, note_code: str) -> str:
+    """The ONE Slack line for a rejected preview or queue / chain request: the deal id and the note code (which
+    holds the sub-codes), nothing else. No names, values or error text can be in it: a note is a code."""
+    return (f"Plan not created for deal {deal_id or 'unknown'} ({note_code}). Nothing was written to Famly. "
+            "Fix the deal in HubSpot and send it again.")
+
+
+def rejection_now(deal_id, note_code: str, writer=None, notify=None) -> list[str]:
+    """A rejected preview or request: post ONE Slack line (the deal id and the sub-codes), then write
+    needs_attention + the note to the deal when there is a deal id. Never raises."""
+    try:
+        (notify or slack.post_notice)(rejection_text(deal_id, note_code))
+    except Exception as exc:  # noqa: BLE001 - a Slack problem never hides the HubSpot write
+        logger.warning("PLAN STATUS rejection notice failed deal=%s error=%s", deal_id, type(exc).__name__)
+    return attention_now(deal_id, note_code, writer, notify)
+
+
+def rejection_async(deal_id, note_code: str) -> None:
+    """The rejection hook: `rejection_now` off the calling thread. Never raises, never blocks the caller."""
+    try:
+        _spawn(lambda: rejection_now(deal_id, note_code))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("PLAN STATUS rejection hook not started deal=%s error=%s", deal_id, type(exc).__name__)
+
+
 def attention_async(deal_id, note_code: str) -> None:
     """The failure hook: write needs_attention off the calling thread. Never raises, never blocks the caller."""
     if not deal_id:

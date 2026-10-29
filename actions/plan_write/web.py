@@ -242,7 +242,7 @@ def prepare_preview(
         # exactly as before so the router still classifies it.
         status = getattr(exc, "status_code", None)
         if status is not None:
-            status_sync.attention_async(hubspot_intake.deal_id_of(payload),
+            status_sync.rejection_async(hubspot_intake.deal_id_of(payload),
                                         status_codes.plan_rejected_by_famly(status))
         raise
 
@@ -263,7 +263,7 @@ def prepare_preview(
     if not result.ok or preview is None:
         # Validation failures are a client problem (bad payload) -> 422. Nothing
         # is posted to Slack: there is no plan to approve. The deal is told (a code, never the error text).
-        status_sync.attention_async(hubspot_intake.deal_id_of(payload), status_codes.plan_rejected(result.errors))
+        status_sync.rejection_async(hubspot_intake.deal_id_of(payload), status_codes.plan_rejected(result.errors))
         return Prepared(data=data, status=422, result=result, preview=preview, warnings=warnings)
 
     store_body = result.plan_body or {}

@@ -105,7 +105,7 @@ def handle(payload: dict) -> tuple[dict, int]:
     parsed = engine.parse_request(raw, deal_id=deal)
     if parsed.request is None:
         data["errors"] = parsed.errors
-        status_sync.attention_async(deal, status_codes.request_invalid("input_invalid"))
+        status_sync.rejection_async(deal, status_codes.request_invalid("input_invalid", parsed.errors))
         return data, 422
     request = parsed.request
     child_id = request.child_id
@@ -121,7 +121,7 @@ def handle(payload: dict) -> tuple[dict, int]:
         )
     except timeline.TimelineError as exc:
         data["errors"] = [str(exc)]
-        status_sync.attention_async(deal, status_codes.request_invalid("timeline_invalid"))
+        status_sync.rejection_async(deal, status_codes.request_invalid("timeline_invalid", [str(exc)]))
         return data, 422
     data["warnings"] = list(timeline_warnings)
 
@@ -130,7 +130,7 @@ def handle(payload: dict) -> tuple[dict, int]:
     problems = engine.validate_segments(request.payload, segments)
     if problems:
         data["errors"] = problems
-        status_sync.attention_async(deal, status_codes.request_invalid("segments_invalid"))
+        status_sync.rejection_async(deal, status_codes.request_invalid("segments_invalid", problems))
         return data, 422
 
     # Free any child whose chain is waiting on a preview that has expired, this

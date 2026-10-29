@@ -24,6 +24,7 @@ from actions.onboard import cli_phone_audit as onboard_phone_audit
 from actions.onboard import cli_status as onboard_status
 from actions.onboard import cli_worker as onboard_worker
 from actions.onboard_audit import cli as onboard_audit
+from actions.plan_check import cli as plan_check
 from actions.onboard_quality import cli as onboard_quality_check
 from actions.onboard_dry_run import cli as onboard_dry_run
 from actions.plan_write import cli as plan_write
@@ -76,6 +77,7 @@ ACTIONS = [
     hubspot_set_plan_uploaded,
     hubspot_set_plan_status,
     onboard_audit,
+    plan_check,
     onboard_quality_check,
     probe_contact_create,
     probe_bill_payers,
