@@ -146,6 +146,31 @@ def rejection_async(deal_id, note_code: str) -> None:
         logger.warning("PLAN STATUS rejection hook not started deal=%s error=%s", deal_id, type(exc).__name__)
 
 
+def held_text(deal_id, job_id, note_code: str) -> str:
+    """The ONE Slack line for a held queue job: the deal id, the job id and the reason code, nothing else."""
+    return (f"Queue job held for deal {deal_id or 'unknown'}: job {job_id} ({note_code}). The held plan is not "
+            f"created. Approve or reject it in Slack, or run `queue-cancel {job_id}` and send the deal again.")
+
+
+def held_now(deal_id, job_id, note_code: str, post_slack: bool = True, writer=None, notify=None) -> list[str]:
+    """A held queue job: post ONE Slack line (when `post_slack`), then write needs_attention + the note code to
+    the deal when there is a deal id. Never raises."""
+    if post_slack:
+        try:
+            (notify or slack.post_notice)(held_text(deal_id, job_id, note_code))
+        except Exception as exc:  # noqa: BLE001 - a Slack problem never hides the HubSpot write
+            logger.warning("PLAN STATUS held notice failed deal=%s error=%s", deal_id, type(exc).__name__)
+    return attention_now(deal_id, note_code, writer, notify)
+
+
+def held_async(deal_id, job_id, note_code: str, post_slack: bool = True) -> None:
+    """The hold hook: `held_now` off the calling thread. Never raises, never blocks the caller."""
+    try:
+        _spawn(lambda: held_now(deal_id, job_id, note_code, post_slack))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("PLAN STATUS held hook not started deal=%s error=%s", deal_id, type(exc).__name__)
+
+
 def attention_async(deal_id, note_code: str) -> None:
     """The failure hook: write needs_attention off the calling thread. Never raises, never blocks the caller."""
     if not deal_id:

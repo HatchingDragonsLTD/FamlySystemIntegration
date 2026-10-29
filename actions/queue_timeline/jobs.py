@@ -50,9 +50,9 @@ import logging
 import sqlite3
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
-from actions.plan_write import preview_store
+from actions.plan_write import preview_store, status_codes
 from actions.plan_write.hubspot_intake import DEAL_ID_KEYS
 
 logger = logging.getLogger(__name__)
@@ -373,6 +373,48 @@ def undigested_done() -> list[Job]:
             (STATUS_DONE, STATUS_DRY_DONE),
         ).fetchall()
     return [_row_to_job(r) for r in rows]
+
+
+# --------------------------------------------------------------------------- #
+# Held jobs: the reason codes, and the once-per-6-hours Slack line per deal
+# --------------------------------------------------------------------------- #
+HELD_NOTICE_WINDOW = timedelta(hours=6)
+
+
+def held_codes(job: Job) -> list[str]:
+    """The reason codes of a HELD job's held plan: recorded when it was held, else worked out from `detail`
+    (a job held before the codes were recorded). Codes only."""
+    if job.status != STATUS_HELD:
+        return []
+    segment = job.segments[job.next_index] if 0 <= job.next_index < len(job.segments) else {}
+    recorded = segment.get("hold_codes")
+    if isinstance(recorded, list) and recorded:
+        return [str(code) for code in recorded]
+    reasons = [r for r in (job.detail or "").split("; ") if r]
+    return list(dict.fromkeys(status_codes.held_code_of(r) for r in reasons)) or [status_codes.HELD_OTHER]
+
+
+def _held_notice_key(deal_id, job_id: str) -> str:
+    return f"held_notice:{deal_id or 'job-' + job_id}"
+
+
+def stamp_held_notice(deal_id, job_id: str, now: datetime | None = None) -> None:
+    """Record that a held line went out for this deal now (a job's first hold line always goes out)."""
+    state_set(_held_notice_key(deal_id, job_id), (now or datetime.now(timezone.utc)).isoformat())
+
+
+def held_notice_due(deal_id, job_id: str, now: datetime | None = None) -> bool:
+    """True, and stamps now, when no held line went out for this deal in the last 6 hours. ONE conditional
+    upsert, so two simultaneous resends cannot both be told to post."""
+    now = now or datetime.now(timezone.utc)
+    cutoff = (now - HELD_NOTICE_WINDOW).isoformat()
+    with preview_store.open_store() as connection:
+        cursor = connection.execute(
+            "INSERT INTO queue_state (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value WHERE queue_state.value < ?",
+            (_held_notice_key(deal_id, job_id), now.isoformat(), cutoff),
+        )
+        return cursor.rowcount > 0
 
 
 # --------------------------------------------------------------------------- #

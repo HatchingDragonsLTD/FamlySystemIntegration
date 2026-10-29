@@ -34,6 +34,7 @@ from actions.probe_child_create import cli_delete as probe_child_delete
 from actions.probe_contact_create import cli as probe_contact_create
 from actions.queue_timeline import (
     queue_cancel,
+    queue_held,
     queue_list,
     queue_pause,
     queue_resume,
@@ -90,6 +91,7 @@ ACTIONS = [
     queue_worker,
     queue_status,
     queue_list,
+    queue_held,
     queue_cancel,
     queue_pause,
     queue_resume,

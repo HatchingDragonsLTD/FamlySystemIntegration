@@ -13,12 +13,14 @@ and anything it does not recognise becomes the generic code for its kind. Codes 
   commit_failed*           the Approve commit failed (Famly said no, or an unexpected error);
   commit_unknown           the commit went through but the plan could not be confirmed by a live read;
   queue_job_failed:<kind>  a queued job failed;
+  queue_job_held:<reasons> a queued job was held for a human (see HELD_WARNING_CODES and HELD_TEXT_CODES);
   chain_failed:<kind>      a multi-plan chain stopped.
 """
 
 import re
 
 PLAN_REJECTED = "plan_rejected"
+QUEUE_JOB_HELD = "queue_job_held"
 COMMIT_FAILED = "commit_failed"
 COMMIT_FAILED_4XX = "commit_failed_http_4xx"
 COMMIT_FAILED_5XX = "commit_failed_http_5xx"
@@ -189,6 +191,48 @@ def queue_job_failed(reason) -> str:
         if needle in text:
             return f"{QUEUE_JOB_FAILED}:{kind}"
     return QUEUE_JOB_FAILED
+
+
+# A warning that holds a queue job, by its `error` code (Famly's own, or the local kinds in warnings.py). The
+# warning's title and message are never used: a code outside this table is `warning_other`.
+HELD_WARNING_CODES = {
+    "1614173107": "plan_past_child_last_day",
+    "DiscountExcluded": "discount_excluded",
+    "SiteUnresolved": "site_unresolved",
+    "FundingMismatch": "funding_mismatch",
+}
+WARNING_OTHER = "warning_other"
+HELD_OTHER = "other"
+
+# The other reasons a plan is held, matched on the worker's own reason text (never Famly's).
+HELD_TEXT_CODES = (
+    ("rounding was not applied", "rounding_not_applied"),
+    ("the preview has no pricing periods", "no_pricing_periods"),
+    ("is 0 and no funding is applied", "zero_estimate_no_funding"),
+    ("is not above 0", "estimate_not_above_zero"),
+    ("QUEUE_MAX_MONTHLY", "estimate_over_ceiling"),
+    ("QUEUE_ALLOWED_INSTITUTIONS", "institution_not_allowed"),
+    ("not allowed to auto-commit", "institution_not_allowed"),
+)
+
+
+def warning_reason_code(error) -> str:
+    """The reason code for one warning, from its error code only."""
+    return HELD_WARNING_CODES.get(str(error or "").strip(), WARNING_OTHER)
+
+
+def held_code_of(reason) -> str:
+    """The reason code for one hold reason string (the worker's text). `warning:` reasons here have no error
+    code to go on, so they are `warning_other`; the worker maps warnings by their code itself."""
+    text = str(reason or "")
+    if text.startswith("warning:"):
+        return WARNING_OTHER
+    return next((code for needle, code in HELD_TEXT_CODES if needle in text), HELD_OTHER)
+
+
+def queue_job_held(codes) -> str:
+    """The note for a held queue job: `queue_job_held:<reason>[,<reason>...]`, at most NOTE_MAX characters."""
+    return with_subcodes(QUEUE_JOB_HELD, codes or [HELD_OTHER])
 
 
 def chain_failed(reason) -> str:

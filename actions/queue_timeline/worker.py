@@ -254,6 +254,36 @@ def hold(job: jobs.Job, index: int, prepared, reasons: list[str]) -> None:
     plan_write_web.post_prepared(prepared, heading=heading)
     jobs.set_status(job.job_id, jobs.STATUS_HELD, why, preview_id=prepared.preview_id)
     logger.warning("QUEUE JOB HELD job_id=%s index=%d: %s", job.job_id, index, why)
+    _flag_held(job, index, prepared, reasons)
+
+
+def hold_codes(prepared, reasons: list[str]) -> list[str]:
+    """The fixed reason code for each hold reason, in order, without repeats. A warning is mapped by its error
+    code (`status_codes.HELD_WARNING_CODES`, else `warning_other`); its title and message are never used."""
+    warning_codes = iter(
+        status_codes.warning_reason_code(getattr(getattr(w, "warning", w), "error", None))
+        for w in (prepared.result.warnings if prepared.status == 200 else [])
+        if not _informational(w)
+    )
+    codes = [
+        next(warning_codes, status_codes.WARNING_OTHER) if reason.startswith("warning: ")
+        else status_codes.held_code_of(reason)
+        for reason in reasons
+    ]
+    return list(dict.fromkeys(codes))
+
+
+def _flag_held(job: jobs.Job, index: int, prepared, reasons: list[str]) -> None:
+    """Make a hold visible: the reason codes on the job, one Slack line and needs_attention on the deal (off this
+    thread). Never raises and never changes the hold itself."""
+    try:
+        codes = hold_codes(prepared, reasons)
+        jobs.record_segment(job.job_id, index, hold_codes=codes)
+        deal = (job.payload or {}).get("dealId")
+        jobs.stamp_held_notice(deal, job.job_id)
+        status_sync.held_async(deal, job.job_id, status_codes.queue_job_held(codes))
+    except Exception:  # noqa: BLE001 - reporting must never break the queue's own handling
+        logger.warning("PLAN STATUS held hook failed job_id=%s", job.job_id)
 
 
 # --------------------------------------------------------------------------- #
@@ -819,6 +849,27 @@ def list_jobs(status_filter: str | None = None) -> dict:
         for j in jobs.list_jobs(status_filter)
     ]
     return {"jobs": rows, "count": len(rows)}
+
+
+def held_list() -> dict:
+    """queue-held: every held job as ids and codes only. Read-only."""
+    now = _now()
+    rows = []
+    for job in jobs.list_jobs(jobs.STATUS_HELD):
+        try:
+            age = round((now - datetime.fromisoformat(job.updated_at)).total_seconds() / 3600, 1)
+        except (TypeError, ValueError):
+            age = None
+        rows.append(
+            {
+                "dealId": (job.payload or {}).get("dealId"),
+                "childId": job.child_id,
+                "jobId": job.job_id,
+                "reasonCode": ",".join(jobs.held_codes(job)),
+                "ageHours": age,
+            }
+        )
+    return {"held": rows, "count": len(rows)}
 
 
 def cancel(job_id: str) -> dict:

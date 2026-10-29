@@ -111,4 +111,21 @@ def handle(payload: dict) -> tuple[dict, int]:
 
     if enqueued.outcome == jobs.ALREADY_QUEUED:
         logger.info("QUEUE_TIMELINE already queued as job_id=%s", job.job_id)
+        if job.status == jobs.STATUS_HELD:
+            _reflag_held(data, job, deal)
     return data, 200
+
+
+def _reflag_held(data: dict, job: jobs.Job, deal) -> None:
+    """A resend for a deal whose job is HELD: still `already_queued`, but never quiet. The deal is flagged
+    needs_attention again, Slack gets one line per deal per 6 hours, and the body says why. Never raises."""
+    try:
+        codes = jobs.held_codes(job)
+        data["reason_code"] = ",".join(codes)
+        deal = deal or (job.payload or {}).get("dealId")
+        status_sync.held_async(
+            deal, job.job_id, status_codes.queue_job_held(codes), post_slack=jobs.held_notice_due(deal, job.job_id)
+        )
+        logger.warning("QUEUE_TIMELINE resend for held job_id=%s: %s", job.job_id, data["reason_code"])
+    except Exception:  # noqa: BLE001 - the acknowledgement must still go out
+        logger.warning("PLAN STATUS held resend hook failed job_id=%s", job.job_id)
