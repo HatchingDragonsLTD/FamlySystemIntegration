@@ -9,6 +9,7 @@ Add new entries as one or two lines. When this file passes 8 KB, move the oldest
 - Quality check cron: `onboard-quality-check`, read-only, Mon (digest) and Thu, 07:30 London, Slack alerts on new issues, CSV in reports/.
 - Reference refresh cron: `reference-refresh`, daily 03:10 London, needs REFERENCE_DIR, validates and backs up before replacing the five generated reference files.
 - Test suite guard: tests blank credentials and refuse real network calls (`tests/__init__.py`, `tests/network_guard.py`).
+- Prod .env confirmed 2026-11-18 (screenshot): COMMIT_ENABLED true, allow-list `*`, QUEUE_MODE auto, ONBOARD_MODE live, ONBOARD_BILL_PAYER on, PLAN_FLAG_LEGACY_WRITE off. Queue: 303 done, 0 held, services active.
 
 ## .env switches (names only; values live in .env)
 - COMMIT_ENABLED (master switch for Approve commits; dev false) and COMMIT_ALLOWED_CHILD_IDS (allow-list, `*` = all).
@@ -21,7 +22,6 @@ Add new entries as one or two lines. When this file passes 8 KB, move the oldest
 
 ## Open work and parked
 - HubSpot workflow: add the deal record id to the plan_preview webhook body and remove the step that sets famly_plan_uploaded (no flag is written until the id is sent).
-- HubSpot dropdowns: `child_linked` and `bill_payer_linked` on famly_sync_status must be offered, or the status stays at the earlier value.
 - Parked: adding a HUBSPOT reference to an EXISTING child (needs a full children.update echo; not built); adding a reference to an existing contact (full contacts update; not built); parent app roles and logins; Shoreditch URN site code.
 - Delete when done: temporary `urn_lookup` and `delete_plans` actions; probe commands (`probe-bill-payers`, `probe-child-create`, `probe-contact-create`) once no longer needed.
 
@@ -38,7 +38,7 @@ Add new entries as one or two lines. When this file passes 8 KB, move the oldest
 - `python main.py chain-status|chain-resume|chain-cancel|chain-sweep` manage create_timeline chains.
 
 ## To confirm
-- Which values the production .env actually holds (COMMIT_ENABLED, COMMIT_ALLOWED_CHILD_IDS, QUEUE_MODE, ONBOARD_MODE, ONBOARD_BILL_PAYER, ONBOARD_URN_GENERATION, PLAN_FLAG_LEGACY_WRITE); the archive records only the laptop (COMMIT_ENABLED true, allow-list `*`) and never the droplet.
+- Prod ONBOARD_ENFORCE_ALLOWLIST (screenshot cut off at `of…`, likely off = allow-list not enforced) and ONBOARD_URN_GENERATION (not visible). 34 held jobs in var/onboard_jobs.sqlite3 (last 10 Nov).
 - Whether the 2026-10-28/29 work (plan status, rejection sub-codes, held-queue visibility, reference-refresh and its cron, pricing-input guards) has been deployed and exercised live; those entries say "fakes only, NOT run live".
 - Whether the quality-check cron runs at 07:30 London or UTC on the droplet (cron may ignore CRON_TZ; switch to 06:30 on 2027-03-28 if UTC).
-- Open in the archive: WhatsApp property name, child-name deal properties, month-end group boundary rule, `var/urns_missing.txt`, sibling deals sharing one Bill Payer label.
+- Open in the archive: month-end group boundary rule, `var/urns_missing.txt`, sibling deals sharing one Bill Payer label.
