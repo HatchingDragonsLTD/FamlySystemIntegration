@@ -1,6 +1,6 @@
 # Status (current state, not a log)
 
-Full history: docs/archive/status_to_2026-11-18.md. Design docs in docs/: famly_onboarding_pipeline_design.md, onboarding_bill_payer_design.md, onboarding_pipeline_state_and_checks.md, test_suite_report.md, handover_2026-10-28.md, handover_2026-10-29.md, reports_2026-10-27.md.
+Full history: docs/archive/status_to_2026-11-18.md. Design docs in docs/: famly_onboarding_pipeline_design, onboarding_bill_payer_design, onboarding_pipeline_state_and_checks, test_suite_report, handovers, reports_2026-10-27.
 Add new entries as one or two lines. When this file passes 8 KB, move the oldest detail into the archive.
 
 ## Live / built (as of 2026-10-29 entries; confirm what is deployed under "To confirm")
@@ -8,7 +8,7 @@ Add new entries as one or two lines. When this file passes 8 KB, move the oldest
 - Plan write: `plan_write` (preview, Slack Approve commits via `runner.commit`), `queue_timeline` (unattended queue + `queue-worker`), `create_timeline` (chains). Server owns `famly_plan_status` / `famly_plan_note` (and legacy `famly_plan_uploaded`); rejections carry stable sub-codes and post one Slack line; held queue jobs are flagged needs_attention.
 - Quality check cron: `onboard-quality-check`, read-only, Mon (digest) and Thu, 07:30 London, Slack alerts on new issues, CSV in reports/.
 - Reference refresh cron: `reference-refresh`, daily 03:10 London, needs REFERENCE_DIR, validates and backs up before replacing the five generated reference files.
-- Test suite guard: tests blank credentials and refuse real network calls (`tests/__init__.py`, `tests/network_guard.py`). Last recorded full run: 2392 tests, 1 skipped, passing.
+- Test suite guard: tests blank credentials and refuse real network calls (`tests/__init__.py`, `tests/network_guard.py`).
 
 ## .env switches (names only; values live in .env)
 - COMMIT_ENABLED (master switch for Approve commits; dev false) and COMMIT_ALLOWED_CHILD_IDS (allow-list, `*` = all).
@@ -25,8 +25,6 @@ Add new entries as one or two lines. When this file passes 8 KB, move the oldest
 - Parked: adding a HUBSPOT reference to an EXISTING child (needs a full children.update echo; not built); adding a reference to an existing contact (full contacts update; not built); parent app roles and logins; removing invoice recipients.
 - Parked: Shoreditch URN site code (`urn.SITE_URN_CODES` lacks it).
 - Delete when done: temporary `urn_lookup` and `delete_plans` actions; probe commands (`probe-bill-payers`, `probe-child-create`, `probe-contact-create`) once no longer needed.
-- Bill payer share 0.0 is rejected by Famly on create; pipeline uses 1.0 only.
-- `plan-check` covers only part of the plan inputs (coverage: partial).
 
 ## Commands used most
 - `python main.py onboard-enqueue --deal-id ID [--reopen-done]` queue a deal (`--file PATH --limit N|--all` for a batch).
@@ -45,4 +43,4 @@ Add new entries as one or two lines. When this file passes 8 KB, move the oldest
 - Which values the production .env actually holds (COMMIT_ENABLED, COMMIT_ALLOWED_CHILD_IDS, QUEUE_MODE, ONBOARD_MODE, ONBOARD_BILL_PAYER, ONBOARD_URN_GENERATION, PLAN_FLAG_LEGACY_WRITE); the archive records only the laptop (COMMIT_ENABLED true, allow-list `*`) and never the droplet.
 - Whether the 2026-10-28/29 work (plan status, rejection sub-codes, held-queue visibility, reference-refresh and its cron, pricing-input guards) has been deployed and exercised live; those entries say "fakes only, NOT run live".
 - Whether the quality-check cron runs at 07:30 London or UTC on the droplet (cron may ignore CRON_TZ; switch to 06:30 on 2027-03-28 if UTC).
-- Open from the archive: HubSpot WhatsApp property name (`hs_whatsapp_phone_number` assumed), child-name deal properties, month-end group boundary rule, `var/urns_missing.txt` never checked, sibling deals sharing one Bill Payer label.
+- Open in the archive: WhatsApp property name, child-name deal properties, month-end group boundary rule, `var/urns_missing.txt`, sibling deals sharing one Bill Payer label.
