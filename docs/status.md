@@ -9,7 +9,8 @@ Add new entries as one or two lines. When this file passes 8 KB, move the oldest
 - Quality check cron: `onboard-quality-check`, read-only, Mon (digest) and Thu, 07:30 London, Slack alerts on new issues, CSV in reports/.
 - Reference refresh cron: `reference-refresh`, daily 03:10 London, needs REFERENCE_DIR, validates and backs up before replacing the five generated reference files.
 - Test suite guard: tests blank credentials and refuse real network calls (`tests/__init__.py`, `tests/network_guard.py`).
-- Prod .env confirmed 2026-11-18 (screenshot): COMMIT_ENABLED true, allow-list `*`, QUEUE_MODE auto, ONBOARD_MODE live, ONBOARD_BILL_PAYER on, PLAN_FLAG_LEGACY_WRITE off. Queue: 303 done, 0 held, services active.
+- Prod .env (2026-11-18): COMMIT_ENABLED true, allow-list `*`, QUEUE_MODE auto, ONBOARD_MODE live, BILL_PAYER on, LEGACY_WRITE off. Queue 303 done, 0 held.
+- `onboard-audit --preview-estimate` (live 2026-11-18, one deal): fees compared with Famly's previewed estimate of the active plan (the only PUT, preview-only, `actions/plan_estimate`). List-call estimate omits automatic charges. Cron stays GET-only.
 
 ## .env switches (names only; values live in .env)
 - COMMIT_ENABLED (master switch for Approve commits; dev false) and COMMIT_ALLOWED_CHILD_IDS (allow-list, `*` = all).
