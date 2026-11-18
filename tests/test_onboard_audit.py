@@ -256,6 +256,26 @@ class CodeTests(AuditCase):
         self.rest.plans = {"c1": [good_plan(monthlyEstimate=1090)]}        # within 10% of billable_fees
         self.assertNotIn("plan_fees_differ", self.codes())
 
+    def test_dates_compare_the_span_of_all_plans_not_one_plan(self):
+        """Funding and advanced fees split a stay into several plans: the span must match the deal."""
+        def codes_for(*plans):
+            self.rest.plans = {"c1": list(plans)}
+            return self.codes()
+        first = good_plan(id="a", to="2026-06-01")                         # deal starts 2026-01-15, no end date
+        second = good_plan(id="b", **{"from": "2026-06-01"})
+        codes = codes_for(first, second)
+        self.assertNotIn("plan_dates_differ", codes)                        # contiguous, covers the deal's span
+        codes = codes_for(good_plan(id="a", **{"from": "2026-01-01"}, to="2026-06-01"), second)
+        self.assertIn("plan_from_differs", codes)
+        self.assertNotIn("plan_to_differs", codes)
+        codes = codes_for(first, good_plan(id="b", **{"from": "2026-06-01"}, to="2026-12-01"))
+        self.assertEqual([c for c in codes if c in ("plan_from_differs", "plan_to_differs")], ["plan_to_differs"])
+        codes = codes_for(first, good_plan(id="b", **{"from": "2026-07-01"}))
+        self.assertIn("plan_gap_between_plans", codes)
+        self.assertIn("plan_dates_differ", codes)                           # the umbrella code stays
+        codes = codes_for(good_plan(**{"from": "2026-02-02"}))              # one plan: the plain check, now split
+        self.assertEqual([c for c in codes if c.startswith("plan_from") or c.startswith("plan_to")], ["plan_from_differs"])
+
     def test_not_derivable_names_the_missing_input_class(self):
         deal = self.hub.deals[DEAL]
         for key, code in (("monday", None), ("billable_fees", "plan_input_fees_missing"),

@@ -564,12 +564,35 @@ def _number(value: Any) -> float | None:
         return None
 
 
+def _date_codes(plans: list, expected_from: str, expected_to: str | None) -> list[str]:
+    """Do the child's plans together cover what the deal says? Funding and advanced fees split a stay
+    into several plans, so one plan's dates need not equal the deal's: the SPAN of all the plans is
+    compared (earliest `from` with the deal's start, latest `to` with the day after the leave date; open
+    if any plan is open), and a gap between consecutive plans is flagged. With one plan this is the plain
+    comparison. Codes: plan_from_differs, plan_to_differs, plan_gap_between_plans. (Not checked yet: that
+    each funded or advanced-fee plan's own start is right.)"""
+    ordered = sorted(plans, key=lambda p: str(p.from_ or ""))
+    codes = []
+    if str(ordered[0].from_ or "")[:10] != expected_from:
+        codes.append("plan_from_differs")
+    last_to = None if any(not p.to for p in ordered) else max(str(p.to)[:10] for p in ordered)
+    if last_to != expected_to:
+        codes.append("plan_to_differs")
+    for before, after in zip(ordered, ordered[1:]):
+        if before.to and str(after.from_ or "")[:10] > str(before.to)[:10]:
+            codes.append("plan_gap_between_plans")
+            break
+    return codes
+
+
 def compare_plan(plans: list, deal: dict, institution: str | None, today=None, estimator=None) -> list[str]:
     """Compare the child's existing plan with what the DEAL implies, as codes. No request is
     made and nothing is previewed: the expected plan is read straight from the deal.
 
-      dates     the plan's `from` is `actual_start_date_1`, its exclusive `to` is the day after
-                the deal's `end_date` (open-ended when the deal has none);
+      dates     the plans' span starts on `actual_start_date_1` and its exclusive `to` is the day
+                after the deal's `end_date` (open-ended when the deal has none); with one plan that
+                is the plan itself, with several (funding, advanced fees) it is the earliest `from`
+                and latest `to`, plus no gap between plans (see _date_codes);
       sessions  the SET of (weekday, slot) from the deal's monday..friday properties, against the
                 plan's session bookings (a booking's slot is found from its session id in the
                 local session catalogue);
@@ -579,7 +602,8 @@ def compare_plan(plans: list, deal: dict, institution: str | None, today=None, e
                 is used instead (plan_estimate_previewed), falling back to the list figure with
                 plan_preview_failed when the preview cannot be built or is refused.
 
-    Codes: plan_matches | plan_differs + plan_dates_differ / plan_sessions_differ /
+    Codes: plan_matches | plan_differs + plan_dates_differ (+ plan_from_differs / plan_to_differs /
+    plan_gap_between_plans) / plan_sessions_differ /
     plan_fees_differ | plan_not_derivable + plan_input_dates_missing / plan_input_sessions_missing /
     plan_input_fees_missing / plan_session_catalogue_gap."""
     from actions.plan_write import hubspot_flatten
@@ -603,8 +627,9 @@ def compare_plan(plans: list, deal: dict, institution: str | None, today=None, e
         missing.append("plan_input_dates_missing")
     else:
         expected_to = hubspot_flatten.exclusive_end(last_day.isoformat()) if last_day else None
-        if str(chosen.from_ or "")[:10] != expected_from or (str(chosen.to or "")[:10] or None) != expected_to:
-            differs.append("plan_dates_differ")
+        date_codes = _date_codes(plans, expected_from, expected_to)
+        if date_codes:
+            differs += ["plan_dates_differ", *date_codes]
 
     wanted = set()
     unreadable = False
