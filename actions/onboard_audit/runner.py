@@ -31,7 +31,8 @@ WHAT IS COMPARED (codes):
             plan_matches | plan_differs (+ plan_dates_differ, plan_sessions_differ, plan_fees_differ) |
             plan_not_derivable (+ plan_input_dates_missing, plan_input_sessions_missing,
             plan_input_fees_missing, plan_session_catalogue_gap): the expected plan is read from
-            the deal's own properties with NO preview request (see compare_plan)
+            the deal's own properties; a preview request only with --preview-estimate (see compare_plan,
+            which adds plan_estimate_previewed / plan_preview_failed)
 """
 
 import csv
@@ -563,7 +564,7 @@ def _number(value: Any) -> float | None:
         return None
 
 
-def compare_plan(plans: list, deal: dict, institution: str | None, today=None) -> list[str]:
+def compare_plan(plans: list, deal: dict, institution: str | None, today=None, estimator=None) -> list[str]:
     """Compare the child's existing plan with what the DEAL implies, as codes. No request is
     made and nothing is previewed: the expected plan is read straight from the deal.
 
@@ -572,7 +573,11 @@ def compare_plan(plans: list, deal: dict, institution: str | None, today=None) -
       sessions  the SET of (weekday, slot) from the deal's monday..friday properties, against the
                 plan's session bookings (a booking's slot is found from its session id in the
                 local session catalogue);
-      fees      the plan's current monthly estimate within FEE_TOLERANCE of `billable_fees`.
+      fees      the plan's current monthly estimate within FEE_TOLERANCE of `billable_fees`. The list
+                call's estimate leaves out automatic charges; with `estimator` (plan, today -> float,
+                see actions/plan_estimate) the plan IN FORCE TODAY is previewed and its real estimate
+                is used instead (plan_estimate_previewed), falling back to the list figure with
+                plan_preview_failed when the preview cannot be built or is refused.
 
     Codes: plan_matches | plan_differs + plan_dates_differ / plan_sessions_differ /
     plan_fees_differ | plan_not_derivable + plan_input_dates_missing / plan_input_sessions_missing /
@@ -627,6 +632,16 @@ def compare_plan(plans: list, deal: dict, institution: str | None, today=None) -
         missing.append("plan_input_fees_missing")
     else:
         estimate = _number(chosen.current_monthly_estimate(today))
+        if estimator is not None:
+            from actions.plan_estimate.runner import active_plan
+            live = active_plan(plans, today)
+            if live is not None:
+                try:
+                    estimate = _number(estimator(live, today))
+                    buckets.append("plan_estimate_previewed")
+                except Exception as exc:  # noqa: BLE001 - one preview must not stop the audit
+                    logger.warning("onboard-audit: plan preview failed (%s)", type(exc).__name__)
+                    buckets.append("plan_preview_failed")
         if estimate is None or abs(estimate - fees) > FEE_TOLERANCE * max(abs(fees), 1.0):
             differs.append("plan_fees_differ")
         if estimate is not None:
@@ -639,7 +654,8 @@ def compare_plan(plans: list, deal: dict, institution: str | None, today=None) -
     return ["plan_matches", *buckets]
 
 
-def plan_codes(result, deal: dict | None = None, institution: str | None = None, today=None) -> list[str]:
+def plan_codes(result, deal: dict | None = None, institution: str | None = None, today=None,
+               estimator=None) -> list[str]:
     """From the child's EXISTING plans: none at all, plans that overlap or repeat each other
     (Famly's plan `to` is exclusive; an open end counts as far in the future), and, given the
     deal, the comparison with what the deal implies (`compare_plan`)."""
@@ -653,7 +669,7 @@ def plan_codes(result, deal: dict | None = None, institution: str | None = None,
             codes.append("plan_overlap_or_duplicate")
             break
     if deal is not None:
-        codes += compare_plan(plans, deal, institution, today)
+        codes += compare_plan(plans, deal, institution, today, estimator)
     return codes
 
 
@@ -685,7 +701,8 @@ def operations_deals(hubspot, stages: dict[str, tuple[str, str]], stage_names: l
 
 def run(hubspot, gql, rest, *, deal_ids: list[str] | None = None, operations: bool = False,
         stage_names: list[str] | None = None, site_ids: list[str] | None = None,
-        include_left: bool = False, deals: list[dict] | None = None, scope=None) -> tuple[dict, list[Row]]:
+        include_left: bool = False, deals: list[dict] | None = None, scope=None,
+        estimator=None, previewer=None) -> tuple[dict, list[Row]]:
     """The audit. Exactly one of `deal_ids` / `operations` / `deals`. Returns (summary, rows).
 
     `deals`: deal dicts the caller already read (the operations search rows), audited as given with no
@@ -695,7 +712,11 @@ def run(hubspot, gql, rest, *, deal_ids: list[str] | None = None, operations: bo
     unless it is set (plan_missing for them is reported only with it).
 
     `scope` (a `scope.Scope`, `--operations` only): drop the deals the shared operations scope excludes
-    (see scope.py); the counts included and excluded by reason are in `summary["scope"]`. None = every deal."""
+    (see scope.py); the counts included and excluded by reason are in `summary["scope"]`. None = every deal.
+
+    `estimator` / `previewer` (both or neither; --preview-estimate): fee comparison uses Famly's previewed
+    estimate for the plan in force today (see compare_plan). Off by default, and onboard-quality-check
+    never passes them, so the weekly cron stays GET-only."""
     from actions.read_child_plans import runner as plans_runner
 
     stages = hubspot.stage_names()
@@ -773,12 +794,15 @@ def run(hubspot, gql, rest, *, deal_ids: list[str] | None = None, operations: bo
         if derive.is_child_only_stage(stage) and not include_left:
             continue
         try:
-            row.codes += plan_codes(plans_runner.run(child.id, client=rest), deal, row.site_code)
+            row.codes += plan_codes(plans_runner.run(child.id, client=rest), deal, row.site_code,
+                                   estimator=estimator)
         except Exception as exc:  # noqa: BLE001 - one child's plan read must not stop the audit
             logger.warning("onboard-audit: plan read failed (%s)", type(exc).__name__)
             row.codes.append("plans_not_readable")
 
     summary = summarise(rows, hubspot, gql, rest)
+    if previewer is not None:
+        summary["requests"]["famlyPlanPreviews"] = getattr(previewer, "calls", None)
     if scope_counts is not None:
         summary["scope"] = scope_counts
     return summary, rows
@@ -801,7 +825,8 @@ def summarise(rows: list[Row], hubspot, gql, rest) -> dict:
         "requests": {"hubspot": getattr(hubspot, "calls", None), "famlyGraphql": getattr(gql, "calls", None),
                      "famlyRest": getattr(rest, "calls", None)},
         "planComparison": "dates, sessions (monday..friday) and fees (billable_fees, within "
-                          f"{int(FEE_TOLERANCE * 100)}% of the current monthly estimate); no preview, no write",
+                          f"{int(FEE_TOLERANCE * 100)}% of the current monthly estimate); no write; the estimate is previewed "
+                          "only with --preview-estimate",
     }
 
 

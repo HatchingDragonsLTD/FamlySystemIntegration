@@ -23,6 +23,9 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--out", metavar="PATH", help="Also write a CSV of ids and codes")
     parser.add_argument("--codes", metavar="CODE1,CODE2",
                         help="--out: only the rows that have ANY of these codes (a base code or a sub-code)")
+    parser.add_argument("--preview-estimate", action="store_true",
+                        help="Compare fees with Famly's PREVIEWED estimate of the plan in force today "
+                             "(one extra PUT ...?preview=true per child; never persists). Default off")
     parser.add_argument("--include-left", action="store_true",
                         help="Also read and compare the plans of child-only stages (Left Nursery); "
                              "skipped by default")
@@ -55,9 +58,16 @@ def handle(args: argparse.Namespace):
 
     hubspot = runner.ReadOnlyHubSpot()
     gql = runner.ReadOnlyGraphQL(urn_runner._public_client())
-    rest = runner.ReadOnlyRest(RestClient())
+    client = RestClient()
+    rest = runner.ReadOnlyRest(client)
+    estimator = previewer = None
+    if getattr(args, "preview_estimate", False):
+        from actions.plan_estimate import runner as estimate_runner
+        previewer = estimate_runner.PreviewOnlyRest(client)
+        estimator = estimate_runner.estimator(previewer)
     summary, rows = runner.run(hubspot, gql, rest, deal_ids=deal_ids, operations=bool(args.operations),
-                               stage_names=args.stage, include_left=bool(args.include_left), scope=scope)
+                               stage_names=args.stage, include_left=bool(args.include_left), scope=scope,
+                               estimator=estimator, previewer=previewer)
     if args.out:
         written = runner.write_csv(args.out, rows, only_codes=(args.codes or "").split(","))
         summary["csv"] = {"rows": written}
