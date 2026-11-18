@@ -4,7 +4,7 @@ Full history: docs/archive/status_to_2026-11-18.md. Design docs in docs/: famly_
 Add new entries as one or two lines. When this file passes 8 KB, move the oldest detail into the archive.
 
 ## Live / built (as of 2026-10-29 entries; confirm what is deployed under "To confirm")
-- Onboarding pipeline (`actions/onboard`): HubSpot deal -> queue -> Slack Gate A approval -> Famly child, contacts and bill payer CREATES (never updates or deletes), then write-back to HubSpot. Webhook `POST /intake` action `onboard_enqueue`; worker `onboard-worker`. End date always sent; HubSpot never blocks Famly; Retry button on hold notices.
+- Onboarding pipeline (`actions/onboard`): HubSpot deal -> queue -> Slack Gate A approval -> Famly child, contacts and bill payer CREATES (never updates or deletes), then write-back to HubSpot. Webhook `POST /intake` action `onboard_enqueue`. End date always sent; HubSpot never blocks Famly; Retry button on hold notices.
 - Plan write: `plan_write` (preview, Slack Approve commits via `runner.commit`), `queue_timeline` (unattended queue + `queue-worker`), `create_timeline` (chains). Server owns `famly_plan_status` / `famly_plan_note` (and legacy `famly_plan_uploaded`); rejections carry stable sub-codes and post one Slack line; held queue jobs are flagged needs_attention.
 - Quality check cron: `onboard-quality-check`, read-only, Mon (digest) and Thu, 07:30 London, Slack alerts on new issues, CSV in reports/.
 - Reference refresh cron: `reference-refresh`, daily 03:10 London, needs REFERENCE_DIR, validates and backs up before replacing the five generated reference files.
@@ -22,14 +22,12 @@ Add new entries as one or two lines. When this file passes 8 KB, move the oldest
 ## Open work and parked
 - HubSpot workflow: add the deal record id to the plan_preview webhook body and remove the step that sets famly_plan_uploaded (no flag is written until the id is sent).
 - HubSpot dropdowns: `child_linked` and `bill_payer_linked` on famly_sync_status must be offered, or the status stays at the earlier value.
-- Parked: adding a HUBSPOT reference to an EXISTING child (needs a full children.update echo; not built); adding a reference to an existing contact (full contacts update; not built); parent app roles and logins; removing invoice recipients.
-- Parked: Shoreditch URN site code (`urn.SITE_URN_CODES` lacks it).
+- Parked: adding a HUBSPOT reference to an EXISTING child (needs a full children.update echo; not built); adding a reference to an existing contact (full contacts update; not built); parent app roles and logins; Shoreditch URN site code.
 - Delete when done: temporary `urn_lookup` and `delete_plans` actions; probe commands (`probe-bill-payers`, `probe-child-create`, `probe-contact-create`) once no longer needed.
 
 ## Commands used most
 - `python main.py onboard-enqueue --deal-id ID [--reopen-done]` queue a deal (`--file PATH --limit N|--all` for a batch).
 - `python main.py onboard-dry-run --deal-id ID` plan only, no writes.
-- `python main.py onboard-status --deal-id ID` job state.
 - `python main.py onboard-worker [--once]` run the onboarding worker.
 - `python main.py onboard-audit --operations [--out CSV]` read-only audit of onboarded deals.
 - `python main.py onboard-quality-check [--baseline|--digest]` the cron job.
