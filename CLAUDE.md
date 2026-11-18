@@ -1,5 +1,5 @@
 # Famly integration
-- Read docs/status.md at the start of a session.
+- Read docs/status.md at the start of a session; open the archive only when a task needs history.
 - Python, stdlib unittest. One module: python -m unittest tests.test_x -q. Full suite: python -m unittest discover -s tests -q (slow; once at the end).
 - Layout: actions/<name>/{runner.py,cli.py,web.py}; web_registry.py routes webhook actions; core/ clients; integrations/ Slack and catalogues; reference/ JSON (pulled by pull-* commands); var/ is gitignored personal data.
 - Never print, log or store child or parent names. Child ids only.
@@ -11,3 +11,11 @@
 - Tests use fakes. Hit live Famly only when the task says to verify live.
 - Testing: for money, funding, dates, commit and delete guards and queue safety, test thoroughly. For everything else write at most about 8 focused tests. No test-breaking checks unless the task asks. Run only the affected modules with -q, and the full suite once at the end, using: python -m unittest discover -s tests -q 2>&1 | tail -5
 
+## Workflow
+- Build in /home/drew/famly-dev (dev .env has no real tokens; COMMIT_ENABLED=false, ONBOARD_MODE=off). Nothing runs from here.
+- /home/drew/famly is production: services run from it. Never edit it; only git pull there after I merge.
+- Live commands (probes, audits, verify runs) are run from /home/drew/famly, only when the task says so, and I approve each one.
+- Work on a branch per task; commit there; never push to or merge main. I review and merge.
+- After a merge I pull in prod and restart famly-intake, famly-queue-worker and famly-onboard-worker when runtime code changed.
+- Command results and audit files go in reports/ (gitignored), never loose in the project root.
+- Logs: journalctl -u <service> (server time is UTC).
