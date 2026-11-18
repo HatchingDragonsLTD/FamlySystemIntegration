@@ -10,7 +10,7 @@ Add new entries as one or two lines. When this file passes 8 KB, move the oldest
 - Reference refresh cron: `reference-refresh`, daily 03:10 London, needs REFERENCE_DIR, validates and backs up before replacing the five generated reference files.
 - Test suite guard: tests blank credentials and refuse real network calls (`tests/__init__.py`, `tests/network_guard.py`).
 - Prod .env (2026-11-18): COMMIT_ENABLED true, allow-list `*`, QUEUE_MODE auto, ONBOARD_MODE live, BILL_PAYER on, LEGACY_WRITE off. Queue 303 done, 0 held.
-- `onboard-audit --preview-estimate` (live 2026-11-18, one deal): fees compared with Famly's previewed estimate of the active plan (the only PUT, preview-only, `actions/plan_estimate`). List-call estimate omits automatic charges. Cron stays GET-only.
+- `onboard-audit --preview-estimate` (live 2026-11-18): fees vs Famly's previewed estimate of the active plan (only PUT, preview-only, `actions/plan_estimate`); cron stays GET-only. Plan dates compare the span of all plans (funding/advanced fees split plans): plan_from_differs / plan_to_differs / plan_gap_between_plans.
 
 ## .env switches (names only; values live in .env)
 - COMMIT_ENABLED (master switch for Approve commits; dev false) and COMMIT_ALLOWED_CHILD_IDS (allow-list, `*` = all).
@@ -23,6 +23,7 @@ Add new entries as one or two lines. When this file passes 8 KB, move the oldest
 
 ## Open work and parked
 - HubSpot workflow: add the deal record id to the plan_preview webhook body and remove the step that sets famly_plan_uploaded (no flag is written until the id is sent).
+- Audit: check that each funded and advanced-fee plan's own start date is accurate (not checked yet).
 - Parked: adding a HUBSPOT reference to an EXISTING child (needs a full children.update echo; not built); adding a reference to an existing contact (full contacts update; not built); parent app roles and logins; Shoreditch URN site code.
 - Delete when done: temporary `urn_lookup` and `delete_plans` actions; probe commands (`probe-bill-payers`, `probe-child-create`, `probe-contact-create`) once no longer needed.
 
